@@ -63,8 +63,8 @@ struct Entity {
         STRUCT_PLACE(uint32, entity_global_id, 0x90);
         STRUCT_PLACE(uint32, entity_id, 0x94);
         STRUCT_PLACE(MisalignedResourceLoadEntry*, resload_entry, 0x30);
-        STRUCT_PLACE(MisalignedResourceLoadEntry*, resload_entry2, 0x38); //Für STUSkinTheme
-        STRUCT_PLACE(MisalignedResourceLoadEntry*, resload_entry3, 0x40); //Für STUSkinBase
+        STRUCT_PLACE(MisalignedResourceLoadEntry*, resload_entry2, 0x38); //Fï¿½r STUSkinTheme
+        STRUCT_PLACE(MisalignedResourceLoadEntry*, resload_entry3, 0x40); //Fï¿½r STUSkinBase
     };
 
     inline ComponentBase* getById(int id) {
@@ -203,24 +203,26 @@ struct Component_10_FilterBits {
 
     void set_team(int team) {
         owassert(team >= 0 && team < 4);
-        filter_bits &= ~(__int64)0x3C0000;
+        __int64 team_bit = 0;
         switch (team) {
         case 0:
-            filter_bits |= 0x40000;
+            team_bit = 0x40000;
             break;
         case 1:
-            filter_bits |= 0x80000;
+            team_bit = 0x80000;
             break;
         case 2:
-            filter_bits |= 0x100000;
+            team_bit = 0x100000;
             break;
         case 3:
-            filter_bits |= 0x200000;
+            team_bit = 0x200000;
             break;
         }
+        pre_filter_bits = (pre_filter_bits & ~(__int64)0x3C0000) | team_bit;
+        filter_bits = (filter_bits & ~(__int64)0x3C0000) | team_bit;
     }
 
-    //default values für controller entity
+    //default values fï¿½r controller entity
     void set_filterbits_spectator() {
         field_8C = 0x101;
         field_8E = 1;
@@ -230,6 +232,8 @@ struct Component_10_FilterBits {
     }
 
     void FilterBitsMakeFinal() {
+        // Ensure +0xCBF6A0 (cmp rbx, [rsi+98h]) does not short-circuit on non-local entities
+        filter_bits = ~pre_filter_bits;
         ((void(*__fastcall)(Component_10_FilterBits*))(globals::gameBase + 0xcbf660))(this);
     }
 };
@@ -255,11 +259,13 @@ struct HealthPart {
         int part_enabled;
         STRUCT_PLACE(float, max_health, 4);
         STRUCT_PLACE(float, curr_health, 8);
+        STRUCT_PLACE(int, field_C, 0xC);
         STRUCT_PLACE(char, field_10, 0x10);
         STRUCT_PLACE(char, some_other_flag, 0x11);
-        STRUCT_PLACE(__int64, field_12, 0x12);
+        STRUCT_PLACE(short, field_12, 0x12);
     };
 };
+static_assert(sizeof(HealthPart) == 0x14, "HealthPart stride must be exactly 0x14 bytes");
 
 struct Component_28_STUHealthComponent;
 struct STUHealthComponent_vt {
@@ -280,12 +286,31 @@ struct Component_28_STUHealthComponent {
         ComponentBase base;
         STUHealthComponent_vt* vfptr;
 
-        //TODO: May be wrong. This is STU MirrorData
-        //Plus multiple fields have the saame name. WTF!
+        // Verified in +0xCC5F92 and +0xCC67F5: 16 HealthPart entries (stride 0x14 = 0x140 bytes) per pool
         STRUCT_PLACE_ARRAY(HealthPart, normal_health, 0x10, 0x98);
         STRUCT_PLACE_ARRAY(HealthPart, armour_health, 0x10, 0x1D8);
         STRUCT_PLACE_ARRAY(HealthPart, shield_health, 0x10, 0x318);
     };
+
+    float CalcTotalCurrentHealth() const {
+        float total = 0.0f;
+        for (int i = 0; i < 0x10; i++) {
+            if (normal_health[i].part_enabled) total += normal_health[i].curr_health;
+            if (armour_health[i].part_enabled) total += armour_health[i].curr_health;
+            if (shield_health[i].part_enabled) total += shield_health[i].curr_health;
+        }
+        return total;
+    }
+
+    float CalcTotalMaxHealth() const {
+        float total = 0.0f;
+        for (int i = 0; i < 0x10; i++) {
+            if (normal_health[i].part_enabled) total += normal_health[i].max_health;
+            if (armour_health[i].part_enabled) total += armour_health[i].max_health;
+            if (shield_health[i].part_enabled) total += shield_health[i].max_health;
+        }
+        return total;
+    }
 };
 
 enum class WalkDirectionLR : unsigned char {
@@ -1030,5 +1055,94 @@ public:
     };
 
     bool demo_join_game = false;
+};
+
+struct OriginEntitySlot {
+    uint32 entity_id = 0;
+    Entity* ent_ptr = nullptr;
+    __int64 stu_id = 0;
+    __int64 additional_stu_id = 0;
+    uintptr_t spawn_caller_rva = 0;
+    bool had_loader_init_data = false;
+    Vector4 loader_init_pos{};
+    Vector4 loader_init_rot{};
+    Vector4 loader_init_scale{};
+
+    bool has_nonzero_pos = false;
+    Vector4 first_nonzero_pos{};
+    Vector4 first_nonzero_rot{};
+    uintptr_t first_nonzero_caller_rva = 0;
+
+    Vector4 latest_nonzero_pos{};
+    Vector4 latest_nonzero_rot{};
+    uintptr_t latest_nonzero_caller_rva = 0;
+
+    int zero_set_count = 0;
+    uintptr_t last_zero_caller_rva = 0;
+
+    int zero_overwrite_count = 0;
+    int zero_overwrite_blocked_count = 0;
+    int direct_zero_overwrite_count = 0;
+    uintptr_t last_zero_overwrite_caller_rva = 0;
+
+    bool culled_by_heracles = false;
+    Vector4 pre_cull_pos{};
+    Vector4 pre_cull_rot{};
+};
+
+struct OriginClutterTracker {
+    static constexpr int MAX_SLOTS = 0x1000;
+    static inline OriginEntitySlot s_slots[MAX_SLOTS]{};
+    static inline bool s_block_zero_overwrites = true;
+    static inline bool s_auto_cull_unplaced_origin_props = false;
+    static inline int s_total_zero_overwrites_blocked = 0;
+    static inline int s_total_culled_props = 0;
+    static inline int s_ticks_since_world_ready = -1;
+    static inline bool s_dumped_report_for_current_map = false;
+    static inline __int64 s_last_loaded_map_id = 0;
+
+    static inline OriginEntitySlot* GetSlot(uint32 ent_id, Entity* ent = nullptr) {
+        if (ent_id == 0)
+            return nullptr;
+        OriginEntitySlot& slot = s_slots[ent_id & (MAX_SLOTS - 1)];
+        if (slot.entity_id != ent_id) {
+            slot = OriginEntitySlot{};
+            slot.entity_id = ent_id;
+            slot.ent_ptr = ent;
+        } else if (ent) {
+            slot.ent_ptr = ent;
+        }
+        return &slot;
+    }
+
+    static void ResetAll() {
+        for (int i = 0; i < MAX_SLOTS; i++) {
+            s_slots[i] = OriginEntitySlot{};
+        }
+        s_total_zero_overwrites_blocked = 0;
+        s_total_culled_props = 0;
+    }
+
+    static void OnTick(EntityAdminBase* game_ea, int world_state);
+    static int CullUnplacedOriginProps(EntityAdminBase* game_ea);
+    static int RestoreCulledProps(EntityAdminBase* game_ea);
+    static void DumpReportToFile(EntityAdminBase* game_ea, const char* trigger_reason);
+};
+
+struct WeaponHardpointDiag {
+    static inline int s_total_events_logged = 0;
+    static inline int s_fire_shot_calls = 0;
+    static inline int s_ss_effect_calls = 0;
+    static inline int s_attach_calls = 0;
+    static inline int s_resolve_weapon_calls = 0;
+    static inline int s_update_weapon_calls = 0;
+    static inline std::string s_last_dump_status = "Not dumped yet.";
+
+    static void ClearTrace();
+    static void ForceUpdateWeapons(EntityAdminBase* game_ea, uint8_t is_1p);
+    static void DumpReportToFile(EntityAdminBase* game_ea, const char* trigger_reason);
+};
+
+struct OriginClutterDummyEnd {
 };
 

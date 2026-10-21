@@ -3,16 +3,32 @@
 #include "stu_resources.h"
 #include "Statescript.h"
 #include "StatescriptVar.h"
+#include "MovementState.h"
 
 void player_spawner::modify_ent(spawn_info info, Entity* ent) {
 	auto game_ea = GameEntityAdmin();
-	//Entity* ent = game_ea->getEntById(info.latest_entid);
 	if (!ent) {
 		imgui_helpers::messageBox("Failed to modify ent");
 		return;
 	}
 	if (info.set_localent) {
 		game_ea->local_entid = ent->entity_id;
+	}
+
+	Vector4 valid_rot = info.spawn_rotation;
+	if (valid_rot.X == 0.0f && valid_rot.Y == 0.0f && valid_rot.Z == 0.0f && valid_rot.W == 0.0f) {
+		valid_rot.W = 1.0f;
+	}
+
+	Component_1_SceneRendering* scene_comp = ent->getById<Component_1_SceneRendering>(1);
+	if (scene_comp) {
+		if (info.set_position) {
+			scene_comp->SetPosRotation(info.spawn_position, valid_rot);
+		}
+		if (!info.set_filterbits_controller && ent == model_ent) {
+			scene_comp->SetScale(Vector4(1.0f, 1.0f, 1.0f, 1.0f));
+			scene_comp->SetVisible();
+		}
 	}
 
 	Component_20_ModelReference* pet_comp = ent->getById<Component_20_ModelReference>(0x20);
@@ -37,17 +53,30 @@ void player_spawner::modify_ent(spawn_info info, Entity* ent) {
 
 	Component_28_STUHealthComponent* health = ent->getById<Component_28_STUHealthComponent>(0x28);
 	if (health && info.set_health) {
-		auto& part = health->normal_health[0];
-		part.part_enabled = 1;
-		part.curr_health = 169;
-		part.max_health = 200;
-		part.some_other_flag = 1;
-		part.field_10 = 1;
+		if (health->CalcTotalMaxHealth() <= 0.0f) {
+			auto& part = health->normal_health[0];
+			part.part_enabled = 1;
+			part.max_health = 200.0f;
+			part.curr_health = 200.0f;
+			part.field_C = 0;
+			part.field_10 = 1;
+			part.some_other_flag = 1;
+			part.field_12 = 0;
+		} else {
+			for (int i = 0; i < 0x10; i++) {
+				if (health->normal_health[i].part_enabled && health->normal_health[i].curr_health <= 0.0f)
+					health->normal_health[i].curr_health = health->normal_health[i].max_health;
+				if (health->armour_health[i].part_enabled && health->armour_health[i].curr_health <= 0.0f)
+					health->armour_health[i].curr_health = health->armour_health[i].max_health;
+				if (health->shield_health[i].part_enabled && health->shield_health[i].curr_health <= 0.0f)
+					health->shield_health[i].curr_health = health->shield_health[i].max_health;
+			}
+		}
 	}
 
 	Component_2F_LocalPlayer* lp = ent->getById<Component_2F_LocalPlayer>(0x2F);
 	if (lp && info.set_2f_movable) {
-		//lp->is_able_to_aim = true;
+		lp->is_able_to_aim = true;
 
 		auto move = (void(__fastcall*)(__int64, int, int, char, char))(globals::gameBase + 0xc27560);
 		auto get_sys36 = (__int64(__fastcall*)(EntityAdminBase*))(globals::gameBase + 0xc03750);
@@ -61,55 +90,83 @@ void player_spawner::modify_ent(spawn_info info, Entity* ent) {
 		player_info->hero_was_selected = true;
 		player_info->m_slot = 3;
 		player_info->selected_heroid = info.heroid;
+		player_info->unconformed_selected_heroid = info.heroid;
 		player_info->localplayer_heroselected = true;
-		//player_info->selected_heroid_2 = info.heroid;
-		//player_info->unk_1 = 1;
 	}
 
 	Component_10_FilterBits* filter_bits = ent->getById<Component_10_FilterBits>(0x10);
 	if (filter_bits) {
 		if (info.set_filterbits_controller) {
 			filter_bits->set_filterbits_spectator();
+		} else {
+			filter_bits->pre_filter_bits |= 0x800000;
+			filter_bits->filter_bits |= 0x800000;
 		}
 		if (info.team != -1) {
 			filter_bits->set_team(info.team);
 		}
-		filter_bits->filter_bits = 0x800000;
 		filter_bits->FilterBitsMakeFinal();
 	}
 
 	Component_23_Statescript* statescript = ent->getById<Component_23_Statescript>(0x23);
 	if (statescript) {
 		if (info.weapon_attach) {
-			auto entity_def = stu_resources::GetByID(info.resource_id)->to_editable();
-			auto component_map = entity_def.get_argument_map("m_componentMap");
-			auto weapon_comp = ((STUBase<>*)component_map.value->get_by_key(stringHash("STUWeaponComponent"))->value)->to_editable(); //
-			statescript->loadScript(weapon_comp.get_argument_resource("m_managerScript")->resource_id);
-			for (auto weapon : weapon_comp.get_argument_objectlist("m_weapons")) {
-				auto script = weapon.get_argument_resource("m_script"); //m_graph is always null?
-				if (script->has_resource())
-					statescript->loadScript(script->resource_id);
+			auto stu_res = stu_resources::GetByID(info.resource_id);
+			if (stu_res) {
+				auto entity_def = stu_res->to_editable();
+				auto component_map = entity_def.get_argument_map("m_componentMap");
+				auto weapon_entry = component_map.value ? component_map.value->get_by_key(stringHash("STUWeaponComponent")) : nullptr;
+				if (weapon_entry && weapon_entry->value) {
+					auto weapon_comp = ((STUBase<>*)weapon_entry->value)->to_editable();
+					auto mgr_script = weapon_comp.get_argument_resource("m_managerScript");
+					if (mgr_script && mgr_script->has_resource())
+						statescript->loadScript(mgr_script->resource_id);
+					for (auto weapon : weapon_comp.get_argument_objectlist("m_weapons")) {
+						auto script = weapon.get_argument_resource("m_script");
+						if (script && script->has_resource())
+							statescript->loadScript(script->resource_id);
+					}
+				}
 			}
 		}
 
-		if (info.fixup_player_statescript) {
+		if (info.fixup_player_statescript && statescript->ss_inner.rid_entity_varbag) {
 			StatescriptPrimitive cv{};
 			cv.type = StatescriptPrimitive_BYTE;
 			cv.value = 1;
+			statescript->ss_inner.rid_entity_varbag->SetVar({ 0x0D800000000000FD }, cv);
 			statescript->ss_inner.rid_entity_varbag->SetVar({ StatescriptVar_ENTITY_VARBAG, 0x0D800000000000FD }, cv);
 
-			StatescriptPrimitive wpn_1{}; //One weapon active -> SECONDARY WEAPONS DONT WORK
+			StatescriptPrimitive wpn_1{};
 			wpn_1.type = StatescriptPrimitive_INT;
 			wpn_1.value = 1;
-			statescript->ss_inner.rid_entity_varbag->SetArray({ StatescriptVar_ENTITY_VARBAG, 0x0D8000000000001D }, wpn_1, wpn_1, -1);
+			statescript->ss_inner.rid_entity_varbag->SetArray({ 0x0D8000000000001D }, wpn_1, wpn_1, -1);
+
+			if (health) {
+				StatescriptPrimitive health_cv{};
+				health_cv.type = StatescriptPrimitive_FLT;
+				*(float*)&health_cv.value = health->CalcTotalCurrentHealth();
+				statescript->ss_inner.rid_entity_varbag->SetVar({ 0x0D800000000006C4 }, health_cv);
+				statescript->ss_inner.rid_entity_varbag->SetVar({ StatescriptVar_ENTITY_VARBAG, 0x0D800000000006C4 }, health_cv);
+
+				*(float*)&health_cv.value = health->CalcTotalMaxHealth();
+				statescript->ss_inner.rid_entity_varbag->SetVar({ 0x0D800000000006C9 }, health_cv);
+				statescript->ss_inner.rid_entity_varbag->SetVar({ StatescriptVar_ENTITY_VARBAG, 0x0D800000000006C9 }, health_cv);
+			}
+		}
+
+		bool is_local_model = (ent == model_ent && controller_ent && game_ea && game_ea->local_entid == controller_ent->entity_id);
+		for (auto* inst : statescript->ss_inner.g1_instanceArr) {
+			if (inst) {
+				if (is_local_model) {
+					inst->execution_flags = (inst->execution_flags | 0x400009u | 0x200000u) & ~0x1004u;
+				} else {
+					inst->execution_flags = (inst->execution_flags | 0x400009u) & ~(0x1004u | 0x200000u);
+				}
+				inst->vfptr->RedoCheckIsAimEnt(inst);
+			}
 		}
 	}
-
-	/*if (info.call_component2_vodoo) {
-		auto comp_2 = (*ent->entity_admin_backref->system_1_ref)->GetComponent2WarumAuchImmer(ent->entity_admin_backref->system_1_ref);
-		printf("Comp2: %p\n", comp_2);
-		auto comp2_vodoo = (void(*)(Component_2_AssetManager*, Entity*))(globals::gameBase + 0x9f2290);
-	}*/
 }
 
 Entity* player_spawner::spawn_ent(spawn_info& info) {
@@ -119,6 +176,9 @@ Entity* player_spawner::spawn_ent(spawn_info& info) {
 		return nullptr;
 	}
 	auto spawner = EntityLoader::Create(info.resource_id, res_ptr, info.load_2f_33, info.load_3f);
+	if (!spawner) {
+		return nullptr;
+	}
 	for (auto additional : info.additional_compids) {
 		auto spawner_elem = &spawner->loader_entries[additional.component_id];
 		spawner_elem->component_id = additional.component_id;
@@ -128,7 +188,17 @@ Entity* player_spawner::spawn_ent(spawn_info& info) {
 			spawner_elem->stu_component_data = additional.stu_component_data;
 		if (additional.stu_instance_data)
 			spawner_elem->stu_instance_data = additional.stu_instance_data;
-		//memcpy(elem, &info, sizeof(EntityLoader_Entry));
+	}
+	Component_1_SceneRendering::InitData init_data{};
+	if (info.set_position) {
+		Vector4 valid_rot = info.spawn_rotation;
+		if (valid_rot.X == 0.0f && valid_rot.Y == 0.0f && valid_rot.Z == 0.0f && valid_rot.W == 0.0f) {
+			valid_rot.W = 1.0f;
+		}
+		init_data.position = info.spawn_position;
+		init_data.scale = Vector4(1.0f, 1.0f, 1.0f, 1.0f);
+		init_data.rotation = valid_rot;
+		spawner->loader_entries[1].init_data = (__int64)&init_data;
 	}
 	spawner->aplist_extra = info.skin_theme_id;
 	return spawner->Spawn(GameEntityAdmin());
@@ -142,26 +212,172 @@ void player_spawner::template_localPlayer() {
 	controller_info.set_2f_movable = true;
 	controller_info.load_2f_33 = true;
 	controller_info.load_3f = true;
-	controller_info.movement_attach = 2; //Doch model sonst funktioniert F1 nicht
+	controller_info.movement_attach = 2;
 	controller_info.set_filterbits_controller = false;
-	model_info.resource_id = 0x400000000000001;
+	controller_info.team = 0;
+	if (model_info.resource_id == 0) {
+		model_info.resource_id = 0x400000000000001;
+	}
+	if (model_info.heroid == 0 && model_info.resource_id == 0x400000000000001) {
+		model_info.heroid = 0x02E0000000000003ULL;
+		controller_info.heroid = 0x02E0000000000003ULL;
+	}
 	model_info.petbackref_attach = 1;
 	model_info.set_health = true;
 	model_info.weapon_attach = true;
 	model_info.fixup_player_statescript = true;
+	model_info.team = 0;
 }
 
-//returns key: controller - value: model
 std::pair<Entity*, Entity*> player_spawner::spawn() {
+	if (controller_info.heroid == 0 && model_info.heroid != 0) {
+		controller_info.heroid = model_info.heroid;
+	}
+	if (controller_info.heroid == 0 && model_info.resource_id == 0x400000000000001) {
+		controller_info.heroid = 0x02E0000000000003ULL;
+		model_info.heroid = 0x02E0000000000003ULL;
+	}
+
 	controller_ent = spawn_ent(controller_info);
 	model_ent = spawn_ent(model_info);
 	if (!controller_ent || !model_ent) {
 		return {};
 	}
 
-	//controller_entity.latest_entid = c_ent->entity_id;
-	//model_entity.latest_entid = m_ent->entity_id;
-	modify_ent(controller_info, controller_ent);
-	modify_ent(model_info, model_ent);
+	if (!use_deferred_spawn) {
+		modify_ent(controller_info, controller_ent);
+		modify_ent(model_info, model_ent);
+		return { controller_ent, model_ent };
+	}
+
+	pending_controller_entid = controller_ent->entity_id;
+	pending_model_entid = model_ent->entity_id;
+	pending_controller_info = controller_info;
+	pending_model_info = model_info;
+	wait_ticks = 0;
+	ready_after_ticks = 0;
+	pre_init_script_count = 0;
+	post_init_script_count = 0;
+	post_init_has_backref = 0;
+	post_init_is_aim_ent = 0;
+	diag_c20 = false;
+	diag_c1f = false;
+	diag_c12 = false;
+	diag_c23 = false;
+	diag_not_instantiating = false;
+	diag_varbag_ready = false;
+	diag_instance_count = 0;
+	spawn_state = DeferredSpawnState::WAITING_FOR_COMPONENTS;
+
 	return { controller_ent, model_ent };
+}
+
+void player_spawner::tick_deferred_spawn() {
+	if (spawn_state != DeferredSpawnState::WAITING_FOR_COMPONENTS && spawn_state != DeferredSpawnState::APPLYING_POST_SPAWN_INIT) {
+		return;
+	}
+
+	auto* ea = GameEntityAdmin();
+	if (!ea) {
+		return;
+	}
+
+	Entity* c_ent = ea->getEntById(pending_controller_entid);
+	Entity* m_ent = ea->getEntById(pending_model_entid);
+
+	if (spawn_state == DeferredSpawnState::WAITING_FOR_COMPONENTS) {
+		wait_ticks++;
+
+		if (!c_ent || !m_ent) {
+			if (wait_ticks >= MAX_WAIT_TICKS) {
+				spawn_state = DeferredSpawnState::SPAWN_FAILED_TIMEOUT;
+				printf("[DeferredSpawner] Timeout waiting for entities! (C: 0x%x, M: 0x%x, ticks: %d)\n", pending_controller_entid, pending_model_entid, wait_ticks);
+			}
+			return;
+		}
+
+		auto* c20 = c_ent->getById<Component_20_ModelReference>(0x20);
+		auto* c1f = m_ent->getById<Component_1F_Backref>(0x1F);
+		auto* c12 = m_ent->getById<ComponentBase>(0x12);
+		auto* c23 = m_ent->getById<Component_23_Statescript>(0x23);
+
+		diag_c20 = (c20 != nullptr);
+		diag_c1f = (c1f != nullptr);
+		diag_c12 = (c12 != nullptr);
+		diag_c23 = (c23 != nullptr);
+
+		bool basic_ready = (diag_c20 && diag_c23);
+		bool statescript_ready = false;
+
+		if (diag_c23) {
+			diag_not_instantiating = (c23->ss_inner.is_instantiating == 0);
+			diag_varbag_ready = (c23->ss_inner.rid_entity_varbag != nullptr);
+			diag_instance_count = c23->ss_inner.g1_instanceArr.num;
+
+			if (diag_not_instantiating && diag_varbag_ready) {
+				statescript_ready = true;
+			}
+			else if (wait_ticks >= 15 && diag_varbag_ready) {
+				statescript_ready = true;
+			}
+		}
+
+		if (basic_ready && statescript_ready) {
+			ready_after_ticks = wait_ticks;
+			pre_init_script_count = c23->ss_inner.g1_instanceArr.num;
+			spawn_state = DeferredSpawnState::APPLYING_POST_SPAWN_INIT;
+			printf("[DeferredSpawner] Components ready after %d ticks! Pre-init scripts: %d\n", ready_after_ticks, pre_init_script_count);
+		}
+		else if (wait_ticks >= MAX_WAIT_TICKS) {
+			spawn_state = DeferredSpawnState::SPAWN_FAILED_TIMEOUT;
+			printf("[DeferredSpawner] Timeout waiting for components! (c20: %p, c1f: %p, c12: %p, c23: %p, ticks: %d)\n",
+				c20, c1f, c12, c23, wait_ticks);
+			return;
+		}
+		else {
+			return;
+		}
+	}
+
+	if (spawn_state == DeferredSpawnState::APPLYING_POST_SPAWN_INIT) {
+		this->controller_ent = c_ent;
+		this->model_ent = m_ent;
+
+		modify_ent(pending_controller_info, c_ent);
+
+		if (c_ent && m_ent) {
+			Component_1F_Backref* petref = m_ent->getById<Component_1F_Backref>(0x1F);
+			if (petref && pending_model_info.petbackref_attach > 0) {
+				Entity* backref_ent = pending_model_info.petbackref_attach == 1 ? c_ent : m_ent;
+				petref->backref_entid = backref_ent->entity_id;
+				petref->backref_global_entid = backref_ent->entity_global_id;
+			}
+			auto tell_statescript_this_is_localent = (void(__fastcall*)(Entity*, uint*))(globals::gameBase + 0xd07830);
+			tell_statescript_this_is_localent(m_ent, &c_ent->entity_id);
+		}
+
+		modify_ent(pending_model_info, m_ent);
+
+		auto* c23 = m_ent->getById<Component_23_Statescript>(0x23);
+		if (c23) {
+			bool is_local_model = (pending_controller_info.set_localent || (c_ent && ea->local_entid == c_ent->entity_id));
+			for (auto* inst : c23->ss_inner.g1_instanceArr) {
+				if (inst) {
+					if (is_local_model) {
+						inst->execution_flags = (inst->execution_flags | 0x400009u | 0x200000u) & ~0x1004u;
+					} else {
+						inst->execution_flags = (inst->execution_flags | 0x400009u) & ~(0x1004u | 0x200000u);
+					}
+					inst->vfptr->RedoCheckIsAimEnt(inst);
+				}
+			}
+			post_init_script_count = c23->ss_inner.g1_instanceArr.num;
+			post_init_has_backref = c23->ss_inner.has_player_entbackref;
+			post_init_is_aim_ent = (int)c23->ss_inner.is_aim_ent;
+		}
+
+		spawn_state = DeferredSpawnState::SPAWN_COMPLETE;
+		printf("[DeferredSpawner] Post-spawn init complete! Scripts: %d -> %d, backref: %d, aim_ent: %d\n",
+			pre_init_script_count, post_init_script_count, post_init_has_backref, post_init_is_aim_ent);
+	}
 }

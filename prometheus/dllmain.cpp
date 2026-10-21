@@ -370,7 +370,7 @@ __int64 __fastcall createwindow_hook(__int64 gameManager) {
     std::thread([]() {
         while (true) {
             Sleep(100);
-            //teEngine ínstance
+            //teEngine ï¿½nstance
             DWORD_PTR render = *(DWORD_PTR*)(globals::gameBase + 0x181e3e0);
             if (!render)
                 continue;
@@ -509,41 +509,69 @@ Entity* emplace_entity_hook(EntityAdminBase* ea, int* entid, EntityLoader* loade
         for (auto& item : loader->loader_entries)
             item.component_id = 0;
     }
-    //stacktrace();
-    //printf("Load entity with ID: %p %x %p\n", loader->stu_id, *entid, loader);
-    //for (int i = 1; i < 0xc0; i++) {
-    //    EntityLoader_Entry* entry = &loader->loader_entries[i];
-    //    if (entry->component_id == 0)
-    //        continue;
-    //    /*if (loader->stu_id == 0x0400000000000001 && (entry->component_id == 0xe || entry->component_id == 0x1c))
-    //        entry->component_id = 0;*/
-    //    if (allmighty_hash_lib::components.find(entry->component_id) != allmighty_hash_lib::components.end())
-    //        printf("- Component %s (%x) (data %p %p %p )\n", allmighty_hash_lib::components[entry->component_id].name.c_str(), entry->component_id, entry->a1, entry->a2, entry->a3);
-    //    else
-    //        printf("- Component %x (data %p %p %p)\n", entry->component_id, entry->a1, entry->a2, entry->a3);
-    //}
-    /*if (loader->stu_id == 0x0400000000000169) {
-        printf("Hook Load");
-        auto entry = &loader->loader_entries[0x3F];
-        entry->component_id = 0x3f;
-        entry->a1 = 0;
-        entry->a2 = 0;
-        entry->a3 = 0;
-    }*/
-    /*if (loader->stu_id == 0x400000000000167) {
-        printf("break here!");
-        stacktrace();
-    }*/
-    /*if (loader->stu_id == 0x400000000000fc3) {
-        loader->loader_entries[0x4b].component_id = 0x4b;
-    }*/
-    /*auto result = emplace_entity_orig(ea, entid, loader);;
-    if (loader->stu_id == 0x0400000000000311) {
-        printf("hook here!\n");
-    }*/
-    //return result;
-    return emplace_entity_orig(ea, entid, loader);
+    uintptr_t caller = (uintptr_t)_ReturnAddress();
+    uintptr_t caller_rva = (caller >= globals::gameBase && caller < globals::gameBase + globals::gameSize)
+        ? (caller - globals::gameBase) : caller;
+    bool had_init = (loader && loader->loader_entries[1].init_data != 0);
+    Vector4 init_pos{}, init_scale{}, init_rot{};
+    if (had_init) {
+        auto* id = (Component_1_SceneRendering::InitData*)loader->loader_entries[1].init_data;
+        init_pos = id->position;
+        init_scale = id->scale;
+        init_rot = id->rotation;
+    }
+
+    Entity* ent = emplace_entity_orig(ea, entid, loader);
+
+    EntityAdminBase* game_ea = GameEntityAdmin();
+    if (ent && game_ea && ea == game_ea) {
+        auto* slot = OriginClutterTracker::GetSlot(ent->entity_id, ent);
+        if (slot) {
+            slot->spawn_caller_rva = caller_rva;
+            if (loader) {
+                slot->stu_id = loader->stu_id;
+                slot->additional_stu_id = loader->additional_stu_id;
+            }
+            slot->had_loader_init_data = had_init;
+            if (had_init) {
+                slot->loader_init_pos = init_pos;
+                slot->loader_init_scale = init_scale;
+                slot->loader_init_rot = init_rot;
+                float init_abs = fabsf(init_pos.X) + fabsf(init_pos.Y) + fabsf(init_pos.Z);
+                if (init_abs > 0.5f && !slot->has_nonzero_pos) {
+                    slot->has_nonzero_pos = true;
+                    slot->first_nonzero_pos = init_pos;
+                    slot->first_nonzero_rot = init_rot;
+                    slot->first_nonzero_caller_rva = caller_rva;
+                    slot->latest_nonzero_pos = init_pos;
+                    slot->latest_nonzero_rot = init_rot;
+                    slot->latest_nonzero_caller_rva = caller_rva;
+                }
+            }
+            auto* c1 = ent->getById<Component_1_SceneRendering>(1);
+            if (c1 && slot->has_nonzero_pos) {
+                float cur_abs = fabsf(c1->position.X) + fabsf(c1->position.Y) + fabsf(c1->position.Z);
+                uintptr_t parent_c1 = *(uintptr_t*)((uintptr_t)c1 + 0x1D0);
+                if (cur_abs < 0.05f && parent_c1 == 0 && OriginClutterTracker::s_block_zero_overwrites) {
+                    c1->SetPosRotation(slot->latest_nonzero_pos, slot->latest_nonzero_rot);
+                }
+            }
+            if (game_ea->local_entid != 0) {
+                extern void WeaponDiagLogFmt(const char* fmt, ...);
+                __int64 res_id = (ent->resload_entry && ent->resload_entry->valid()) ? ent->resload_entry->align()->resource_id : 0;
+                WeaponDiagLogFmt("[EMPLACE_ENT (+0x80F7C0)] caller=+0x%llX ent=0x%X stu=0x%llX res=0x%llX has_0D=%d has_1D=%d init_pos=(%.2f,%.2f,%.2f)",
+                    (unsigned long long)caller_rva, ent->entity_id,
+                    (unsigned long long)(loader ? loader->stu_id : 0),
+                    (unsigned long long)res_id,
+                    ent->hasComponent(0x0D) ? 1 : 0,
+                    ent->hasComponent(0x1D) ? 1 : 0,
+                    init_pos.X, init_pos.Y, init_pos.Z);
+            }
+        }
+    }
+    return ent;
 }
+
 
 typedef __int64(__fastcall* afterdatapackload_)(__int64 a1, __int64 a2, __int64 a3, int a4, int a5);
 afterdatapackload_ afterdatapackload_fn;//0xf3eb10
@@ -701,11 +729,8 @@ char __fastcall selectiveResLoad_hook(__int64 a1, __int64 a2)
     char v2; // al
     int v3; // eax
 
-    if ((*(_BYTE*)(a2 + 0x10) & 2) == 0) {
-        //printf("& 2 == 0\n");
-        //printf("aaa");
-        return 1;
-    }
+    // Allow server-replicated map props (((a2 + 0x10) & 2) == 0) to load offline,
+    // but do NOT return 1 early so they still go through the LoadEntIndex (+0x182b718) filter below.
     if ((*(_BYTE*)(a2 + 0x10) & 1) == 0)
     {
         v2 = *(_BYTE*)(a2 + 0x13);
@@ -731,26 +756,969 @@ char __fastcall selectiveResLoad_hook(__int64 a1, __int64 a2)
 
 char (*component_1_oncreate_orig)(Component_1_SceneRendering*, EntityLoader*);
 char componen1_oncreate_hook(Component_1_SceneRendering* comp, EntityLoader* loader) {
-    //0xa00450
+    char res = component_1_oncreate_orig(comp, loader);
+    if (comp && comp->base.entity_backref) {
+        Entity* ent = comp->base.entity_backref;
+        EntityAdminBase* game_ea = GameEntityAdmin();
+        if (game_ea && ent->entity_admin_backref == game_ea) {
+            auto* slot = OriginClutterTracker::GetSlot(ent->entity_id, ent);
+            if (slot) {
+                if (loader) {
+                    slot->stu_id = loader->stu_id;
+                    slot->additional_stu_id = loader->additional_stu_id;
+                }
+                float abs_pos = fabsf(comp->position.X) + fabsf(comp->position.Y) + fabsf(comp->position.Z);
+                if (abs_pos > 0.5f && comp->position.Y > -4000.0f) {
+                    if (!slot->has_nonzero_pos) {
+                        slot->has_nonzero_pos = true;
+                        slot->first_nonzero_pos = comp->position;
+                        slot->first_nonzero_rot = comp->rotation;
+                        slot->first_nonzero_caller_rva = 0xA00450;
+                    }
+                    slot->latest_nonzero_pos = comp->position;
+                    slot->latest_nonzero_rot = comp->rotation;
+                    slot->latest_nonzero_caller_rva = 0xA00450;
+                }
+            }
+        }
+    }
+    return res;
+}
 
-    /*if (comp->base.entity_backref->resload_entry->valid() && comp->base.entity_backref->resload_entry->align()->resource_id == 0x0400000000000311) {
-        printf("COMP1:!!\n");
-        printf("STU COMPONENT DATA: %p\n", loader->loader_entries[1].stu_component_data);
-        printf("INSTANTIATE DATA: %p\n", loader->loader_entries[1].init_data);
-        printf("STU INSTANCE DATA: %p\n", loader->loader_entries[1].stu_instance_data);
+typedef void(__fastcall* set_pos_rot_fn)(Component_1_SceneRendering* comp1, Vector4* rot, Vector4* pos);
+set_pos_rot_fn SetPosRotation_orig = nullptr;
+set_pos_rot_fn SetPosRotationInternal_orig = nullptr;
 
-        auto init_data = (Component1_InitData*)loader->loader_entries[1].init_data;
-        printf("init_data field_0:  %f %f %f %f\n", init_data->field_1, init_data->field_2, init_data->field_3, init_data->field_4);
-        printf("init_data field_10: %f %f %f %f\n", init_data->field_10.X, init_data->field_10.Y, init_data->field_10.Z, init_data->field_10.W);
-        init_data->field_10.X = 3;
-        init_data->field_10.Y = 3;
-        init_data->field_10.Z = 3;
-        init_data->field_10.W = 3;
-        printf("init_data field_20: %f %f %f %f\n", init_data->field_20.X, init_data->field_20.Y, init_data->field_20.Z, init_data->field_20.W);
-        printf("\n");
-    }*/
+static bool HandleComponent1TransformHook(Component_1_SceneRendering* comp1, Vector4* rot, Vector4* pos, uintptr_t caller_rva, Vector4& out_rot, Vector4& out_pos) {
+    if (!comp1 || !pos || !comp1->base.entity_backref)
+        return false;
+    Entity* ent = comp1->base.entity_backref;
+    EntityAdminBase* game_ea = GameEntityAdmin();
+    if (!game_ea || ent->entity_admin_backref != game_ea)
+        return false;
+    auto* slot = OriginClutterTracker::GetSlot(ent->entity_id, ent);
+    if (!slot)
+        return false;
 
-    return component_1_oncreate_orig(comp, loader);
+    // 1. If culled by Heracles, ALWAYS lock both physics (+0xA04000) and visual render transform (+0xA045C0) to (0, -5000, 0)
+    if (slot->culled_by_heracles) {
+        out_pos = Vector4(0.0f, -5000.0f, 0.0f, 0.0f);
+        out_rot = Vector4(0.0f, 0.0f, 0.0f, 1.0f);
+        return true;
+    }
+
+    float abs_sum = fabsf(pos->X) + fabsf(pos->Y) + fabsf(pos->Z);
+    bool is_cull_pos = (pos->Y < -4000.0f);
+    uintptr_t parent_c1 = *(uintptr_t*)((uintptr_t)comp1 + 0x1D0);
+
+    // Never treat attached child entities (whose pos at +0x60 is a parent/bone-relative offset) as world-space clutter
+    if (parent_c1 != 0)
+        return false;
+
+    // 2. Record valid non-zero world transforms
+    if (!is_cull_pos && abs_sum > 0.5f) {
+        if (!slot->has_nonzero_pos) {
+            slot->has_nonzero_pos = true;
+            slot->first_nonzero_pos = *pos;
+            slot->first_nonzero_rot = rot ? *rot : comp1->rotation;
+            slot->first_nonzero_caller_rva = caller_rva;
+        }
+        slot->latest_nonzero_pos = *pos;
+        if (rot) slot->latest_nonzero_rot = *rot;
+        slot->latest_nonzero_caller_rva = caller_rva;
+        return false;
+    }
+
+    // 3. Intercept (0,0,0) overwrites (including +0xD06600 -> +0xA045C0 pre-render Component_12 ticks!)
+    if (!is_cull_pos && abs_sum < 0.05f) {
+        slot->zero_set_count++;
+        slot->last_zero_caller_rva = caller_rva;
+        bool is_attach_call = (caller_rva >= 0xA01000 && caller_rva < 0xA01600);
+        bool is_player_or_weapon_ent = (ent->hasComponent(0x15) || ent->hasComponent(0x2F) || ent->hasComponent(0x3F) || ent->hasComponent(0x1D));
+        if (slot->has_nonzero_pos && parent_c1 == 0 && !is_attach_call && !is_player_or_weapon_ent) {
+            slot->zero_overwrite_count++;
+            slot->last_zero_overwrite_caller_rva = caller_rva;
+            if (OriginClutterTracker::s_block_zero_overwrites) {
+                slot->zero_overwrite_blocked_count++;
+                OriginClutterTracker::s_total_zero_overwrites_blocked++;
+                out_pos = slot->latest_nonzero_pos;
+                bool has_valid_saved_rot = (slot->latest_nonzero_rot.W != 0.0f || slot->latest_nonzero_rot.X != 0.0f || slot->latest_nonzero_rot.Y != 0.0f || slot->latest_nonzero_rot.Z != 0.0f);
+                out_rot = has_valid_saved_rot ? slot->latest_nonzero_rot : (rot ? *rot : Vector4(0.0f, 0.0f, 0.0f, 1.0f));
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static constexpr int WEAPON_DIAG_RING_SIZE = 256;
+struct WeaponDiagEntry {
+    uint32_t seq = 0;
+    char text[380]{};
+};
+static WeaponDiagEntry s_weapon_diag_ring[WEAPON_DIAG_RING_SIZE]{};
+static volatile LONG s_weapon_diag_seq = 0;
+
+template<typename T>
+static T SafeReadVal(uintptr_t addr, T fallback = T{}) {
+    if (addr < 0x10000ULL) return fallback;
+    __try {
+        return *(const T*)addr;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return fallback;
+    }
+}
+
+void WeaponDiagLogFmt(const char* fmt, ...) {
+    LONG seq = InterlockedIncrement(&s_weapon_diag_seq);
+    WeaponHardpointDiag::s_total_events_logged = (int)seq;
+    WeaponDiagEntry& e = s_weapon_diag_ring[(seq - 1) & (WEAPON_DIAG_RING_SIZE - 1)];
+    e.seq = (uint32_t)seq;
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(e.text, sizeof(e.text) - 1, fmt, args);
+    e.text[sizeof(e.text) - 1] = '\0';
+    va_end(args);
+}
+
+static bool Has1PViewModelEntity(uintptr_t weapon_mgr) {
+    if (!weapon_mgr) return false;
+    uintptr_t comp23 = SafeReadVal<uintptr_t>(weapon_mgr);
+    if (!comp23) return false;
+    Entity* owner = SafeReadVal<Entity*>(comp23 + 0x08);
+    if (!owner || !owner->component_list.ptr) return false;
+    for (int i = 0; i < owner->component_list.num - 1; i++) {
+        ComponentBase* comp = owner->component_list.ptr[i];
+        if (comp && comp->component_id == 0x22) {
+            return SafeReadVal<uintptr_t>((uintptr_t)comp + 0x20) != 0;
+        }
+    }
+    return false;
+}
+
+typedef void(__fastcall* update_weapon_attachments_fn)(uintptr_t weapon_mgr, uint8_t is_1p);
+update_weapon_attachments_fn UpdateWeaponAttachments_orig = nullptr;
+void __fastcall UpdateWeaponAttachments_hook(uintptr_t weapon_mgr, uint8_t is_1p) {
+    uintptr_t caller = (uintptr_t)_ReturnAddress();
+    uintptr_t caller_rva = (caller >= globals::gameBase && caller < globals::gameBase + globals::gameSize)
+        ? (caller - globals::gameBase) : caller;
+    bool has_1p = Has1PViewModelEntity(weapon_mgr);
+    uint32 owner_entid = 0;
+    int32_t entries_cnt = 0;
+    if (weapon_mgr) {
+        uintptr_t comp23 = SafeReadVal<uintptr_t>(weapon_mgr);
+        if (comp23) {
+            Entity* owner = SafeReadVal<Entity*>(comp23 + 0x08);
+            if (owner) owner_entid = SafeReadVal<uint32>((uintptr_t)&owner->entity_id);
+        }
+        entries_cnt = SafeReadVal<int32_t>(weapon_mgr + 0x10);
+    }
+    WeaponHardpointDiag::s_update_weapon_calls++;
+    UpdateWeaponAttachments_orig(weapon_mgr, is_1p);
+
+    uint32 slot0_0 = 0, slot1_0 = 0;
+    uint64 handle_0 = 0;
+    if (weapon_mgr && entries_cnt > 0 && entries_cnt < 64) {
+        uintptr_t entries_ptr = SafeReadVal<uintptr_t>(weapon_mgr + 0x08);
+        if (entries_ptr) {
+            slot0_0 = SafeReadVal<uint32>(entries_ptr + 0x00);
+            slot1_0 = SafeReadVal<uint32>(entries_ptr + 0x04);
+            handle_0 = SafeReadVal<uint64>(entries_ptr + 0x168);
+        }
+    }
+    WeaponDiagLogFmt("[UPDATE_WEAPONS (+0xD563D0)] caller=+0x%llX owner=0x%X is_1p=%u has_1p_ent=%d cnt=%d e0:(h=0x%llX s0=0x%X s1=0x%X)",
+        (unsigned long long)caller_rva, owner_entid, is_1p, has_1p ? 1 : 0, entries_cnt,
+        (unsigned long long)handle_0, slot0_0, slot1_0);
+}
+
+typedef uint32*(__fastcall* resolve_weapon_or_parent_fn)(uintptr_t weapon_mgr, uint32* out_entid, uint64 weapon_handle, int slot_index, int fallback_to_3p, int fallback_to_owner, void* out_ea);
+resolve_weapon_or_parent_fn ResolveWeaponOrParentEntity_orig = nullptr;
+uint32* __fastcall ResolveWeaponOrParentEntity_hook(uintptr_t weapon_mgr, uint32* out_entid, uint64 weapon_handle, int slot_index, int fallback_to_3p, int fallback_to_owner, void* out_ea) {
+    uintptr_t caller = (uintptr_t)_ReturnAddress();
+    uintptr_t caller_rva = (caller >= globals::gameBase && caller < globals::gameBase + globals::gameSize)
+        ? (caller - globals::gameBase) : caller;
+    WeaponHardpointDiag::s_resolve_weapon_calls++;
+    uint32* res = ResolveWeaponOrParentEntity_orig(weapon_mgr, out_entid, weapon_handle, slot_index, fallback_to_3p, fallback_to_owner, out_ea);
+    uint32 resolved_id = out_entid ? SafeReadVal<uint32>((uintptr_t)out_entid) : 0;
+    uint32 owner_entid = 0;
+    int32_t entries_cnt = 0;
+    if (weapon_mgr) {
+        uintptr_t comp23 = SafeReadVal<uintptr_t>(weapon_mgr);
+        if (comp23) {
+            Entity* owner = SafeReadVal<Entity*>(comp23 + 0x08);
+            if (owner) owner_entid = SafeReadVal<uint32>((uintptr_t)&owner->entity_id);
+        }
+        entries_cnt = SafeReadVal<int32_t>(weapon_mgr + 0x10);
+    }
+    WeaponDiagLogFmt("[RESOLVE_WEAPON (+0xD560B0)] caller=+0x%llX owner=0x%X handle=0x%llX slot=%d fb3p=%d fbOwn=%d cnt=%d -> out_ent=0x%X",
+        (unsigned long long)caller_rva, owner_entid, (unsigned long long)weapon_handle,
+        slot_index, fallback_to_3p, fallback_to_owner, entries_cnt, resolved_id);
+    return res;
+}
+
+typedef void(__fastcall* spawn_weapon_fire_effect_fn)(uintptr_t action_node, uint32_t shot_idx);
+spawn_weapon_fire_effect_fn SpawnWeaponFireEffect_orig = nullptr;
+void __fastcall SpawnWeaponFireEffect_hook(uintptr_t action_node, uint32_t shot_idx) {
+    uintptr_t caller = (uintptr_t)_ReturnAddress();
+    uintptr_t caller_rva = (caller >= globals::gameBase && caller < globals::gameBase + globals::gameSize)
+        ? (caller - globals::gameBase) : caller;
+    ++WeaponHardpointDiag::s_fire_shot_calls;
+    if (action_node) {
+        int32_t barrel_cnt = SafeReadVal<int32_t>(action_node + 0x1C8);
+        uintptr_t barrels = SafeReadVal<uintptr_t>(action_node + 0x1C0);
+        if (barrel_cnt > 0 && barrels != 0) {
+            uint32_t muzzle_ent = SafeReadVal<uint32_t>(barrels + 0x40, 0xFFFFFFFF);
+            if (muzzle_ent == 0xFFFFFFFF) {
+                ((void(__fastcall*)(uintptr_t, uint8_t))(globals::gameBase + 0xd47070))(action_node, 1);
+            }
+        }
+    }
+    int32_t cnt_1C8 = SafeReadVal<int32_t>(action_node + 0x1C8, -1);
+    int32_t div_14C = SafeReadVal<int32_t>(action_node + 0x14C, -1);
+    WeaponDiagLogFmt("[FIRE_SHOT_BEGIN (+0xD46060)] caller=+0x%llX node=0x%llX shot_idx=%u cnt_1C8=%d div_14C=%d",
+        (unsigned long long)caller_rva, (unsigned long long)action_node, shot_idx, cnt_1C8, div_14C);
+    SpawnWeaponFireEffect_orig(action_node, shot_idx);
+}
+
+typedef uint8_t(__fastcall* spawn_ss_effect_fn)(uintptr_t effect_node, uintptr_t ss_inst, uintptr_t a3);
+spawn_ss_effect_fn SpawnStatescriptEffect_orig = nullptr;
+uint8_t __fastcall SpawnStatescriptEffect_hook(uintptr_t effect_node, uintptr_t ss_inst, uintptr_t a3) {
+    uintptr_t caller = (uintptr_t)_ReturnAddress();
+    uintptr_t caller_rva = (caller >= globals::gameBase && caller < globals::gameBase + globals::gameSize)
+        ? (caller - globals::gameBase) : caller;
+    ++WeaponHardpointDiag::s_ss_effect_calls;
+    uint8_t ret = SpawnStatescriptEffect_orig(effect_node, ss_inst, a3);
+    WeaponDiagLogFmt("[SS_EFFECT (+0xD58110)] caller=+0x%llX node=0x%llX ss_inst=0x%llX a3=0x%llX -> ret=%u",
+        (unsigned long long)caller_rva, (unsigned long long)effect_node, (unsigned long long)ss_inst, (unsigned long long)a3, ret);
+    return ret;
+}
+
+typedef void(__fastcall* attach_c1_hp_fn)(Component_1_SceneRendering* child_c1, Component_1_SceneRendering* parent_c1, uint64_t hp_id, Vector4* rot, Vector4* pos);
+attach_c1_hp_fn AttachComponent1ToHardpoint_orig = nullptr;
+void __fastcall AttachComponent1ToHardpoint_hook(Component_1_SceneRendering* child_c1, Component_1_SceneRendering* parent_c1, uint64_t hp_id, Vector4* rot, Vector4* pos) {
+    uintptr_t caller = (uintptr_t)_ReturnAddress();
+    uintptr_t caller_rva = (caller >= globals::gameBase && caller < globals::gameBase + globals::gameSize)
+        ? (caller - globals::gameBase) : caller;
+    Entity* c_ent = child_c1 ? SafeReadVal<Entity*>((uintptr_t)&child_c1->base.entity_backref) : nullptr;
+    Entity* p_ent = parent_c1 ? SafeReadVal<Entity*>((uintptr_t)&parent_c1->base.entity_backref) : nullptr;
+    uint32 child_id = c_ent ? SafeReadVal<uint32>((uintptr_t)&c_ent->entity_id) : 0;
+    uint32 parent_id = p_ent ? SafeReadVal<uint32>((uintptr_t)&p_ent->entity_id) : 0;
+    AttachComponent1ToHardpoint_orig(child_c1, parent_c1, hp_id, rot, pos);
+    uint16_t bone_idx = SafeReadVal<uint16_t>((uintptr_t)child_c1 + 0x1F4, 0xFFFF);
+    Vector4 c_world = SafeReadVal<Vector4>((uintptr_t)child_c1 + 0xC0);
+    WeaponDiagLogFmt("[ATTACH_HP (+0xA01160)] caller=+0x%llX child=0x%X parent=0x%X hp=0x%llX -> bone=%u world=(%.2f,%.2f,%.2f)",
+        (unsigned long long)caller_rva, child_id, parent_id, (unsigned long long)hp_id, bone_idx, c_world.X, c_world.Y, c_world.Z);
+}
+
+typedef void(__fastcall* attach_c1_internal_fn)(Component_1_SceneRendering* child_c1, Component_1_SceneRendering* parent_c1, uintptr_t hp_info, Vector4* rot, Vector4* pos);
+attach_c1_internal_fn AttachComponent1Internal_orig = nullptr;
+void __fastcall AttachComponent1Internal_hook(Component_1_SceneRendering* child_c1, Component_1_SceneRendering* parent_c1, uintptr_t hp_info, Vector4* rot, Vector4* pos) {
+    uintptr_t caller = (uintptr_t)_ReturnAddress();
+    uintptr_t caller_rva = (caller >= globals::gameBase && caller < globals::gameBase + globals::gameSize)
+        ? (caller - globals::gameBase) : caller;
+    WeaponHardpointDiag::s_attach_calls++;
+    AttachComponent1Internal_orig(child_c1, parent_c1, hp_info, rot, pos);
+
+    Entity* c_ent = child_c1 ? SafeReadVal<Entity*>((uintptr_t)&child_c1->base.entity_backref) : nullptr;
+    Entity* p_ent = parent_c1 ? SafeReadVal<Entity*>((uintptr_t)&parent_c1->base.entity_backref) : nullptr;
+    uint32 child_id = c_ent ? SafeReadVal<uint32>((uintptr_t)&c_ent->entity_id) : 0;
+    uint32 parent_id = p_ent ? SafeReadVal<uint32>((uintptr_t)&p_ent->entity_id) : 0;
+    if (parent_id != 0 && GameEntityAdmin() && GameEntityAdmin()->local_entid != 0) {
+        uint64_t hp_id = SafeReadVal<uint64_t>((uintptr_t)child_c1 + 0x1E8);
+        uint16_t bone_idx = SafeReadVal<uint16_t>((uintptr_t)child_c1 + 0x1F4, 0xFFFF);
+        uint8_t inh_rot = SafeReadVal<uint8_t>((uintptr_t)child_c1 + 0x1F6);
+        uint8_t maint_w = SafeReadVal<uint8_t>((uintptr_t)child_c1 + 0x1F7);
+        Vector4 c_world = SafeReadVal<Vector4>((uintptr_t)child_c1 + 0xC0);
+        Vector4 p_world = SafeReadVal<Vector4>((uintptr_t)parent_c1 + 0xC0);
+        uintptr_t p_1a8 = SafeReadVal<uintptr_t>((uintptr_t)parent_c1 + 0x1A8);
+        uint64_t p_1b8 = SafeReadVal<uint64_t>((uintptr_t)parent_c1 + 0x1B8);
+        WeaponDiagLogFmt("[ATTACH_INT (+0xA01430)] caller=+0x%llX child=0x%X parent=0x%X hp=0x%llX bone=%u inh=%u mw=%u p1A8=0x%llX p1B8=0x%llX cW=(%.2f,%.2f,%.2f) pW=(%.2f,%.2f,%.2f)",
+            (unsigned long long)caller_rva, child_id, parent_id, (unsigned long long)hp_id, bone_idx, inh_rot, maint_w,
+            (unsigned long long)p_1a8, (unsigned long long)p_1b8,
+            c_world.X, c_world.Y, c_world.Z, p_world.X, p_world.Y, p_world.Z);
+    }
+}
+
+typedef uint8_t(__fastcall* try_play_barrel_muzzle_fn)(uintptr_t entry, uintptr_t game_ea);
+try_play_barrel_muzzle_fn TryPlayBarrelMuzzleFlash_orig = nullptr;
+uint8_t __fastcall TryPlayBarrelMuzzleFlash_hook(uintptr_t entry, uintptr_t game_ea) {
+    uint64_t handle = entry ? SafeReadVal<uint64_t>(entry + 0xD8) : 0;
+    uint32_t e4 = entry ? SafeReadVal<uint32_t>(entry + 0xE4) : 0;
+    uint32_t f4 = entry ? SafeReadVal<uint32_t>(entry + 0xF4) : 0;
+    uint32_t f8 = entry ? SafeReadVal<uint32_t>(entry + 0xF8) : 0;
+    uint32_t state_idx = (uint32_t)((handle >> 8) & 0x7FF);
+    uint16_t inst_id_13 = (uint16_t)((handle >> 19) & 0x1FFF);
+
+    uintptr_t patched_id_addr = 0;
+    uint16_t orig_raw_id = 0;
+    uintptr_t matched_node = 0;
+    uint32_t b0_ent = 0, b1_ent = 0;
+
+    if (entry && game_ea && handle != 0 && e4 != 0 && e4 != 0xFFFFFFFF) {
+        Entity* shooter = ((EntityAdminBase*)game_ea)->getEntById(e4);
+        ComponentBase* c23 = shooter ? shooter->getById(0x23) : nullptr;
+        if (c23) {
+            uintptr_t g3_ptr = SafeReadVal<uintptr_t>((uintptr_t)c23 + 0x1E0);
+            int32_t g3_cnt = SafeReadVal<int32_t>((uintptr_t)c23 + 0x1E8);
+            if (g3_ptr && g3_cnt > 0 && g3_cnt < 256) {
+                for (int32_t i = 0; i < g3_cnt; i++) {
+                    uintptr_t slot_addr = g3_ptr + (uintptr_t)i * 0x10;
+                    uint16_t raw_id = SafeReadVal<uint16_t>(slot_addr + 8);
+                    if ((raw_id & 0x1FFF) == inst_id_13) {
+                        orig_raw_id = raw_id;
+                        if (raw_id != inst_id_13) {
+                            patched_id_addr = slot_addr + 8;
+                            *(uint16_t*)patched_id_addr = inst_id_13;
+                        }
+                        uintptr_t ss_inst = SafeReadVal<uintptr_t>(slot_addr);
+                        if (ss_inst) {
+                            uint32_t impl_cnt = SafeReadVal<uint32_t>(ss_inst + 0xA8);
+                            uintptr_t impl_arr = SafeReadVal<uintptr_t>(ss_inst + 0xA0);
+                            if (impl_arr && state_idx < impl_cnt) {
+                                matched_node = SafeReadVal<uintptr_t>(impl_arr + (uintptr_t)state_idx * 8);
+                                if (matched_node) {
+                                    int32_t b_cnt = SafeReadVal<int32_t>(matched_node + 0x1C8);
+                                    uintptr_t b_arr = SafeReadVal<uintptr_t>(matched_node + 0x1C0);
+                                    if (b_arr && b_cnt > 0) {
+                                        b0_ent = SafeReadVal<uint32_t>(b_arr + 0x40);
+                                        if (b_cnt > 1) b1_ent = SafeReadVal<uint32_t>(b_arr + 0x50 + 0x40);
+                                    }
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    uint8_t ret = TryPlayBarrelMuzzleFlash_orig(entry, game_ea);
+
+    if (patched_id_addr) {
+        *(uint16_t*)patched_id_addr = orig_raw_id;
+    }
+
+    WeaponDiagLogFmt("[TRY_BARREL_MUZZLE (+0xCBA3F0)] handle=0x%llX e4=0x%X f4=%u f8=%u st=%u id13=0x%X raw_id=0x%X node=0x%llX b0=0x%X b1=0x%X -> ret=%u",
+        (unsigned long long)handle, e4, f4, f8, state_idx, inst_id_13, orig_raw_id,
+        (unsigned long long)matched_node, b0_ent, b1_ent, ret);
+    return ret;
+}
+
+typedef uintptr_t(__fastcall* process_muzzle_flash_entry_fn)(uintptr_t entry, uintptr_t game_ea);
+process_muzzle_flash_entry_fn ProcessMuzzleFlashEntry_orig = nullptr;
+uintptr_t __fastcall ProcessMuzzleFlashEntry_hook(uintptr_t entry, uintptr_t game_ea) {
+    uint64_t shot_node_handle = 0;
+    uint32_t shooter_entid = 0;
+    uint32_t orig_e4 = 0;
+    uint8_t orig_106 = 0;
+    if (entry) {
+        shot_node_handle = SafeReadVal<uint64_t>(entry + 0xD8);
+        shooter_entid = SafeReadVal<uint32_t>(entry + 0xE0);
+        orig_e4 = SafeReadVal<uint32_t>(entry + 0xE4);
+        orig_106 = SafeReadVal<uint8_t>(entry + 0x106);
+        if (shot_node_handle != 0) {
+            if (shooter_entid != 0 && shooter_entid != 0xFFFFFFFF) {
+                *(uint32_t*)(entry + 0xE4) = shooter_entid;
+            }
+            *(uint8_t*)(entry + 0x106) &= ~0x40;
+        }
+    }
+    uintptr_t ret = ProcessMuzzleFlashEntry_orig(entry, game_ea);
+    if (entry) {
+        WeaponDiagLogFmt("[MUZZLE_ENTRY (+0xCBA6D0)] handle=0x%llX e0=0x%X e4_orig=0x%X e4_new=0x%X f4=%u f8=%u flg_orig=0x%02X -> ret_ent=0x%llX",
+            (unsigned long long)shot_node_handle, shooter_entid, orig_e4,
+            SafeReadVal<uint32_t>(entry + 0xE4),
+            SafeReadVal<uint32_t>(entry + 0xF4), SafeReadVal<uint32_t>(entry + 0xF8),
+            orig_106, (unsigned long long)ret);
+    }
+    return ret;
+}
+
+void __fastcall SetPosRotation_hook(Component_1_SceneRendering* comp1, Vector4* rot, Vector4* pos) {
+    uintptr_t caller = (uintptr_t)_ReturnAddress();
+    uintptr_t caller_rva = (caller >= globals::gameBase && caller < globals::gameBase + globals::gameSize)
+        ? (caller - globals::gameBase) : caller;
+    Vector4 override_rot{}, override_pos{};
+    if (HandleComponent1TransformHook(comp1, rot, pos, caller_rva, override_rot, override_pos)) {
+        SetPosRotation_orig(comp1, &override_rot, &override_pos);
+        return;
+    }
+    SetPosRotation_orig(comp1, rot, pos);
+}
+
+void __fastcall SetPosRotationInternal_hook(Component_1_SceneRendering* comp1, Vector4* rot, Vector4* pos) {
+    uintptr_t caller = (uintptr_t)_ReturnAddress();
+    uintptr_t caller_rva = (caller >= globals::gameBase && caller < globals::gameBase + globals::gameSize)
+        ? (caller - globals::gameBase) : caller;
+    Vector4 override_rot{}, override_pos{};
+    if (HandleComponent1TransformHook(comp1, rot, pos, caller_rva, override_rot, override_pos)) {
+        SetPosRotationInternal_orig(comp1, &override_rot, &override_pos);
+        return;
+    }
+    SetPosRotationInternal_orig(comp1, rot, pos);
+}
+
+typedef void(__fastcall* set_pos_fn)(Component_1_SceneRendering* comp1, Vector4* pos);
+set_pos_fn SetPosition_orig = nullptr;
+void __fastcall SetPosition_hook(Component_1_SceneRendering* comp1, Vector4* pos) {
+    uintptr_t caller = (uintptr_t)_ReturnAddress();
+    uintptr_t caller_rva = (caller >= globals::gameBase && caller < globals::gameBase + globals::gameSize)
+        ? (caller - globals::gameBase) : caller;
+    Vector4 override_rot{}, override_pos{};
+    if (HandleComponent1TransformHook(comp1, nullptr, pos, caller_rva, override_rot, override_pos)) {
+        SetPosition_orig(comp1, &override_pos);
+        return;
+    }
+    SetPosition_orig(comp1, pos);
+}
+
+int OriginClutterTracker::CullUnplacedOriginProps(EntityAdminBase* game_ea) {
+    if (!game_ea) return 0;
+    int culled = 0;
+    uint32 local_ctrl_id = game_ea->local_entid;
+    uint32 local_mdl_id = 0;
+    if (Entity* lc = game_ea->getLocalEnt()) {
+        if (auto* pet = lc->getById<Component_20_ModelReference>(0x20)) {
+            local_mdl_id = pet->cam_attach_entid ? pet->cam_attach_entid : pet->aim_entid;
+        }
+    }
+    for (Entity* ent : *game_ea) {
+        if (!ent) continue;
+        if (ent->entity_id == local_ctrl_id || ent->entity_id == local_mdl_id) continue;
+        // Never touch player controllers, player models, PvP game state, or weapons (Component_1D = Tracer's Pulse Pistols!)
+        if (ent->hasComponent(0x15) || ent->hasComponent(0x2F) || ent->hasComponent(0x3F) || ent->hasComponent(0x24) || ent->hasComponent(0x1D)) continue;
+        // Must have a 3D model component (0x1C) to be visual/physical map clutter
+        if (!ent->hasComponent(0x1C)) continue;
+
+        auto* c1 = ent->getById<Component_1_SceneRendering>(1);
+        if (!c1) continue;
+        uintptr_t parent_c1 = *(uintptr_t*)((uintptr_t)c1 + 0x1D0);
+        if (parent_c1 != 0) continue;
+
+        auto* slot = GetSlot(ent->entity_id, ent);
+        if (slot && slot->culled_by_heracles) continue;
+        // Never touch child/hardpoint-spawned entities (+0xD56BFB = weapon/hardpoint spawner)
+        if (slot && slot->spawn_caller_rva == 0xD56BFB) continue;
+
+        float abs_pos = fabsf(c1->position.X) + fabsf(c1->position.Y) + fabsf(c1->position.Z);
+        bool had_zero_overwrite = slot && (slot->zero_overwrite_count > 0 || slot->direct_zero_overwrite_count > 0);
+        if (abs_pos < 0.25f || had_zero_overwrite) {
+            if (slot) {
+                slot->pre_cull_pos = slot->has_nonzero_pos ? slot->latest_nonzero_pos : c1->position;
+                slot->pre_cull_rot = slot->has_nonzero_pos ? slot->latest_nonzero_rot : c1->rotation;
+                slot->culled_by_heracles = true;
+            }
+            Vector4 hidden_pos(0.0f, -5000.0f, 0.0f, 0.0f);
+            Vector4 ident_rot(0.0f, 0.0f, 0.0f, 1.0f);
+            c1->SetPosRotation(hidden_pos, ident_rot);
+            c1->SetScale(Vector4(0.0f, 0.0f, 0.0f, 0.0f));
+            c1->SetInvisible();
+            culled++;
+            s_total_culled_props++;
+        }
+    }
+    return culled;
+}
+
+int OriginClutterTracker::RestoreCulledProps(EntityAdminBase* game_ea) {
+    if (!game_ea) return 0;
+    int restored = 0;
+    for (Entity* ent : *game_ea) {
+        if (!ent) continue;
+        auto* slot = GetSlot(ent->entity_id, ent);
+        if (slot && slot->culled_by_heracles) {
+            slot->culled_by_heracles = false;
+            auto* c1 = ent->getById<Component_1_SceneRendering>(1);
+            if (c1) {
+                Vector4 target_pos = slot->has_nonzero_pos ? slot->latest_nonzero_pos : slot->pre_cull_pos;
+                Vector4 target_rot = slot->has_nonzero_pos ? slot->latest_nonzero_rot : slot->pre_cull_rot;
+                if (target_rot.X == 0.0f && target_rot.Y == 0.0f && target_rot.Z == 0.0f && target_rot.W == 0.0f) {
+                    target_rot.W = 1.0f;
+                }
+                c1->SetScale(Vector4(1.0f, 1.0f, 1.0f, 1.0f));
+                c1->SetPosRotation(target_pos, target_rot);
+                c1->SetVisible();
+            }
+            restored++;
+        }
+    }
+    s_total_culled_props = 0;
+    return restored;
+}
+
+void OriginClutterTracker::DumpReportToFile(EntityAdminBase* game_ea, const char* trigger_reason) {
+    if (!game_ea) return;
+    auto* world = get_system27_WorldEngineSystem(game_ea);
+    __int64 map_id = world ? world->loaded_map_id : 0;
+    int wstate = world ? (int)world->world_state : -1;
+
+    std::string out;
+    out.reserve(65536);
+    out += "# Origin Clutter Runtime Diagnostic Log (Step 2C)\n\n";
+    out += std::format("- **Trigger Reason**: `{}`\n", trigger_reason ? trigger_reason : "Auto");
+    out += std::format("- **Loaded Map ID**: `0x{:016X}` (`world_state = {}`)\n", (unsigned long long)map_id, wstate);
+    out += std::format("- **Case B (`s_block_zero_overwrites`)**: `{}` (Total Blocked Calls: `{}`)\n",
+        s_block_zero_overwrites ? "ENABLED" : "DISABLED", s_total_zero_overwrites_blocked);
+    out += std::format("- **Case A (`s_auto_cull_unplaced_origin_props`)**: `{}` (Total Culled Props: `{}`)\n\n",
+        s_auto_cull_unplaced_origin_props ? "ENABLED" : "DISABLED", s_total_culled_props);
+
+    int total_ents = 0;
+    int total_nonzero = 0;
+    int total_near_origin = 0;
+    int total_had_overwrites = 0;
+
+    for (Entity* ent : *game_ea) {
+        if (!ent) continue;
+        total_ents++;
+        auto* slot = GetSlot(ent->entity_id, ent);
+        if (slot && slot->has_nonzero_pos) total_nonzero++;
+        if (slot && (slot->zero_overwrite_count > 0 || slot->direct_zero_overwrite_count > 0)) total_had_overwrites++;
+        auto* c1 = ent->getById<Component_1_SceneRendering>(1);
+        if (c1) {
+            float abs_pos = fabsf(c1->position.X) + fabsf(c1->position.Y) + fabsf(c1->position.Z);
+            if (abs_pos < 10.0f || (slot && slot->culled_by_heracles)) {
+                total_near_origin++;
+            }
+        }
+    }
+
+    out += std::format("## Summary Counts\n- **Total `GameEntityAdmin` Entities**: `{}`\n", total_ents);
+    out += std::format("- **Entities With Valid Non-Zero World Position**: `{}`\n", total_nonzero);
+    out += std::format("- **Entities With Attempted Non-Zero -> `(0,0,0)` Overwrites (Case B)**: `{}`\n", total_had_overwrites);
+    out += std::format("- **Entities Currently Within 10m of `(0,0,0)` (or Culled)**: `{}`\n\n", total_near_origin);
+
+    out += "## 1. Entities Where Non-Zero Position Was Overwritten Toward `(0,0,0)` (Case B)\n";
+    out += "| EntID | STU ID | Resload ID | Spawn Caller | First NonZero Pos | First Caller | Zero Overwrite Count | Last Zero Caller | Current Pos | Components |\n";
+    out += "|---|---|---|---|---|---|---|---|---|---|\n";
+
+    for (Entity* ent : *game_ea) {
+        if (!ent) continue;
+        auto* slot = GetSlot(ent->entity_id, ent);
+        if (!slot || (slot->zero_overwrite_count == 0 && slot->direct_zero_overwrite_count == 0)) continue;
+
+        __int64 res_id = (ent->resload_entry && ent->resload_entry->valid()) ? ent->resload_entry->align()->resource_id : 0;
+        auto* c1 = ent->getById<Component_1_SceneRendering>(1);
+        Vector4 cur_pos = c1 ? c1->position : Vector4{};
+
+        std::string comps_str;
+        for (int i = 0; i < ent->component_list.num - 1; i++) {
+            if (ent->component_list.ptr[i]) {
+                if (!comps_str.empty()) comps_str += ",";
+                comps_str += std::format("{:02X}", (int)ent->component_list.ptr[i]->component_id);
+            }
+        }
+
+        out += std::format("| `0x{:X}` | `0x{:X}` | `0x{:X}` | `+0x{:X}` | `({:.2f}, {:.2f}, {:.2f})` | `+0x{:X}` | `{}` (direct `{}`) | `+0x{:X}` | `({:.2f}, {:.2f}, {:.2f})` | `[{}]` |\n",
+            ent->entity_id,
+            (unsigned long long)slot->stu_id,
+            (unsigned long long)res_id,
+            (unsigned int)slot->spawn_caller_rva,
+            slot->first_nonzero_pos.X, slot->first_nonzero_pos.Y, slot->first_nonzero_pos.Z,
+            (unsigned int)slot->first_nonzero_caller_rva,
+            slot->zero_overwrite_count, slot->direct_zero_overwrite_count,
+            (unsigned int)slot->last_zero_overwrite_caller_rva,
+            cur_pos.X, cur_pos.Y, cur_pos.Z,
+            comps_str);
+    }
+
+    out += "\n## 2. All Entities Near `(0,0,0)` (`|X|+|Y|+|Z| < 10.0`) or Culled (Case A & Origin Entities)\n";
+    out += "| EntID | STU ID | Resload ID | Spawn Caller | Loader InitPos | Current Pos | Parent C1 | HasNonZero | Culled | Components |\n";
+    out += "|---|---|---|---|---|---|---|---|---|---|\n";
+
+    for (Entity* ent : *game_ea) {
+        if (!ent) continue;
+        auto* c1 = ent->getById<Component_1_SceneRendering>(1);
+        if (!c1) continue;
+        auto* slot = GetSlot(ent->entity_id, ent);
+        float abs_pos = fabsf(c1->position.X) + fabsf(c1->position.Y) + fabsf(c1->position.Z);
+        if (abs_pos >= 10.0f && !(slot && slot->culled_by_heracles)) continue;
+
+        __int64 res_id = (ent->resload_entry && ent->resload_entry->valid()) ? ent->resload_entry->align()->resource_id : 0;
+        uintptr_t parent_c1 = *(uintptr_t*)((uintptr_t)c1 + 0x1D0);
+        uint32 parent_entid = 0;
+        if (parent_c1 != 0) {
+            auto* p_comp = (Component_1_SceneRendering*)parent_c1;
+            if (p_comp->base.entity_backref) parent_entid = p_comp->base.entity_backref->entity_id;
+        }
+
+        std::string comps_str;
+        for (int i = 0; i < ent->component_list.num - 1; i++) {
+            if (ent->component_list.ptr[i]) {
+                if (!comps_str.empty()) comps_str += ",";
+                comps_str += std::format("{:02X}", (int)ent->component_list.ptr[i]->component_id);
+            }
+        }
+
+        Vector4 init_p = slot ? slot->loader_init_pos : Vector4{};
+        out += std::format("| `0x{:X}` | `0x{:X}` | `0x{:X}` | `+0x{:X}` | `({:.2f}, {:.2f}, {:.2f})` | `({:.2f}, {:.2f}, {:.2f})` | `0x{:X}` | `{}` | `{}` | `[{}]` |\n",
+            ent->entity_id,
+            slot ? (unsigned long long)slot->stu_id : 0ULL,
+            (unsigned long long)res_id,
+            slot ? (unsigned int)slot->spawn_caller_rva : 0U,
+            init_p.X, init_p.Y, init_p.Z,
+            c1->position.X, c1->position.Y, c1->position.Z,
+            parent_entid,
+            (slot && slot->has_nonzero_pos) ? "YES" : "NO",
+            (slot && slot->culled_by_heracles) ? "YES" : "NO",
+            comps_str);
+    }
+
+    const char* paths[] = {
+        "origin_clutter_diag.log"
+    };
+    for (const char* p : paths) {
+        FILE* f = fopen(p, "wb");
+        if (f) {
+            fwrite(out.data(), 1, out.size(), f);
+            fclose(f);
+        }
+    }
+    printf("[OriginClutterTracker] Wrote origin_clutter_diag.log (%zu bytes, reason=%s)\n",
+        out.size(), trigger_reason ? trigger_reason : "Auto");
+}
+
+void OriginClutterTracker::OnTick(EntityAdminBase* game_ea, int world_state) {
+    if (!game_ea) return;
+    auto* world = get_system27_WorldEngineSystem(game_ea);
+    __int64 cur_map = world ? world->loaded_map_id : 0;
+    if (cur_map != 0 && cur_map != s_last_loaded_map_id) {
+        s_last_loaded_map_id = cur_map;
+        s_dumped_report_for_current_map = false;
+        s_ticks_since_world_ready = 0;
+    }
+
+    // Scan for direct comp1->position writes or newly initialized positions
+    for (Entity* ent : *game_ea) {
+        if (!ent) continue;
+        auto* c1 = ent->getById<Component_1_SceneRendering>(1);
+        if (!c1) continue;
+        auto* slot = GetSlot(ent->entity_id, ent);
+        if (!slot) continue;
+        if (slot->culled_by_heracles) {
+            if (c1->position.Y > -4000.0f) {
+                Vector4 hidden_pos(0.0f, -5000.0f, 0.0f, 0.0f);
+                Vector4 ident_rot(0.0f, 0.0f, 0.0f, 1.0f);
+                c1->SetPosRotation(hidden_pos, ident_rot);
+                c1->SetScale(Vector4(0.0f, 0.0f, 0.0f, 0.0f));
+                c1->SetInvisible();
+            }
+            continue;
+        }
+
+        float abs_pos = fabsf(c1->position.X) + fabsf(c1->position.Y) + fabsf(c1->position.Z);
+        uintptr_t parent_c1 = *(uintptr_t*)((uintptr_t)c1 + 0x1D0);
+        if (parent_c1 == 0 && abs_pos > 0.5f && c1->position.Y > -4000.0f) {
+            if (!slot->has_nonzero_pos) {
+                slot->has_nonzero_pos = true;
+                slot->first_nonzero_pos = c1->position;
+                slot->first_nonzero_rot = c1->rotation;
+                slot->first_nonzero_caller_rva = 0xDEAD0001;
+            }
+            slot->latest_nonzero_pos = c1->position;
+            slot->latest_nonzero_rot = c1->rotation;
+        } else if (abs_pos < 0.05f && slot->has_nonzero_pos && parent_c1 == 0) {
+            bool is_player_or_weapon_ent = (ent->hasComponent(0x15) || ent->hasComponent(0x2F) || ent->hasComponent(0x3F) || ent->hasComponent(0x1D));
+            if (!is_player_or_weapon_ent) {
+                slot->direct_zero_overwrite_count++;
+                if (s_block_zero_overwrites) {
+                    slot->zero_overwrite_blocked_count++;
+                    s_total_zero_overwrites_blocked++;
+                    c1->SetPosRotation(slot->latest_nonzero_pos, slot->latest_nonzero_rot);
+                }
+            }
+        }
+    }
+
+    if (world_state == 8) {
+        if (s_ticks_since_world_ready >= 0) {
+            s_ticks_since_world_ready++;
+            if (s_ticks_since_world_ready == 90 && !s_dumped_report_for_current_map) {
+                s_dumped_report_for_current_map = true;
+                if (s_auto_cull_unplaced_origin_props) {
+                    CullUnplacedOriginProps(game_ea);
+                }
+            }
+        }
+    } else if (world_state >= 3 && world_state <= 7) {
+        s_ticks_since_world_ready = 0;
+        s_dumped_report_for_current_map = false;
+    }
+}
+
+void WeaponHardpointDiag::ClearTrace() {
+    for (int i = 0; i < WEAPON_DIAG_RING_SIZE; i++) {
+        s_weapon_diag_ring[i] = WeaponDiagEntry{};
+    }
+    s_weapon_diag_seq = 0;
+    s_total_events_logged = 0;
+    s_fire_shot_calls = 0;
+    s_ss_effect_calls = 0;
+    s_attach_calls = 0;
+    s_resolve_weapon_calls = 0;
+    s_update_weapon_calls = 0;
+    s_last_dump_status = "Cleared trace ring buffer.";
+}
+
+void WeaponHardpointDiag::ForceUpdateWeapons(EntityAdminBase* game_ea, uint8_t is_1p) {
+    if (!game_ea) {
+        s_last_dump_status = "No GameEntityAdmin!";
+        return;
+    }
+    Entity* lc = game_ea->getLocalEnt();
+    Entity* mdl = nullptr;
+    if (lc) {
+        if (auto* pet = lc->getById<Component_20_ModelReference>(0x20)) {
+            uint32 mid = pet->cam_attach_entid ? pet->cam_attach_entid : pet->aim_entid;
+            if (mid) mdl = game_ea->getEntById(mid);
+        }
+    }
+    if (!mdl) {
+        for (Entity* ent : *game_ea) {
+            if (ent && ent->hasComponent(0x23) && ent->hasComponent(0x1C)) {
+                mdl = ent;
+                break;
+            }
+        }
+    }
+    if (!mdl) {
+        s_last_dump_status = "Could not find local hero model entity!";
+        return;
+    }
+    ComponentBase* c23 = mdl->getById(0x23);
+    if (!c23) {
+        s_last_dump_status = "Model entity has no Component_23!";
+        return;
+    }
+    uintptr_t weapon_mgr = (uintptr_t)c23 + 0x1458;
+    if (UpdateWeaponAttachments_orig) {
+        UpdateWeaponAttachments_hook(weapon_mgr, is_1p);
+        s_last_dump_status = std::format("Called UpdateWeaponAttachments(0x{:X}, is_1p={}) on model ent 0x{:X}.",
+            (unsigned long long)weapon_mgr, is_1p, mdl->entity_id);
+    }
+}
+
+void WeaponHardpointDiag::DumpReportToFile(EntityAdminBase* game_ea, const char* trigger_reason) {
+    std::string out;
+    out.reserve(131072);
+    out += "# Muzzle Flash & Weapon Hardpoint Runtime Diagnostic Log\n\n";
+    out += std::format("- **Trigger Reason**: `{}`\n", trigger_reason ? trigger_reason : "Manual");
+    out += std::format("- **Counters**: `TotalEvents={}`, `FireShot(+0xD46060)={}`, `SSEffect(+0xD58110)={}`, `Attach(+0xA01430)={}`, `ResolveWeapon(+0xD560B0)={}`, `UpdateWeapons(+0xD563D0)={}`\n\n",
+        s_total_events_logged, s_fire_shot_calls, s_ss_effect_calls, s_attach_calls, s_resolve_weapon_calls, s_update_weapon_calls);
+
+    if (!game_ea) {
+        out += "**ERROR: `GameEntityAdmin()` is NULL!**\n";
+    } else {
+        Entity* lc = game_ea->getLocalEnt();
+        uint32 local_ctrl_id = game_ea->local_entid;
+        uint32 local_mdl_id = 0;
+        Entity* mdl = nullptr;
+        if (lc) {
+            if (auto* pet = lc->getById<Component_20_ModelReference>(0x20)) {
+                local_mdl_id = pet->cam_attach_entid ? pet->cam_attach_entid : pet->aim_entid;
+                if (local_mdl_id) mdl = game_ea->getEntById(local_mdl_id);
+            }
+        }
+        if (!mdl) {
+            for (Entity* ent : *game_ea) {
+                if (ent && ent->hasComponent(0x23) && ent->hasComponent(0x1C) && ent->entity_id != local_ctrl_id) {
+                    mdl = ent;
+                    local_mdl_id = ent->entity_id;
+                    break;
+                }
+            }
+        }
+
+        out += "## 1. Local Player Controller & Hero Model Overview\n";
+        out += std::format("- **`game_ea->local_entid`**: `0x{:X}` (`lc = 0x{:X}`)\n", local_ctrl_id, (unsigned long long)lc);
+        out += std::format("- **`local_mdl_id`**: `0x{:X}` (`mdl = 0x{:X}`)\n", local_mdl_id, (unsigned long long)mdl);
+
+        // NOTE: Do NOT call +0xC5E8E0 or +0xC5F8B0 directly from prometheus.dll!
+        // +0xC5E8E0 contains an obfuscated PE 'MZ' (0x5A4D) return-address check relative to the caller's code page.
+
+        if (lc) {
+            if (auto* c1 = lc->getById<Component_1_SceneRendering>(1)) {
+                Vector4 wpos = SafeReadVal<Vector4>((uintptr_t)c1 + 0xC0);
+                out += std::format("- **Controller `Component_1`**: `local_pos=({:.2f}, {:.2f}, {:.2f})`, `world_pos(+0xC0)=({:.2f}, {:.2f}, {:.2f})`, `parent_c1=0x{:X}`, `first_child=0x{:X}`\n",
+                    c1->position.X, c1->position.Y, c1->position.Z, wpos.X, wpos.Y, wpos.Z,
+                    SafeReadVal<uintptr_t>((uintptr_t)c1 + 0x1D0), SafeReadVal<uintptr_t>((uintptr_t)c1 + 0x1E0));
+            }
+        }
+
+        if (mdl) {
+            if (auto* c1 = mdl->getById<Component_1_SceneRendering>(1)) {
+                Vector4 wpos = SafeReadVal<Vector4>((uintptr_t)c1 + 0xC0);
+                uintptr_t c1c_link = SafeReadVal<uintptr_t>((uintptr_t)c1 + 0x1A8);
+                uint64_t flags_1b8 = SafeReadVal<uint64_t>((uintptr_t)c1 + 0x1B8);
+                uint64_t rflags_180 = SafeReadVal<uint64_t>((uintptr_t)c1 + 0x180);
+                uintptr_t anim_inst = c1c_link ? SafeReadVal<uintptr_t>((c1c_link - 0x20) + 0x1F0) : 0;
+                uintptr_t bone_mats = anim_inst ? SafeReadVal<uintptr_t>(anim_inst + 0x20) : 0;
+                uint16_t bone_cnt = anim_inst ? SafeReadVal<uint16_t>(anim_inst + 0x40) : 0;
+                out += std::format("- **Hero Model `Component_1` (`0x{:X}`)**:\n", (unsigned long long)c1);
+                out += std::format("  - `local_pos(+0x60)`: `({:.2f}, {:.2f}, {:.2f})`, `world_pos(+0xC0)`: `({:.2f}, {:.2f}, {:.2f})`\n",
+                    c1->position.X, c1->position.Y, c1->position.Z, wpos.X, wpos.Y, wpos.Z);
+                out += std::format("  - `render_flags(+0x180)`: `0x{:016X}`, `comp1C_link(+0x1A8)`: `0x{:X}`, `internal_flags(+0x1B8)`: `0x{:016X}`\n",
+                    rflags_180, c1c_link, flags_1b8);
+                out += std::format("  - `anim_inst([comp1C+0x1F0])`: `0x{:X}`, `bone_matrices([anim+0x20])`: `0x{:X}`, `bone_count([anim+0x40])`: `{}`\n",
+                    anim_inst, bone_mats, bone_cnt);
+                out += std::format("  - `parent_c1(+0x1D0)`: `0x{:X}`, `first_child_c1(+0x1E0)`: `0x{:X}`\n",
+                    SafeReadVal<uintptr_t>((uintptr_t)c1 + 0x1D0), SafeReadVal<uintptr_t>((uintptr_t)c1 + 0x1E0));
+            }
+
+            if (ComponentBase* c22 = mdl->getById(0x22)) {
+                out += std::format("- **Hero Model `Component_22` (`0x{:X}`) QWORD dump (`+0x00..+0x60`)**:\n", (unsigned long long)c22);
+                for (int off = 0; off <= 0x60; off += 8) {
+                    uintptr_t val = SafeReadVal<uintptr_t>((uintptr_t)c22 + off);
+                    uint32 ent_id_if_ent = 0;
+                    if (off == 0x18 || off == 0x20 || off == 0x28) {
+                        if (val > 0x10000) {
+                            ent_id_if_ent = SafeReadVal<uint32>(val + 0x94);
+                        }
+                    }
+                    out += std::format("  - `+0x{:02X}`: `0x{:016X}` (if Entity* -> `entid=0x{:X}`)\n", off, (unsigned long long)val, ent_id_if_ent);
+                }
+            } else {
+                out += "- **Hero Model `Component_22`**: `NULL` (not present on model entity!)\n";
+            }
+
+            if (ComponentBase* c23 = mdl->getById(0x23)) {
+                uintptr_t wmgr = (uintptr_t)c23 + 0x1458;
+                uintptr_t entries_ptr = SafeReadVal<uintptr_t>(wmgr + 0x08);
+                int32_t entries_cnt = SafeReadVal<int32_t>(wmgr + 0x10);
+                out += std::format("- **Hero Model `Component_23 + 0x1458` Weapon Attachment Table (`0x{:X}`)**:\n", (unsigned long long)wmgr);
+                out += std::format("  - `entries_ptr(+0x08)`: `0x{:X}`, `entries_count(+0x10)`: `{}`\n", (unsigned long long)entries_ptr, entries_cnt);
+                for (int i = 0; i < entries_cnt && i < 16 && entries_ptr != 0; i++) {
+                    uintptr_t e = entries_ptr + (uintptr_t)i * 0x250;
+                    uint32 s0 = SafeReadVal<uint32>(e + 0x00);
+                    uint32 s1 = SafeReadVal<uint32>(e + 0x04);
+                    uint64 wh = SafeReadVal<uint64>(e + 0x168);
+                    uint64 ml1p = SafeReadVal<uint64>(e + 0x170);
+                    uint64 ml3p = SafeReadVal<uint64>(e + 0x178);
+                    uint64 ed1p = SafeReadVal<uint64>(e + 0x180);
+                    uint64 ed3p = SafeReadVal<uint64>(e + 0x188);
+                    uint32 tent = SafeReadVal<uint32>(e + 0x190);
+                    uint64 hp1p = SafeReadVal<uint64>(e + 0x1A0);
+                    uint64 hp3p = SafeReadVal<uint64>(e + 0x1A8);
+                    Vector4 poff = SafeReadVal<Vector4>(e + 0x1E0);
+                    float sc1p = SafeReadVal<float>(e + 0x1F0);
+                    float sc3p = SafeReadVal<float>(e + 0x1F4);
+                    uint8_t b240 = SafeReadVal<uint8_t>(e + 0x240);
+                    out += std::format("  - **Entry [{}] (`0x{:X}`)**:\n", i, (unsigned long long)e);
+                    out += std::format("    - `slot0_entid(1P)`: `0x{:X}`, `slot1_entid(3P)`: `0x{:X}`, `weapon_handle(+0x168)`: `0x{:X}`\n", s0, s1, (unsigned long long)wh);
+                    out += std::format("    - `model_look_1p(+0x170)`: `0x{:X}`, `model_look_3p(+0x178)`: `0x{:X}`\n", (unsigned long long)ml1p, (unsigned long long)ml3p);
+                    out += std::format("    - `ent_def_1p(+0x180)`: `0x{:X}`, `ent_def_3p(+0x188)`: `0x{:X}`\n", (unsigned long long)ed1p, (unsigned long long)ed3p);
+                    out += std::format("    - `target_entid(+0x190)`: `0x{:X}`, `hardpoint_1p(+0x1A0)`: `0x{:X}`, `hardpoint_3p(+0x1A8)`: `0x{:X}`\n", tent, (unsigned long long)hp1p, (unsigned long long)hp3p);
+                    out += std::format("    - `pos_offset(+0x1E0)`: `({:.2f}, {:.2f}, {:.2f})`, `scale_1p`: `{:.2f}`, `scale_3p`: `{:.2f}`, `flag_240`: `{}`\n",
+                        poff.X, poff.Y, poff.Z, sc1p, sc3p, b240);
+                }
+            }
+        }
+
+        out += "\n## 2. All Attached / Weapon / Effect / Player Entities in `GameEntityAdmin`\n";
+        out += "| EntID | STU ID | Resload ID | SpawnCaller | Components | LocalPos (+0x60) | WorldPos (+0xC0) | ParentEnt | Hardpoint (+0x1E8) | BoneIdx (+0x1F4) | Inh/MW | C1_1A8 / 1B8 | Anim / Bones | ParentBonePos |\n";
+        out += "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n";
+
+        for (Entity* ent : *game_ea) {
+            if (!ent) continue;
+            auto* c1 = ent->getById<Component_1_SceneRendering>(1);
+            uintptr_t parent_c1 = c1 ? SafeReadVal<uintptr_t>((uintptr_t)c1 + 0x1D0) : 0;
+            uint32 p_entid = 0;
+            if (parent_c1 != 0) {
+                Entity* p_ent = SafeReadVal<Entity*>(parent_c1 + 0x08);
+                if (p_ent) p_entid = SafeReadVal<uint32>((uintptr_t)p_ent + 0x94);
+            }
+            auto* slot = OriginClutterTracker::GetSlot(ent->entity_id, ent);
+            uintptr_t sp_caller = slot ? slot->spawn_caller_rva : 0;
+
+            bool interesting =
+                ent->entity_id == local_ctrl_id ||
+                ent->entity_id == local_mdl_id ||
+                (local_ctrl_id != 0 && ent->entity_id >= local_ctrl_id && (
+                    ent->hasComponent(0x1D) ||
+                    ent->hasComponent(0x20) ||
+                    ent->hasComponent(0x22) ||
+                    sp_caller == 0xD56BFB ||
+                    sp_caller == 0xD472FF ||
+                    sp_caller == 0xD35A74 ||
+                    sp_caller == 0xCBA83F ||
+                    p_entid == local_ctrl_id ||
+                    p_entid == local_mdl_id));
+            if (!interesting) continue;
+
+            __int64 stu_id = slot ? slot->stu_id : 0;
+            __int64 res_id = (ent->resload_entry && ent->resload_entry->valid()) ? ent->resload_entry->align()->resource_id : 0;
+
+            std::string comps_str;
+            for (int i = 0; i < ent->component_list.num - 1; i++) {
+                if (ent->component_list.ptr[i]) {
+                    if (!comps_str.empty()) comps_str += ",";
+                    comps_str += std::format("{:02X}", (int)ent->component_list.ptr[i]->component_id);
+                }
+            }
+
+            Vector4 lpos = c1 ? c1->position : Vector4{};
+            Vector4 wpos = c1 ? SafeReadVal<Vector4>((uintptr_t)c1 + 0xC0) : Vector4{};
+            std::string p_bone_pos_str = "-";
+            uint64_t hp_id = c1 ? SafeReadVal<uint64_t>((uintptr_t)c1 + 0x1E8) : 0;
+            uint16_t bone_idx = c1 ? SafeReadVal<uint16_t>((uintptr_t)c1 + 0x1F4, 0xFFFF) : 0xFFFF;
+            uint8_t inh_rot = c1 ? SafeReadVal<uint8_t>((uintptr_t)c1 + 0x1F6) : 0;
+            uint8_t maint_w = c1 ? SafeReadVal<uint8_t>((uintptr_t)c1 + 0x1F7) : 0;
+            uintptr_t c1_1a8 = c1 ? SafeReadVal<uintptr_t>((uintptr_t)c1 + 0x1A8) : 0;
+            uint64_t c1_1b8 = c1 ? SafeReadVal<uint64_t>((uintptr_t)c1 + 0x1B8) : 0;
+            uintptr_t anim_inst = c1_1a8 ? SafeReadVal<uintptr_t>((c1_1a8 - 0x20) + 0x1F0) : 0;
+            uint16_t bone_cnt = anim_inst ? SafeReadVal<uint16_t>(anim_inst + 0x40) : 0;
+
+            if (parent_c1 != 0) {
+                auto* pc = (Component_1_SceneRendering*)parent_c1;
+                uintptr_t p_1a8 = SafeReadVal<uintptr_t>((uintptr_t)pc + 0x1A8);
+                uintptr_t p_anim = p_1a8 ? SafeReadVal<uintptr_t>((p_1a8 - 0x20) + 0x1F0) : 0;
+                uintptr_t p_bmats = p_anim ? SafeReadVal<uintptr_t>(p_anim + 0x20) : 0;
+                uint16_t p_bcnt = p_anim ? SafeReadVal<uint16_t>(p_anim + 0x40) : 0;
+                if (p_bmats && bone_idx < p_bcnt) {
+                    uintptr_t bmat = p_bmats + (uintptr_t)bone_idx * 0x30;
+                    Vector4 bpos = SafeReadVal<Vector4>(bmat + 0x20);
+                    p_bone_pos_str = std::format("({:.2f},{:.2f},{:.2f})", bpos.X, bpos.Y, bpos.Z);
+                }
+            }
+
+            out += std::format("| `0x{:X}` | `0x{:X}` | `0x{:X}` | `+0x{:X}` | `[{}]` | `({:.2f},{:.2f},{:.2f})` | `({:.2f},{:.2f},{:.2f})` | `0x{:X}` | `0x{:X}` | `{}` | `{}/{}` | `0x{:X}` / `0x{:X}` | `0x{:X}` (`{}`) | `{}` |\n",
+                ent->entity_id, (unsigned long long)stu_id, (unsigned long long)res_id, (unsigned int)sp_caller,
+                comps_str,
+                lpos.X, lpos.Y, lpos.Z,
+                wpos.X, wpos.Y, wpos.Z,
+                p_entid, (unsigned long long)hp_id, bone_idx, inh_rot, maint_w,
+                (unsigned long long)c1_1a8, (unsigned long long)c1_1b8,
+                (unsigned long long)anim_inst, bone_cnt,
+                p_bone_pos_str);
+        }
+    }
+
+    out += "\n## 3. Chronological Ring Buffer Trace (Last 60 Events)\n```text\n";
+    LONG cur_seq = s_weapon_diag_seq;
+    LONG start_seq = (cur_seq > 60) ? (cur_seq - 60 + 1) : 1;
+    for (LONG s = start_seq; s <= cur_seq; s++) {
+        const WeaponDiagEntry& e = s_weapon_diag_ring[(s - 1) & (WEAPON_DIAG_RING_SIZE - 1)];
+        if (e.seq == (uint32_t)s && e.text[0] != '\0') {
+            out += std::format("[#{:04d}] {}\n", (int)e.seq, (const char*)e.text);
+        }
+    }
+    out += "```\n";
+
+    const char* paths[] = {
+        "weapon_hardpoint_diag.log"
+    };
+    bool wrote_ok = false;
+    for (const char* p : paths) {
+        FILE* f = fopen(p, "wb");
+        if (f) {
+            fwrite(out.data(), 1, out.size(), f);
+            fclose(f);
+            wrote_ok = true;
+        }
+    }
+    s_last_dump_status = std::format("Wrote weapon_hardpoint_diag.log ({} bytes, {} trace events, ok={})",
+        out.size(), (int)cur_seq, wrote_ok ? "YES" : "NO");
+    printf("[WeaponHardpointDiag] %s\n", s_last_dump_status.c_str());
 }
 
 //void ConstructNewGameEAInPlace() {
@@ -860,6 +1828,30 @@ void __cdecl StartHook(void*) {
 
     MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xa00450), componen1_oncreate_hook, (PVOID*)&component_1_oncreate_orig));
     MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xa00450)));
+
+    MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xa04000), SetPosRotation_hook, (PVOID*)&SetPosRotation_orig));
+    MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xa04000)));
+    MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xa045c0), SetPosRotationInternal_hook, (PVOID*)&SetPosRotationInternal_orig));
+    MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xa045c0)));
+    MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xa03e60), SetPosition_hook, (PVOID*)&SetPosition_orig));
+    MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xa03e60)));
+    MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xd563d0), UpdateWeaponAttachments_hook, (PVOID*)&UpdateWeaponAttachments_orig));
+    MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xd563d0)));
+    MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xd560b0), ResolveWeaponOrParentEntity_hook, (PVOID*)&ResolveWeaponOrParentEntity_orig));
+    MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xd560b0)));
+    MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xd46060), SpawnWeaponFireEffect_hook, (PVOID*)&SpawnWeaponFireEffect_orig));
+    MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xd46060)));
+    MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xd58110), SpawnStatescriptEffect_hook, (PVOID*)&SpawnStatescriptEffect_orig));
+    MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xd58110)));
+    MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xa01160), AttachComponent1ToHardpoint_hook, (PVOID*)&AttachComponent1ToHardpoint_orig));
+    MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xa01160)));
+    MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xa01430), AttachComponent1Internal_hook, (PVOID*)&AttachComponent1Internal_orig));
+    MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xa01430)));
+    MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xcba3f0), TryPlayBarrelMuzzleFlash_hook, (PVOID*)&TryPlayBarrelMuzzleFlash_orig));
+    MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xcba3f0)));
+    MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xcba6d0), ProcessMuzzleFlashEntry_hook, (PVOID*)&ProcessMuzzleFlashEntry_orig));
+    MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xcba6d0)));
+    printf("hooked Component_1 transforms & weapon hardpoint fixes (+0xd563d0, +0xd560b0, +0xd46060, +0xcba3f0, +0xcba6d0)\n");
 
     /*MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xbff460), testVIGSTickHook, (PVOID*)&VigsTickOrig));
     MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xbff460)));*/

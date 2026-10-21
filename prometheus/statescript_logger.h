@@ -109,10 +109,15 @@ public:
                 cloned->vfptr = ss_e->vfptr;
                 sub.e_log.push_back(cloned);
             }
-            while (sub.logs.size() > 1000)
-                sub.logs.erase(sub.logs.begin());
-            while (sub.e_log.size() > 1000)
-                sub.e_log.erase(sub.e_log.begin());
+            if (sub.logs.size() > 1200) {
+                sub.logs.erase(sub.logs.begin(), sub.logs.begin() + 200);
+            }
+            if (sub.e_log.size() > 1200) {
+                for (size_t i = 0; i < 200; ++i) {
+                    delete sub.e_log[i];
+                }
+                sub.e_log.erase(sub.e_log.begin(), sub.e_log.begin() + 200);
+            }
         }
         char result = TickScript_orig(ss, ss_e);
         return result;

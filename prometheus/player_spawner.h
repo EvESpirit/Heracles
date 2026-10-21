@@ -4,6 +4,15 @@
 
 class player_spawner {
 public:
+	enum class DeferredSpawnState : int {
+		IDLE = 0,
+		SPAWN_REQUESTED = 1,
+		WAITING_FOR_COMPONENTS = 2,
+		APPLYING_POST_SPAWN_INIT = 3,
+		SPAWN_COMPLETE = 4,
+		SPAWN_FAILED_TIMEOUT = 5
+	};
+
 	struct spawn_info {
 		//Load
 		__int64 resource_id = 0;
@@ -27,6 +36,9 @@ public:
 		bool set_filterbits_controller = false;
 		bool weapon_attach = false;
 		bool fixup_player_statescript = false;
+		bool set_position = false;
+		Vector4 spawn_position{};
+		Vector4 spawn_rotation{};
 		//bool call_component2_vodoo;
 	};
 
@@ -39,6 +51,27 @@ public:
 	spawn_info model_info{};
 	Entity* controller_ent;
 	Entity* model_ent;
+
+	bool use_deferred_spawn = true;
+	DeferredSpawnState spawn_state = DeferredSpawnState::IDLE;
+	uint32 pending_controller_entid = 0;
+	uint32 pending_model_entid = 0;
+	spawn_info pending_controller_info{};
+	spawn_info pending_model_info{};
+	int wait_ticks = 0;
+	int ready_after_ticks = 0;
+	int pre_init_script_count = 0;
+	int post_init_script_count = 0;
+	int post_init_has_backref = 0;
+	int post_init_is_aim_ent = 0;
+	bool diag_c20 = false;
+	bool diag_c1f = false;
+	bool diag_c12 = false;
+	bool diag_c23 = false;
+	bool diag_not_instantiating = false;
+	bool diag_varbag_ready = false;
+	int diag_instance_count = 0;
+	static constexpr int MAX_WAIT_TICKS = 300; // ~5 seconds safety timeout
 
 	void template_localPlayer();
 
@@ -53,4 +86,5 @@ public:
 
 	//returns key: controller - value: model
 	std::pair<Entity*, Entity*> spawn();
-};
+	void tick_deferred_spawn();
+};

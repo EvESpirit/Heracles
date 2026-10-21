@@ -6,6 +6,7 @@
 #include "entity_window.h"
 #include "../stu_resources.h"
 #include "../player_spawner.h"
+#include "../MovementState.h"
 
 //2f und 33 sind bei controller
 //-> ist prob local player
@@ -17,7 +18,7 @@
 //local entity muss team haben in filter bits
 //mov attach == local ent??? maybe, crasht nicht
 //local ent muss camera stuff (c20) haben
-//Component mit 2f muss c20 haben und wird benützt
+//Component mit 2f muss c20 haben und wird benuetzt
 
 //SPECTATE:
 //Entity mit C20 muss filterbits 0x400000 haben
@@ -99,22 +100,6 @@ class player_spawner_deluxe : public window {
 		ImGui::RadioButton("3", &inf->team, 3);
 	}
 
-	//void template_localplayer() {
-	//	_spawner.controller_info.resource_id = 0x40000000000000E;
-	//	_spawner.controller_info.aim_attach = 2;
-	//	_spawner.controller_info.cam_attach = 2;
-	//	_spawner.controller_info.set_localent = true;
-	//	_spawner.controller_info.set_2f_movable = true;
-	//	_spawner.controller_info.load_2f_33 = true;
-	//	_spawner.controller_info.load_3f = true;
-	//	_spawner.controller_info.movement_attach = 2; //Doch model sonst funktioniert F1 nicht
-	//	_spawner.controller_info.set_filterbits_controller = false;
-	//	_spawner.model_info.resource_id = 0x400000000000001;
-	//	_spawner.model_info.petbackref_attach = 1;
-	//	_spawner.model_info.set_health = true;
-	//	_spawner.model_info.weapon_attach = true;
-	//}
-
 	void template_teamplayer() {
 		_spawner.controller_info.resource_id = 0x40000000000000E;
 		_spawner.controller_info.aim_attach = 2;
@@ -125,9 +110,19 @@ class player_spawner_deluxe : public window {
 		_spawner.controller_info.load_3f = true;
 		_spawner.controller_info.movement_attach = 2;
 		_spawner.controller_info.set_filterbits_controller = false;
-		_spawner.model_info.resource_id = 0x400000000000001;
+		_spawner.controller_info.team = 1;
+		if (_spawner.model_info.resource_id == 0) {
+			_spawner.model_info.resource_id = 0x400000000000001;
+		}
+		if (_spawner.model_info.heroid == 0 && _spawner.model_info.resource_id == 0x400000000000001) {
+			_spawner.model_info.heroid = 0x02E0000000000003ULL;
+			_spawner.controller_info.heroid = 0x02E0000000000003ULL;
+		}
 		_spawner.model_info.petbackref_attach = 1;
 		_spawner.model_info.set_health = true;
+		_spawner.model_info.weapon_attach = true;
+		_spawner.model_info.fixup_player_statescript = true;
+		_spawner.model_info.team = 1;
 	}
 
 	inline void render() override {
@@ -154,123 +149,134 @@ class player_spawner_deluxe : public window {
 						if (ImGui::Selectable(name, selected)) {
 							_spawner.model_info.resource_id = ent_id;
 							_spawner.model_info.heroid = hero.first;
+							_spawner.controller_info.heroid = hero.first;
 						}
 					}
 					ImGui::EndListBox();
 				}
 
 				if (_selected_hero.valid()) {
-					//if (ImGui::BeginListBox("S", ImVec2(600, 150))) { //auto resize doesnt work here...
-						for (auto skin_id : _selected_hero.get_argument_resreflist("m_skins")) {
-							auto skin = skin_id->get_STU()->to_editable();
-							std::string name = std::format("{:x}", skin_id->resource_id);
-							//Dont bother no skin has a name in this version
-							/*auto name1 = skin.get_argument_primitive("m_internalName").get_value<const char*>();
-							auto name2 = skin.get_argument_primitive("m_skinCode").get_value<const char*>();
-							auto name3 = skin.get_argument_primitive(0x5c415784).get_value<const char*>();
-							if (strlen(name1) > 0)
-								name += name1 + std::string(" ");
-							if (strlen(name2) > 0)
-								name += name2 + std::string(" ");
-							if (strlen(name3) > 0)
-								name += name3 + std::string(" ");*/
-							for (auto skin_theme_id : skin.get_argument_resreflist("m_skinThemes")) {
-								auto skin_theme = skin_theme_id->get_STU()->to_editable();
-								if (ImGui::RadioButton(std::format("##{:x}", skin_theme_id->resource_id).c_str(), _spawner.model_info.skin_theme_id == skin_theme_id->resource_id)) {
-									_spawner.model_info.skin_theme_id = skin_theme_id->resource_id;
-								}
-								ImGui::SameLine();
-								ImGui::TextDisabled(name.c_str());
-								ImGui::SameLine();
-								imgui_helpers::display_type(skin_theme_id->resource_id, true, true, false);
+					for (auto skin_id : _selected_hero.get_argument_resreflist("m_skins")) {
+						auto skin = skin_id->get_STU()->to_editable();
+						std::string name = std::format("{:x}", skin_id->resource_id);
+						for (auto skin_theme_id : skin.get_argument_resreflist("m_skinThemes")) {
+							auto skin_theme = skin_theme_id->get_STU()->to_editable();
+							if (ImGui::RadioButton(std::format("##{:x}", skin_theme_id->resource_id).c_str(), _spawner.model_info.skin_theme_id == skin_theme_id->resource_id)) {
+								_spawner.model_info.skin_theme_id = skin_theme_id->resource_id;
 							}
+							ImGui::SameLine();
+							ImGui::TextDisabled(name.c_str());
+							ImGui::SameLine();
+							imgui_helpers::display_type(skin_theme_id->resource_id, true, true, false);
 						}
-						//ImGui::EndListBox();
-					//}
+					}
 				}
 
 				render_ent_options(&_spawner.model_info);
 			}
 			ImGui::EndChild();
+
+			_spawner.tick_deferred_spawn();
+
+			ImGui::Separator();
+			ImGui::Checkbox("Use Deferred Post-Spawn Init (Fix 0x23 Race)", &_spawner.use_deferred_spawn);
+
+			const char* state_str = "UNKNOWN";
+			ImVec4 state_col = ImVec4(1.f, 1.f, 1.f, 1.f);
+			switch (_spawner.spawn_state) {
+			case player_spawner::DeferredSpawnState::IDLE:
+				state_str = "IDLE";
+				state_col = ImVec4(0.7f, 0.7f, 0.7f, 1.f);
+				break;
+			case player_spawner::DeferredSpawnState::SPAWN_REQUESTED:
+				state_str = "SPAWN_REQUESTED";
+				state_col = ImVec4(1.f, 0.8f, 0.2f, 1.f);
+				break;
+			case player_spawner::DeferredSpawnState::WAITING_FOR_COMPONENTS:
+				state_str = "WAITING_FOR_COMPONENTS";
+				state_col = ImVec4(1.f, 0.8f, 0.2f, 1.f);
+				break;
+			case player_spawner::DeferredSpawnState::APPLYING_POST_SPAWN_INIT:
+				state_str = "APPLYING_POST_SPAWN_INIT";
+				state_col = ImVec4(0.3f, 0.7f, 1.f, 1.f);
+				break;
+			case player_spawner::DeferredSpawnState::SPAWN_COMPLETE:
+				state_str = "SPAWN_COMPLETE";
+				state_col = ImVec4(0.2f, 1.f, 0.2f, 1.f);
+				break;
+			case player_spawner::DeferredSpawnState::SPAWN_FAILED_TIMEOUT:
+				state_str = "SPAWN_FAILED_TIMEOUT";
+				state_col = ImVec4(1.f, 0.2f, 0.2f, 1.f);
+				break;
+			}
+
+			ImGui::Text("Deferred State: ");
+			ImGui::SameLine();
+			ImGui::TextColored(state_col, "%s", state_str);
+			if (_spawner.spawn_state != player_spawner::DeferredSpawnState::IDLE) {
+				ImGui::Text("EntIDs: Controller = 0x%x, Model = 0x%x", _spawner.pending_controller_entid, _spawner.pending_model_entid);
+				ImGui::Text("Wait Ticks: %d (Ready at: %d)", _spawner.wait_ticks, _spawner.ready_after_ticks);
+				ImGui::Text("0x23 Scripts: %d -> %d", _spawner.pre_init_script_count, _spawner.post_init_script_count);
+				ImGui::Text("SyncMgr Flags: has_player_entbackref = %d, is_aim_ent = %d", _spawner.post_init_has_backref, _spawner.post_init_is_aim_ent);
+				ImGui::Text("Live Checks: C20:%s C23:%s (C12:%s C1F:%s) | Inst:%s VarBag:%s (g1:%d)",
+					_spawner.diag_c20 ? "OK" : "NULL",
+					_spawner.diag_c23 ? "OK" : "NULL",
+					_spawner.diag_c12 ? "OK" : "NULL",
+					_spawner.diag_c1f ? "OK" : "NULL",
+					_spawner.diag_not_instantiating ? "DONE" : "BUSY",
+					_spawner.diag_varbag_ready ? "OK" : "NULL",
+					_spawner.diag_instance_count);
+			}
+
+			if (ImGui::Button("Set Spawn Pos from Current Player")) {
+				auto ea = GameEntityAdmin();
+				if (ea) {
+					auto local = ea->getLocalEnt();
+					if (local) {
+						auto pet = local->getById<Component_20_ModelReference>(0x20);
+						if (pet) {
+							auto model = ea->getEntById(pet->cam_attach_entid ? pet->cam_attach_entid : pet->aim_entid);
+							if (model) {
+								auto c1 = model->getById<Component_1_SceneRendering>(1);
+								if (c1) {
+									_spawner.model_info.set_position = true;
+									_spawner.model_info.spawn_position = c1->position;
+									_spawner.model_info.spawn_rotation = c1->rotation;
+								}
+								if (auto* c15 = model->getById<Component_15_STUCharacterMoverComponent>(0x15)) {
+									float abs15 = fabsf(c15->movement_state_2.absolute_position.X) + fabsf(c15->movement_state_2.absolute_position.Y) + fabsf(c15->movement_state_2.absolute_position.Z);
+									if (abs15 > 0.5f) {
+										_spawner.model_info.set_position = true;
+										_spawner.model_info.spawn_position = c15->movement_state_2.absolute_position;
+										_spawner.model_info.spawn_rotation = c15->movement_state_2.rotation_quaternion;
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+			if (_spawner.model_info.set_position) {
+				ImGui::SameLine();
+				ImGui::Text("(Pos: %.1f, %.1f, %.1f)", _spawner.model_info.spawn_position.X, _spawner.model_info.spawn_position.Y, _spawner.model_info.spawn_position.Z);
+				ImGui::SameLine();
+				if (ImGui::Button("Clear Pos")) {
+					_spawner.model_info.set_position = false;
+				}
+			}
+			ImGui::Separator();
+
 			if (ImGui::Button("Spawn")) {
 				_spawner.spawn();
-				/*auto game_admin = GameEntityAdmin();
-				auto get_combatsys = (CombatSystem * (__fastcall*)(EntityAdminBase*))(globals::gameBase + 0xc71600);
-				CombatSystem* combat_sys = get_combatsys(game_admin);
-				printf("combat sys: %p\n", combat_sys);
-				auto client_spawn = (__int64(__fastcall*)(CombatSystem * combat_sys, __int64, __int64 jammsg))(globals::gameBase + 0xca8410);
-				char buf[0x100];
-				client_spawn(combat_sys, 0, (__int64)buf);
-				combat_sys = get_combatsys(game_admin);
-				combat_sys->list_with_entids.emplace_item(controller_entity.latest_entid);
-				combat_sys->list_with_entids.emplace_item(model_entity.latest_entid);
-
-
-				auto spawn = (void(__fastcall*)(char*, __int64, char*))(globals::gameBase + 0xca8660);
-				char combatsys[0x10];
-				*(__int64*)&combatsys[8] = (__int64)GameEntityAdmin();
-				char jammsg[0x90];
-				*(int*)&jammsg[0x78] = m_ent->entity_id;
-				*(Vector4*)&jammsg[0x68] = Vector4(1, 50, 1, 0);
-				spawn(combatsys, 0, jammsg);
-
-				auto localplayer_shit = (void(__fastcall*)(__int64, ComponentBase*))(globals::gameBase + 0xc27800);
-				auto get_sys36 = (__int64(__fastcall*)(EntityAdminBase*))(globals::gameBase + 0xc03750);
-				__int64 sys = get_sys36(game_admin);
-				if (sys) {
-					localplayer_shit(sys, c_ent->getById(0x2F));
-					auto move = (void(__fastcall*)(__int64, int, int, char, char))(globals::gameBase + 0xc27560);
-					move(sys, 5, 5, 1, 1);
-				}*/
-
-				/*auto comp_12 = (__int64)c_ent->getById(0x12);
-				if (comp_12) {
-					*(int*)(comp_12 + 0x14394) = 1;
-					*(double*)(comp_12 + 0x14398) = *(double*)(globals::gameBase + 0x181e320);
-					*(int*)(comp_12 + 0x143A0) = 1;
-				}*/
-
-				//Setzt rotation und nicht position??
-				/*auto setpos = (void(__fastcall*)(__int64, ComponentBase*, Vector4*))(globals::gameBase + 0xca6fb0);
-				auto comp_2f = c_ent->getById(0x2F);
-				if (comp_2f) {
-					auto pos = Vector4(0, 0, 0, 50);
-					setpos(0, comp_2f, &pos);
-				}*/
-			}
-
-			/*if (ImGui::Button("Call Replay ControllerAAAAA")) {
-				mapfunc_vt** replay_controller = *(mapfunc_vt***)(globals::gameBase + 0x17b7fc0);
-				auto func = (void(*)(mapfunc_vt**))(globals::gameBase + 0xc81c80);
-				*(int*)((__int64)replay_controller + 0x100) = controller_entity.latest_entid;
-				*(__int64*)((__int64)replay_controller + 0xB8) = (__int64)GameEntityAdmin();
-				func(replay_controller);
-			}
-
-			if (ImGui::Button("Jank Movement Fix")) {
-				char* ch = (char*)(globals::gameBase + 0xca0800);
-				ch[0] = 0xc3;
-			}
-
-			if (ImGui::Button("Template: Local Player")) {
-				template_localplayer();
 			}
 			ImGui::SameLine();
-			if (ImGui::Button("Template: Team")) {
+			if (ImGui::Button("Preset: Local Player (Team 0)")) {
+				_spawner.template_localPlayer();
+			}
+			ImGui::SameLine();
+			if (ImGui::Button("Preset: Enemy Bot/Dummy (Team 1)")) {
 				template_teamplayer();
 			}
-			if (ImGui::Button("InGame Flag 0x200 Lobby")) {
-				auto ea = LobbyEntityAdmin();
-				memset((void*)(globals::gameBase + 0xc4ea69), 0x90, 0xc4f00a - 0xc4ea69);
-				auto flagger = ea->vfptr->GetStatescriptFlagger(ea);
-				(*flagger)->SetStatescriptFlags(flagger, 0x200);
-			}
-			if (ImGui::Button("InGame Flag 0x200 Game")) {
-				auto ea = GameEntityAdmin();
-				memset((void*)(globals::gameBase + 0xc60488), 0x90, 0xc60c40 - 0xc60488);
-				auto flagger = ea->vfptr->GetStatescriptFlagger(ea);
-				(*flagger)->SetStatescriptFlags(flagger, 0x200);
-			}*/
 
 			ImGui::NewLine();
 			if (ImGui::RadioButton("0x400000000000013 (PvPGame 1)", _spawn_entid == 0x400000000000013)) {
@@ -338,16 +344,12 @@ class player_spawner_deluxe : public window {
 
 					auto cam = GameEntityAdmin()->getSingletonComponent<Component_4F_Camera>(0x4F);
 					cam->override_views.num = 0;
-					
-					//*(char*)(globals::gameBase + 0xc0bb70) = 0x48;
 				}
 				else {
 					sys->local_freeLookView = teFreeLookView::create();
 
 					auto cam = GameEntityAdmin()->getSingletonComponent<Component_4F_Camera>(0x4F);
 					cam->override_views.emplace_item(OverrideView{ &sys->local_freeLookView->base, 1 });
-
-					//*(char*)(globals::gameBase + 0xc0bb70) = 0xc3; //Prevent writing default view / override views from player entity
 				}
 			}
 			if (freelook) {
@@ -359,67 +361,10 @@ class player_spawner_deluxe : public window {
 				_thirdpers_view = nullptr;
 				_dealloc_thirdpers = false;
 			}
-			//TODO: outside of the state view pos doesnt get updated properly.
-			/*bool thirdpers = !!_thirdpers_view;
-			if (ImGui::Checkbox("ThirdPersonView", &thirdpers)) {
-				auto model_ent = GameEntityAdmin()->getEntById(GameEntityAdmin()->getLocalEnt()->getById<Component_20_Pet>(0x20)->cam_attach_entid);
-				auto ent_backref = model_ent->getById<Component_1F_PetBackref>(0x1F);
-
-				if (_thirdpers_view) {
-					ent_backref->override_views.num = 0;
-					_dealloc_thirdpers = true;
-				}
-				else {
-					__int64 view_ptr = ow_memalloc(0x1E0);
-					auto init_thirdperson_view = (View*(*)(__int64))(globals::gameBase + 0xdcd5b0);
-					_thirdpers_view = init_thirdperson_view(view_ptr);
-					printf("ThirdPersonView allocated: %p\n", _thirdpers_view);
-
-					ent_backref->override_views.emplace_item(OverrideView{ _thirdpers_view, 1 });
-				}
-			}*/
-			/*if (_thirdpers_view) {
-				auto model_ent = GameEntityAdmin()->getEntById(GameEntityAdmin()->getLocalEnt()->getById<Component_20_Pet>(0x20)->cam_attach_entid);
-				if (model_ent) {
-					auto model_rendering = model_ent->getById<Component_1_SceneRendering>(1);
-					if (model_rendering) {
-						_thirdpers_view->view_position = model_rendering->position;
-					}
-				}
-			}*/
-			/*ImGui::TextUnformatted("Time Scale");
-			ImGui::SameLine();
-			auto time_scale = globalTimeScale();
-
-			if (ImGui::RadioButton("0.1", *time_scale == 0.1)) {
-				*time_scale = 0.1;
-			}
-			ImGui::SameLine();
-			if (ImGui::RadioButton("0.5", *time_scale == 0.5)) {
-				*time_scale = 0.5;
-			}
-			ImGui::SameLine();
-			if (ImGui::RadioButton("1", *time_scale == 1)) {
-				*time_scale = 1;
-			}
-			ImGui::SameLine();
-			if (ImGui::RadioButton("2", *time_scale == 2)) {
-				*time_scale = 2;
-			}
-			ImGui::SameLine();
-			if (ImGui::RadioButton("3", *time_scale == 3)) {
-				*time_scale = 3;
-			}
-			ImGui::SameLine();
-			if (ImGui::RadioButton("5", *time_scale == 5)) {
-				*time_scale = 5;
-			}*/
-			//0xdcd5b0
 		}
 		ImGui::End();
 	}
 
-	//inline void preStartInitialize() override {}
 	inline void initialize() override {
 		_spawner.template_localPlayer();
 	}
@@ -437,3 +382,144 @@ private:
 };
 
 WINDOW_REGISTER(player_spawner_deluxe);
+
+class weapon_hardpoint_diag_window : public window {
+	WINDOW_DEFINE(weapon_hardpoint_diag_window, "Diagnostics", "Weapon & Hardpoint Diagnostics", true);
+
+	inline void render() override {
+		if (open_window(nullptr, 0, ImVec2(750, 220))) {
+			ImGui::Text("Weapon, Effect & Hardpoint Ring-Buffer Tracer");
+			ImGui::Separator();
+			ImGui::Text("Logged Events: %d | FireShot(+0xD46060): %d | SSEffect(+0xD58110): %d | Attach(+0xA01430): %d | ResolveWeapon(+0xD560B0): %d | UpdateWeapons(+0xD563D0): %d",
+				WeaponHardpointDiag::s_total_events_logged,
+				WeaponHardpointDiag::s_fire_shot_calls,
+				WeaponHardpointDiag::s_ss_effect_calls,
+				WeaponHardpointDiag::s_attach_calls,
+				WeaponHardpointDiag::s_resolve_weapon_calls,
+				WeaponHardpointDiag::s_update_weapon_calls);
+
+			if (ImGui::Button("Dump Weapon & Hardpoint Diagnostics (weapon_hardpoint_diag.log)")) {
+				WeaponHardpointDiag::DumpReportToFile(GameEntityAdmin(), "Manual ImGui Button");
+			}
+			ImGui::SameLine();
+			if (ImGui::Button("Clear Trace Ring Buffer")) {
+				WeaponHardpointDiag::ClearTrace();
+			}
+			ImGui::SameLine();
+			if (ImGui::Button("Force Re-Attach Weapons (3P)")) {
+				WeaponHardpointDiag::ForceUpdateWeapons(GameEntityAdmin(), 0);
+			}
+			ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "Status: %s", WeaponHardpointDiag::s_last_dump_status.c_str());
+		}
+		ImGui::End();
+	}
+};
+
+WINDOW_REGISTER(weapon_hardpoint_diag_window);
+
+class origin_clutter_diag_window : public window {
+	WINDOW_DEFINE(origin_clutter_diag_window, "Diagnostics", "Origin (0,0,0) Clutter Inspector", true);
+
+	inline void render() override {
+		if (open_window(nullptr, 0, ImVec2(800, 420))) {
+			ImGui::Text("Origin (0,0,0) Clutter Inspector & Transform Guard");
+			ImGui::Separator();
+			ImGui::Checkbox("Block (0,0,0) Transform Overwrites (Case B)", &OriginClutterTracker::s_block_zero_overwrites);
+			ImGui::SameLine();
+			ImGui::Checkbox("Auto-Cull Unplaced (0,0,0) Props on Map Load (Case A)", &OriginClutterTracker::s_auto_cull_unplaced_origin_props);
+
+			ImGui::Text("Blocked Overwrites: %d | Culled Props: %d | Ticks Since World State 6: %d",
+				OriginClutterTracker::s_total_zero_overwrites_blocked,
+				OriginClutterTracker::s_total_culled_props,
+				OriginClutterTracker::s_ticks_since_world_ready);
+
+			if (ImGui::Button("Cull Unplaced (0,0,0) Dynamic Props Now")) {
+				OriginClutterTracker::CullUnplacedOriginProps(GameEntityAdmin());
+			}
+			ImGui::SameLine();
+			if (ImGui::Button("Restore Culled Props")) {
+				OriginClutterTracker::RestoreCulledProps(GameEntityAdmin());
+			}
+			ImGui::SameLine();
+			if (ImGui::Button("Dump Origin Report (origin_clutter_diag.log)")) {
+				OriginClutterTracker::DumpReportToFile(GameEntityAdmin(), "Manual UI Button");
+			}
+
+			if (ImGui::BeginChild("OriginClutterList", ImVec2(0, 0), true)) {
+				auto* ea = GameEntityAdmin();
+				if (ea) {
+					Entity* local_ctrl = ea->getLocalEnt();
+					uint32 local_mdl_id = 0;
+					if (local_ctrl) {
+						if (auto* pet = local_ctrl->getById<Component_20_ModelReference>(0x20)) {
+							local_mdl_id = pet->cam_attach_entid ? pet->cam_attach_entid : pet->aim_entid;
+						}
+					}
+					for (Entity* ent : *ea) {
+						if (!ent || ent == local_ctrl || ent->entity_id == local_mdl_id)
+							continue;
+						auto* c1 = ent->getById<Component_1_SceneRendering>(1);
+						if (!c1)
+							continue;
+						bool has_render_or_mover = (ent->getById(0x1C) != nullptr) || (ent->getById(0x2A) != nullptr) || (ent->getById(0x2D) != nullptr) || (ent->getById(0x12) != nullptr);
+						if (!has_render_or_mover)
+							continue;
+						float abs_pos = fabsf(c1->position.X) + fabsf(c1->position.Y) + fabsf(c1->position.Z);
+						auto* slot = OriginClutterTracker::GetSlot(ent->entity_id, ent);
+						bool is_near_zero = (abs_pos < 1.0f);
+						bool had_overwrite = slot && (slot->zero_overwrite_count > 0 || slot->direct_zero_overwrite_count > 0);
+						bool is_culled = slot && slot->culled_by_heracles;
+						if (!is_near_zero && !had_overwrite && !is_culled)
+							continue;
+
+						__int64 stu_id = (ent->resload_entry && ent->resload_entry->valid()) ? ent->resload_entry->align()->resource_id : (slot ? slot->stu_id : 0);
+						ImGui::PushID((int)ent->entity_id);
+						if (ImGui::SmallButton("Inspect")) {
+							entity_window::get_latest_or_create(this)->nav_to_ent(ent);
+						}
+						ImGui::SameLine();
+						if (!is_culled && ImGui::SmallButton("Hide")) {
+							if (slot) {
+								slot->pre_cull_pos = slot->has_nonzero_pos ? slot->latest_nonzero_pos : c1->position;
+								slot->pre_cull_rot = slot->has_nonzero_pos ? slot->latest_nonzero_rot : c1->rotation;
+								slot->culled_by_heracles = true;
+							}
+							Vector4 hidden_pos(0.f, -5000.f, 0.f, 0.f);
+							Vector4 ident_rot(0.f, 0.f, 0.f, 1.f);
+							c1->SetPosRotation(hidden_pos, ident_rot);
+							c1->SetScale(Vector4(0.f, 0.f, 0.f, 0.f));
+							c1->SetInvisible();
+							OriginClutterTracker::s_total_culled_props++;
+						} else if (is_culled && ImGui::SmallButton("Un-Hide")) {
+							slot->culled_by_heracles = false;
+							c1->SetScale(Vector4(1.f, 1.f, 1.f, 1.f));
+							c1->SetPosRotation(slot->pre_cull_pos, slot->pre_cull_rot);
+							c1->SetVisible();
+						}
+						if (slot && slot->has_nonzero_pos) {
+							ImGui::SameLine();
+							if (ImGui::SmallButton("Restore NonZero")) {
+								slot->culled_by_heracles = false;
+								c1->SetScale(Vector4(1.f, 1.f, 1.f, 1.f));
+								c1->SetPosRotation(slot->latest_nonzero_pos, slot->latest_nonzero_rot);
+								c1->SetVisible();
+							}
+						}
+						ImGui::SameLine();
+						ImGui::Text("Ent 0x%x | STU 0x%llx | Call +0x%llx | Pos(%.1f,%.1f,%.1f) | %s",
+							ent->entity_id,
+							(unsigned long long)stu_id,
+							(unsigned long long)(slot ? slot->spawn_caller_rva : 0),
+							c1->position.X, c1->position.Y, c1->position.Z,
+							is_culled ? "CULLED" : (had_overwrite ? "OVERWRITE_BLOCKED" : "AT_ORIGIN"));
+						ImGui::PopID();
+					}
+				}
+			}
+			ImGui::EndChild();
+		}
+		ImGui::End();
+	}
+};
+
+WINDOW_REGISTER(origin_clutter_diag_window);

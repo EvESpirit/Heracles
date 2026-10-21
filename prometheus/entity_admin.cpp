@@ -97,6 +97,8 @@ void play_game_btn() {
 	PrometheusSystem::instance()->demo_join_game = true;
 }
 
+static player_spawner s_hero_select_spawner;
+
 //0xd774b0
 char SendHeroSelection(StatescriptAction_vt** impl, StatescriptState* state, StatescriptInstance* ss, STUBase<>* stu_data) {
 	auto stu = stu_data->to_editable();
@@ -121,13 +123,12 @@ char SendHeroSelection(StatescriptAction_vt** impl, StatescriptState* state, Sta
 		}
 
 		PrometheusSystem::instance()->DeleteLocalEnt();
-
 		auto hero_stu = stu_resources::GetByID(hero_value.value);
 		auto model_entid = hero_stu->to_editable().get_argument_resource("m_gameplayEntity")->resource_id;
 
 		player_spawner spawner(model_entid);
+		spawner.use_deferred_spawn = false;
 		spawner.controller_info.heroid = hero_value.value;
-		Component_1_SceneRendering::InitData init{};
 		auto local_ents = spawner.spawn();
 
 		//TODO Move
@@ -662,7 +663,11 @@ void PrometheusSystem::state_replicator_exhandled() {
 }
 
 
+bool s_enable_ontick_varbag_spam = false;
+
 void PrometheusSystem::OnTick(float tick) {
+	OriginClutterTracker::OnTick(_game_ea, _world ? (int)_world->world_state : 0);
+
 	Entity* local_controller = _game_ea->getLocalEnt();
 	Entity* local_model = nullptr;
 
@@ -674,22 +679,30 @@ void PrometheusSystem::OnTick(float tick) {
 				auto ss = local_model->getById<Component_23_Statescript>(0x23);
 				auto health_stru = local_model->getById<Component_28_STUHealthComponent>(0x28);
 
-				float health = health_stru->vfptr->GetFullCurrentHealth(health_stru);
-				float health_max = health_stru->vfptr->GetFullMaxHealth(health_stru);
+				if (ss && health_stru && ss->ss_inner.rid_entity_varbag) {
+					static float s_last_hp = -1.0f;
+					static float s_last_max_hp = -1.0f;
+					static uint32 s_last_model_id = 0;
+					float health = health_stru->CalcTotalCurrentHealth();
+					float health_max = health_stru->CalcTotalMaxHealth();
 
-				StatescriptPrimitive health_cv{};
-				health_cv.type = StatescriptPrimitive_FLT;
+					if (local_model->entity_id != s_last_model_id || health != s_last_hp || health_max != s_last_max_hp) {
+						s_last_model_id = local_model->entity_id;
+						s_last_hp = health;
+						s_last_max_hp = health_max;
 
-				*(float*)&health_cv.value = health;
-				ss->ss_inner.rid_entity_varbag->SetVar({ StatescriptVar_ENTITY_VARBAG, 0x0D800000000006C4 }, health_cv);
+						StatescriptPrimitive health_cv{};
+						health_cv.type = StatescriptPrimitive_FLT;
 
-				*(float*)&health_cv.value = health_max;
-				ss->ss_inner.rid_entity_varbag->SetVar({ StatescriptVar_ENTITY_VARBAG, 0x0D800000000006C9 }, health_cv);
+						*(float*)&health_cv.value = health;
+						ss->ss_inner.rid_entity_varbag->SetVar({ 0x0D800000000006C4 }, health_cv);
+						ss->ss_inner.rid_entity_varbag->SetVar({ StatescriptVar_ENTITY_VARBAG, 0x0D800000000006C4 }, health_cv);
 
-				StatescriptPrimitive wpn_1{};
-				wpn_1.type = StatescriptPrimitive_INT;
-				wpn_1.value = 1;
-				ss->ss_inner.rid_entity_varbag->SetArray({ 0x0D8000000000001D }, wpn_1, wpn_1, 0);
+						*(float*)&health_cv.value = health_max;
+						ss->ss_inner.rid_entity_varbag->SetVar({ 0x0D800000000006C9 }, health_cv);
+						ss->ss_inner.rid_entity_varbag->SetVar({ StatescriptVar_ENTITY_VARBAG, 0x0D800000000006C9 }, health_cv);
+					}
+				}
 			}
 		}
 	}
@@ -1126,12 +1139,11 @@ void PrometheusSystem::OnTick(float tick) {
 		for (auto ent : _local_controller_entities) {
 			auto ref_comp = ent->getById<Component_20_ModelReference>(0x20);
 			auto aim_entid = ref_comp->aim_entid;
-			//Many checks are probably not needed but better be safe than sorry...
 			if (aim_entid > 0) {
 				auto aim_ent = _game_ea->getEntById(aim_entid);
 				if (aim_ent) {
 					auto filterbits = aim_ent->getById<Component_10_FilterBits>(0x10);
-					filterbits->filter_bits &= ~(0x10 | 0x400000);
+					filterbits->filter_bits &= ~(__int64)0x400000;
 				}
 			}
 		}

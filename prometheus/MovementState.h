@@ -184,7 +184,8 @@ struct Component_12_STUMovementStateComponent {
 		//CreateRotMatrix(&state, &state.rotation_matrix);
 		double result = EmplaceMovStateData(&history_1, state, v35);
 		if (result) {
-			double curr_match_time_secs = *(double*)(globals::gameBase + 0xc217a4);
+			auto* ea = GameEntityAdmin();
+			double curr_match_time_secs = (ea && ea->GameEA_timing) ? ea->GameEA_timing->cf_timer_1.timer_secs_double : *(double*)(globals::gameBase + 0x181e320);
 			latest_recv_secs = curr_match_time_secs;
 			field_143A0 = result;
 		}
