@@ -3,6 +3,7 @@
 #include <MinHook.h>
 #include <mutex>
 #include <functional>
+#include "stringhash_library.h"
 
 class statescript_logger {
 public:
@@ -64,8 +65,37 @@ public:
         s_deletionSubs.push_back(func);
     }
 
+    // Compact H-key trace (hero swap anywhere): prints node entries / logical button
+    // notifications for a short window after StartTrace(), capped at kTraceMaxLines.
+    static constexpr int kTraceMaxLines = 100;
+    static inline ULONGLONG s_trace_until = 0;
+    static inline int s_trace_lines = 0;
+    static bool TraceActive() {
+        return s_trace_until != 0 && s_trace_lines < kTraceMaxLines && GetTickCount64() < s_trace_until;
+    }
+    static void StartTrace(ULONGLONG ms) {
+        s_trace_until = GetTickCount64() + ms;
+        s_trace_lines = 0;
+        printf("[SSTrace] ---- H pressed, tracing %llums ----\n", ms);
+    }
+    static const char* TraceNodeName(STUStatescriptBase* stu, char* buf, size_t sz) {
+        if (!stu || !stu->graph_node.base.vfptr) return "?";
+        auto info = stu->graph_node.base.vfptr->GetSTUInfo();
+        if (!info) return "?";
+        auto it = allmighty_hash_lib::hashes.find(info->name_hash);
+        if (it != allmighty_hash_lib::hashes.end()) return it->second.c_str();
+        snprintf(buf, sz, "0x%08x", (uint32)info->name_hash);
+        return buf;
+    }
+
     static inline __int64(__fastcall* TickScript_orig)(StatescriptInstance*, StatescriptNotification_Base*);
     static __int64 __fastcall TickScript(StatescriptInstance* ss, StatescriptNotification_Base* ss_e) {
+        if (ss_e && ss_e->type != ETYPE_TIMER && ss_e->type != ETYPE_LIFETIME && TraceActive()) {
+            char tbuf[128];
+            ss_e->vfptr->ToString(ss_e, tbuf, 128);
+            s_trace_lines++;
+            printf("[SSTrace] NOTIFY t=%d script=", (int)ss_e->type); printf("0x%llx inst=%hd : %s\n", (unsigned long long)ss->script_id, ss->instance_id, tbuf);
+        }
         //printf("Tick [%hd %p] ", ss->instance_id, ss->script_id);
         if (s_subscriptions.find(ss) != s_subscriptions.end()) {
             char buf[128];
@@ -138,6 +168,13 @@ private:
         auto& state = s_scriptStates[ss][ss->graph->STUFromState(istate)->ss_base.idx_in_nodes];
         state.change_timestamp = inner->cf_timestamp;
         state.is_finish_state = false;
+        if (TraceActive()) {
+            auto stu_state = ss->graph->STUFromState(istate);
+            char nbuf[16];
+            s_trace_lines++;
+            printf("[SSTrace] STATE+ script=0x%llx inst=%hd node=%d %s\n", (unsigned long long)ss->script_id, ss->instance_id,
+                stu_state ? stu_state->ss_base.idx_in_nodes : -1, stu_state ? TraceNodeName(&stu_state->ss_base, nbuf, sizeof(nbuf)) : "?");
+        }
         StateEntry_orig(inner, ss, istate);
     }
     static void __fastcall OnNodeStateFinished(StatescriptSyncMgr* inner, StatescriptInstance* ss, StatescriptState* istate) {
@@ -149,6 +186,13 @@ private:
         auto& state = s_scriptStates[ss][ss->graph->STUFromState(istate)->ss_base.idx_in_nodes];
         state.change_timestamp = inner->cf_timestamp;
         state.is_finish_state = true;
+        if (TraceActive()) {
+            auto stu_state = ss->graph->STUFromState(istate);
+            char nbuf[16];
+            s_trace_lines++;
+            printf("[SSTrace] STATE- script=0x%llx inst=%hd node=%d %s\n", (unsigned long long)ss->script_id, ss->instance_id,
+                stu_state ? stu_state->ss_base.idx_in_nodes : -1, stu_state ? TraceNodeName(&stu_state->ss_base, nbuf, sizeof(nbuf)) : "?");
+        }
         StateFinish_orig(inner, ss, istate);
     }
     static void __fastcall OnNodeActionEntry(StatescriptSyncMgr* inner, StatescriptInstance* ss, StatescriptState* istate, int idx_in_m_nodes) {
@@ -156,9 +200,27 @@ private:
         auto& state = s_scriptStates[ss][idx_in_m_nodes];
         state.change_timestamp = inner->cf_timestamp;
         state.is_finish_state = true;
+        if (TraceActive() && ss->graph) {
+            STUStatescriptBase* node = (idx_in_m_nodes >= 0 && idx_in_m_nodes < (int)ss->graph->m_nodes.count()) ? ss->graph->m_nodes.list()[idx_in_m_nodes] : nullptr;
+            char nbuf[16];
+            s_trace_lines++;
+            printf("[SSTrace] ACTION script=0x%llx inst=%hd node=%d %s\n", (unsigned long long)ss->script_id, ss->instance_id, idx_in_m_nodes, TraceNodeName(node, nbuf, sizeof(nbuf)));
+        }
         ActionEntry_orig(inner, ss, istate, idx_in_m_nodes);
     }
     static char __fastcall OnScriptEntry(__int64 a1, StatescriptInstance* ss, STUStatescriptBase* stu) {
+        if (TraceActive() && ss && stu) {
+            static StatescriptInstance* s_last_ss = nullptr;
+            static int s_last_idx = -1;
+            if (ss != s_last_ss || stu->idx_in_nodes != s_last_idx) {
+                s_last_ss = ss;
+                s_last_idx = stu->idx_in_nodes;
+                char nbuf[16];
+                s_trace_lines++;
+                printf("[SSTrace] ENTRY script=0x%llx inst=%hd node=%d %s\n",
+                    (unsigned long long)ss->script_id, ss->instance_id, stu->idx_in_nodes, TraceNodeName(stu, nbuf, sizeof(nbuf)));
+            }
+        }
         //printf("Took Node Entry: %hhd:%d\n", ss->instance_id, stu->idx_in_nodes);
         auto& state = s_scriptStates[ss][stu->idx_in_nodes];
         state.change_timestamp = ss->ss_inner->cf_timestamp;

@@ -1014,6 +1014,7 @@ class PrometheusSystem {
     PrometheusSystem_Mapfunc _mapfunc{};
     int _trigger_helloVoiceLine_ticks = -1;
     bool _applied_demo = false;
+    bool _applied_hero_swap = false;
 
     void state_replicator_do();
     void state_replicator_exhandled();

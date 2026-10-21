@@ -12,6 +12,8 @@
 #include "state_replicator.h"
 #include "serialization.h"
 #include "demo_cammoves.cpp"
+#include <intrin.h>
+#include "statescript_logger.h"
 
 __int64 PrometheusSystem::get_inheritance() {
 	return NULL;
@@ -81,6 +83,25 @@ void PrometheusSystem::OnDeletion(Entity* ent) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Hero swap anywhere (H outside spawn room)
+// ---------------------------------------------------------------------------
+// 0x1074FC0: native CanSelectHero(Component_3F_PlayerInfo*, bool, bool, char* out) -> bool.
+// Callers:
+//   - +0xD3524D inside native H / logical button 0xAB (171) handler (+0xD35160, dispatched from +0xC326B2):
+//     if true -> calls +0xD35340 (opens Hero Select UI);
+//     if false -> resolves string 0x0DE000000000043F ("not in spawn room") via +0x852EE0 and posts HUD error.
+//   - +0xD89D1C and +0xD89F4A inside the Hero Select UI state machine.
+// Returning 1 unconditionally allows opening Hero Select and confirming a hero anywhere on the map.
+static bool s_force_can_select_hero = true;
+static char(__fastcall* CanSelectHero_orig)(ComponentBase*, char, char, char*) = nullptr;
+static char __fastcall CanSelectHero_hook(ComponentBase* comp3F, char a2, char a3, char* out) {
+	char ret = CanSelectHero_orig(comp3F, a2, a3, out);
+	if (s_force_can_select_hero)
+		return 1;
+	return ret;
+}
+
 string_rep* (*get_displayString_orig)(string_rep*, __int64 id, __int64);
 string_rep* get_displayString_func(string_rep* a1, __int64 id, __int64 a3) {
 	if (id == 0xde00000000005df) {
@@ -98,6 +119,80 @@ void play_game_btn() {
 }
 
 static player_spawner s_hero_select_spawner;
+// Hero chosen on the Hero Select screen. Processed on the next PrometheusSystem::OnTick
+// so the old local entities are not deleted while the Statescript VM is executing this action.
+static __int64 s_pending_hero_swap_id = 0;
+
+static void process_pending_hero_swap() {
+	__int64 heroid = s_pending_hero_swap_id;
+	if (heroid == 0)
+		return;
+	s_pending_hero_swap_id = 0;
+
+	auto ea = GameEntityAdmin();
+	auto hero_stu = stu_resources::GetByID(heroid);
+	if (!ea || !hero_stu) {
+		printf("[HeroSwap] Invalid hero %llx\n", (unsigned long long)heroid);
+		return;
+	}
+	auto gameplay_ent = hero_stu->to_editable().get_argument_resource("m_gameplayEntity");
+	if (!gameplay_ent || !gameplay_ent->has_resource()) {
+		printf("[HeroSwap] Hero %llx has no m_gameplayEntity\n", (unsigned long long)heroid);
+		return;
+	}
+	auto model_entid = gameplay_ent->resource_id;
+
+	// Capture the previous hero model's world transform before deleting it.
+	bool have_transform = false;
+	Vector4 old_pos{};
+	Vector4 old_rot{};
+	if (auto old_local = ea->getLocalEnt()) {
+		if (auto info = old_local->getById<Component_3F_PlayerInfo>(0x3F)) {
+			if (info->selected_heroid == heroid)
+				return; // Same hero, nothing to do
+		}
+		auto pet = old_local->getById<Component_20_ModelReference>(0x20);
+		Entity* old_model = pet ? ea->getEntById(pet->cam_attach_entid) : nullptr;
+		if (old_model) {
+			auto c1 = old_model->getById<Component_1_SceneRendering>(1);
+			auto c15 = old_model->getById<Component_15_STUCharacterMoverComponent>(0x15);
+			if (c15) {
+				old_pos = c15->movement_state_2.absolute_position;
+				have_transform = true;
+			}
+			else if (c1) {
+				old_pos = c1->position;
+				have_transform = true;
+			}
+			if (c1)
+				old_rot = c1->rotation;
+		}
+	}
+
+	PrometheusSystem::instance()->DeleteLocalEnt();
+
+	s_hero_select_spawner = player_spawner(model_entid);
+	s_hero_select_spawner.use_deferred_spawn = true;
+	s_hero_select_spawner.controller_info.heroid = heroid;
+	s_hero_select_spawner.model_info.heroid = heroid;
+	if (have_transform) {
+		old_pos.W = 0.0f;
+		s_hero_select_spawner.model_info.set_position = true;
+		s_hero_select_spawner.model_info.spawn_position = old_pos;
+		s_hero_select_spawner.model_info.spawn_rotation = old_rot;
+	}
+	auto local_ents = s_hero_select_spawner.spawn();
+	printf("[HeroSwap] Swapped to hero %llx (model %llx) ctrl=%x model=%x pos=(%.2f,%.2f,%.2f) has_pos=%d\n",
+		(unsigned long long)heroid, (unsigned long long)model_entid,
+		local_ents.first ? local_ents.first->entity_id : 0, local_ents.second ? local_ents.second->entity_id : 0,
+		old_pos.X, old_pos.Y, old_pos.Z, (int)have_transform);
+
+	//TODO Move
+	state_replicator::ChangeHeroMessage msg;
+	msg.heroid = heroid;
+	msg.skinid = 0;
+	state_replicator::emplace_hero_update(msg);
+}
 
 //0xd774b0
 char SendHeroSelection(StatescriptAction_vt** impl, StatescriptState* state, StatescriptInstance* ss, STUBase<>* stu_data) {
@@ -105,37 +200,18 @@ char SendHeroSelection(StatescriptAction_vt** impl, StatescriptState* state, Sta
 	auto hero = stu.get_argument_object("m_hero");
 	auto hero_cv = (STUConfigVar*)hero.value;
 	StatescriptPrimitive hero_value;
-	hero_cv->get_value(ss, &hero_value);
-	owassert(hero_value.type == StatescriptPrimitive_INT64);
+	if (!hero_cv || !hero_cv->get_value(ss, &hero_value) || hero_value.type != StatescriptPrimitive_INT64) {
+		// e.g. during gamemode loading m_hero is not an INT64 yet; previously asserted here
+		return 1;
+	}
 
 	auto behavior = stu.get_argument_primitive("m_behavior").get_value<int>();
 	/*printf("HeroSelect behavior: %hx\n", behavior);*/
 	//0 = just send teammate preview
 	if (hero_value.value != 0 && behavior == 1) {
 		printf("Selected Hero: %p\n", hero_value.value);
-
-		auto old_local = GameEntityAdmin()->getLocalEnt();
-		if (old_local) {
-			auto hero_info = old_local->getById<Component_3F_PlayerInfo>(0x3F);
-			if (hero_info->selected_heroid == hero_value.value) {
-				return 1;
-			}
-		}
-
-		PrometheusSystem::instance()->DeleteLocalEnt();
-		auto hero_stu = stu_resources::GetByID(hero_value.value);
-		auto model_entid = hero_stu->to_editable().get_argument_resource("m_gameplayEntity")->resource_id;
-
-		player_spawner spawner(model_entid);
-		spawner.use_deferred_spawn = false;
-		spawner.controller_info.heroid = hero_value.value;
-		auto local_ents = spawner.spawn();
-
-		//TODO Move
-		state_replicator::ChangeHeroMessage msg;
-		msg.heroid = hero_value.value;
-		msg.skinid = 0;
-		state_replicator::emplace_hero_update(msg);
+		// Deferred to OnTick (see process_pending_hero_swap)
+		s_pending_hero_swap_id = hero_value.value;
 	}
 	return 1;
 }
@@ -667,6 +743,20 @@ bool s_enable_ontick_varbag_spam = false;
 
 void PrometheusSystem::OnTick(float tick) {
 	OriginClutterTracker::OnTick(_game_ea, _world ? (int)_world->world_state : 0);
+	// Always-on hero swap hooks (H anywhere on the map). Previously SendHeroSelection was gated behind globals::isDemo.
+	if (!_applied_hero_swap) {
+		_applied_hero_swap = true;
+
+		MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xd774b0), SendHeroSelection, (PVOID*)0));
+		MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xd774b0)));
+
+		MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0x1074fc0), CanSelectHero_hook, (PVOID*)&CanSelectHero_orig));
+		MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0x1074fc0)));
+	}
+
+	process_pending_hero_swap();
+	s_hero_select_spawner.tick_deferred_spawn();
+
 
 	Entity* local_controller = _game_ea->getLocalEnt();
 	Entity* local_model = nullptr;
@@ -716,9 +806,6 @@ void PrometheusSystem::OnTick(float tick) {
 
 			MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xc87220), play_game_btn, (PVOID*)0));
 			MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xc87220)));
-
-			MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xd774b0), SendHeroSelection, (PVOID*)0));
-			MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xd774b0)));
 
 			MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xd94930), matchmaking_cv, (PVOID*)0));
 			MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xd94930)));
