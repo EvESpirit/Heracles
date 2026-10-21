@@ -1754,7 +1754,7 @@ __int64 System63_hook(__int64 sys) {
 
 void __cdecl StartHook(void*) {
     //system("pause");
-    printf("hello monsieur\n");
+    printf("The cavalry's here!\n");
     atexit(exit_handler);
 
     char orig[] = { 0x7E, 0x41, 0xDB, 0xB6, 0x8F, 0x68, 0x93, 0x42, 0x09, 0xC8, 0x5F, 0x4A };
@@ -2147,7 +2147,7 @@ BOOL APIENTRY DllMain(HMODULE hModule,
     static std::once_flag entrypoint_mutex;
     std::call_once(entrypoint_mutex, [] {
         globals::ensure_console_allocated();
-        printf("Hello World!\n");
+        printf("Cheers love!\n");
 
         printf("Adding VEH: %p\n", AddVectoredExceptionHandler(true, (PVECTORED_EXCEPTION_HANDLER)VectoredExceptionHandler));
         globals::gameBase = (DWORD_PTR)GetModuleHandleA(nullptr);
