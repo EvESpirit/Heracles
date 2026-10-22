@@ -892,6 +892,339 @@ static void dump_node_raw_hex(std::ofstream& out, STUStatescriptBase* node, int 
 	out << "```\n\n";
 }
 
+static void dump_raw_mem_block(std::ofstream& out, const char* label, void* base_ptr, int byte_len) {
+	out << "\n##### " << label << " (`0x" << std::hex << (uintptr_t)base_ptr << std::dec << "`, `0x" << std::hex << byte_len << std::dec << "` bytes):\n```\n";
+	if (!base_ptr || !is_valid_read_memory(base_ptr, 8)) {
+		out << "(null or invalid pointer)\n```\n";
+		return;
+	}
+	uint64_t* qwords = (uint64_t*)base_ptr;
+	for (int off = 0; off < byte_len; off += 8) {
+		uint64_t val = 0;
+		if (is_valid_read_memory(&qwords[off / 8], 8)) {
+			val = qwords[off / 8];
+		}
+		uint32_t lo_dw = (uint32_t)(val & 0xFFFFFFFFull);
+		uint32_t hi_dw = (uint32_t)(val >> 32);
+		float lo_f = *(float*)&lo_dw;
+		float hi_f = *(float*)&hi_dw;
+		out << std::format("+0x{:03X}: {:016X}  (dw: {:08X} {:08X} | f: {:.3f}, {:.3f})", off, val, lo_dw, hi_dw, lo_f, hi_f);
+
+		if (val >= (uint64_t)globals::gameBase && val < (uint64_t)globals::gameBase + 0x3000000) {
+			out << std::format("  [Game RVA: +0x{:X}]", val - (uint64_t)globals::gameBase);
+		}
+		uint64_t hi = (val >> 48) & 0xFFFF;
+		if (hi == 0x0D80 || hi == 0x0580 || hi == 0x0400 || hi == 0x0800 || hi == 0x0760 || hi == 0x0A50 || hi == 0x0DC0) {
+			out << std::format("  [Resource/Var ID: 0x{:016X}]", val);
+		}
+		if (val > 0x10000 && val < 0x7FFFFFFFFFFFull && is_valid_read_memory((void*)val, 8)) {
+			std::string rtti = get_rtti_classname((void*)val);
+			if (!rtti.empty()) {
+				out << "  [RTTI: " << rtti << "]";
+			}
+		}
+		out << "\n";
+	}
+	out << "```\n";
+}
+
+static void dump_entity_door_forensics(std::ofstream& out, Entity* ent, const char* admin_label) {
+	if (!ent || !is_valid_read_memory(ent, sizeof(Entity))) return;
+	auto* slot = OriginClutterTracker::GetSlot(ent->entity_id, ent);
+	__int64 stu_id = slot ? slot->stu_id : 0;
+	__int64 res_id = (ent->resload_entry && is_valid_read_memory(ent->resload_entry, sizeof(void*)) && ent->resload_entry->valid())
+		? ent->resload_entry->align()->resource_id : 0;
+	if (stu_id == 0) stu_id = res_id;
+
+	out << "## [" << admin_label << "] Door Entity `0x" << std::hex << ent->entity_id
+		<< "` (STU `0x" << stu_id << "`, Resload `0x" << res_id
+		<< "`, SpawnCaller `+0x" << (slot ? slot->spawn_caller_rva : 0) << "`)" << std::dec << "\n";
+
+	auto* c1 = ent->getById<Component_1_SceneRendering>(1);
+	if (c1 && is_valid_read_memory(c1, sizeof(Component_1_SceneRendering))) {
+		uintptr_t parent_c1 = *(uintptr_t*)((uintptr_t)c1 + 0x1D0);
+		uintptr_t phys_ptr = *(uintptr_t*)((uintptr_t)c1 + 0x198);
+		out << "- **Component_1_SceneRendering** (`0x" << std::hex << (uintptr_t)c1 << std::dec << "`):\n";
+		out << std::format("  - Position: `({:.3f}, {:.3f}, {:.3f})`\n", c1->position.X, c1->position.Y, c1->position.Z);
+		out << std::format("  - Rotation: `({:.4f}, {:.4f}, {:.4f}, {:.4f})`\n", c1->rotation.X, c1->rotation.Y, c1->rotation.Z, c1->rotation.W);
+		out << std::format("  - Scale: `({:.3f}, {:.3f}, {:.3f})`\n", c1->scaling.X, c1->scaling.Y, c1->scaling.Z);
+		out << std::format("  - `rendering_flags` (+0x180): `0x{:016X}` (`IsVisible() = {}`)\n",
+			(unsigned long long)c1->rendering_flags, c1->IsVisible() ? "true" : "false");
+		out << std::format("  - `phys_actor_ptr` (+0x198): `0x{:016X}` | `parent_c1` (+0x1D0): `0x{:016X}`\n",
+			(unsigned long long)phys_ptr, (unsigned long long)parent_c1);
+	}
+
+	out << "\n### 1. Component List & Mirror STU Data\n";
+	for (int i = 0; i < ent->component_list.num - 1; i++) {
+		ComponentBase* comp = ent->component_list.ptr[i];
+		if (!comp || !is_valid_read_memory(comp, sizeof(ComponentBase))) continue;
+		uintptr_t vfptr_val = *(uintptr_t*)comp;
+		uintptr_t vfptr_rva = (vfptr_val >= (uintptr_t)globals::gameBase) ? (vfptr_val - (uintptr_t)globals::gameBase) : 0;
+		std::string comp_rtti = get_rtti_classname(comp);
+		out << std::format("- **Component `0x{:02X}`** at `0x{:X}` (vfptr `+0x{:X}`, RTTI `{}`)\n",
+			(int)comp->component_id, (uintptr_t)comp, vfptr_rva, comp_rtti);
+
+		STUBase<STUBase_vt>* mirror = (STUBase<STUBase_vt>*)comp->GetMirrorData();
+		if (mirror && is_valid_read_memory(mirror, sizeof(void*))) {
+			STUInfo* minfo = safe_get_stu_info(mirror);
+			uint mhash = minfo ? minfo->name_hash : 0;
+			std::string mname = "Unknown";
+			auto it = allmighty_hash_lib::hashes.find(mhash);
+			if (it != allmighty_hash_lib::hashes.end()) mname = it->second;
+			std::string mrtti = get_rtti_classname(mirror);
+			out << std::format("  - MirrorData: `0x{:X}` STU `0x{:08X}` (`{}`), RTTI `{}`\n",
+				(uintptr_t)mirror, mhash, mname, mrtti);
+			if (minfo) {
+				std::unordered_set<uintptr_t> visited;
+				visited.insert((uintptr_t)mirror);
+				dump_stu_object_fields(out, mirror, minfo, 2, 4, visited);
+			}
+		}
+	}
+
+	out << "\n### 2. Key Door Components Raw Memory\n";
+	if (auto* c4 = ent->getById<ComponentBase>(0x04)) {
+		dump_raw_mem_block(out, "Component_04 (Animation / Skeleton)", c4, 0x120);
+	}
+	if (auto* c12 = ent->getById<ComponentBase>(0x12)) {
+		dump_raw_mem_block(out, "Component_12 (STUMovementStateComponent Header +0x00..+0x80)", c12, 0x80);
+		dump_raw_mem_block(out, "Component_12 (Footer +0xA030..+0xA068)", (void*)((uintptr_t)c12 + 0xA030), 0x38);
+	}
+	if (auto* c29 = ent->getById<ComponentBase>(0x29)) {
+		dump_raw_mem_block(out, "Component_29 (Door Mover / Portal A)", c29, 0x60);
+	}
+	if (auto* c2a = ent->getById<ComponentBase>(0x2A)) {
+		dump_raw_mem_block(out, "Component_2A (Door Mover / NavMesh Obstacle)", c2a, 0x100);
+	}
+	if (auto* c68 = ent->getById<ComponentBase>(0x68)) {
+		dump_raw_mem_block(out, "Component_68", c68, 0x80);
+	}
+
+	auto* c23 = ent->getById<Component_23_Statescript>(0x23);
+	out << "\n### 3. `Component_23_Statescript` Deep Inspection\n";
+	if (!c23 || !is_valid_read_memory(c23, sizeof(Component_23_Statescript))) {
+		out << "(No Component_23_Statescript on this entity)\n\n---\n\n";
+		return;
+	}
+
+	uint16_t next_cli_id = *(uint16_t*)((uintptr_t)c23 + 0xA8);
+	uint16_t next_srv_id = *(uint16_t*)((uintptr_t)c23 + 0xAA);
+	uint8_t init_byte_bc = *(uint8_t*)((uintptr_t)c23 + 0xBC);
+	out << std::format("- `c23` ptr: `0x{:X}` | `+0xA8` (next_cli_id): `0x{:04X}` ({}) | `+0xAA` (next_srv_id): `0x{:04X}` ({}) | `+0xBC` (init_done): `{}`\n",
+		(uintptr_t)c23, next_cli_id, (int16_t)next_cli_id, next_srv_id, (int16_t)next_srv_id, (int)init_byte_bc);
+	out << std::format("- `ss_inner.is_instantiating`: `{}` | `ontick_updates_enabled`: `{}` | `g1_instanceArr.num`: `{}` | `g3_arrWithIds.num`: `{}`\n",
+		(int)c23->ss_inner.is_instantiating, (int)c23->ss_inner.ontick_updates_enabled,
+		c23->ss_inner.g1_instanceArr.num, c23->ss_inner.g3_arrWithIds.num);
+
+	dump_raw_mem_block(out, "Component_23 Header (+0x00..+0x100)", c23, 0x100);
+
+	out << "\n#### Entity VarBag (`c23->ss_inner.rid_entity_varbag`):\n";
+	dump_varbag_entries(out, c23->ss_inner.rid_entity_varbag, "  ");
+
+	out << "\n#### `g3_arrWithIds` Entries (" << c23->ss_inner.g3_arrWithIds.num << "):\n";
+	for (int i = 0; i < c23->ss_inner.g3_arrWithIds.num; i++) {
+		auto& item = c23->ss_inner.g3_arrWithIds.ptr[i];
+		StatescriptInstance* inst_ptr = *(StatescriptInstance**)&item;
+		out << std::format("  - [{}] inst_id: `{}` (`0x{:04X}`), inst_ptr: `0x{:X}`, script_id: `0x{:016X}`\n",
+			i, (int)item.instance_id, (unsigned int)(uint16_t)item.instance_id, (uintptr_t)inst_ptr,
+			(inst_ptr && is_valid_read_memory(inst_ptr, sizeof(StatescriptInstance))) ? (unsigned long long)inst_ptr->script_id : 0ULL);
+	}
+
+	out << "\n#### `g1_instanceArr` Script Instances (" << c23->ss_inner.g1_instanceArr.num << "):\n";
+	for (int s_idx = 0; s_idx < c23->ss_inner.g1_instanceArr.num; s_idx++) {
+		StatescriptInstance* script = c23->ss_inner.g1_instanceArr.ptr[s_idx];
+		if (!script || !is_valid_read_memory(script, sizeof(StatescriptInstance))) continue;
+
+		uint32_t exec_flags = *(uint32_t*)((uintptr_t)script + 0x258);
+		out << std::format("\n##### Instance [{}] id={} (`0x{:04X}`), Script Resource `0x{:016X}`, parent_id={}, exec_flags(+0x258)=`0x{:08X}`, graph=`0x{:X}`\n",
+			s_idx, script->instance_id, (uint16_t)script->instance_id,
+			(unsigned long long)script->script_id, script->parent_instance_id,
+			exec_flags, (uintptr_t)script->graph);
+
+		out << "- **Instance VarBag 1 (`rid_instance_varbag`)**:\n";
+		dump_varbag_entries(out, script->rid_instance_varbag, "    ");
+		out << "- **Instance VarBag 2 (`second_inst_varbag`)**:\n";
+		dump_varbag_entries(out, script->second_inst_varbag, "    ");
+
+		if (script->state_impl_list.ptr && script->state_impl_list.num > 0 &&
+			is_valid_read_memory(script->state_impl_list.ptr, script->state_impl_list.num * sizeof(void*))) {
+			out << std::format("- **Runtime `state_impl_list`** (`ptr = 0x{:X}`, `num = {}`):\n",
+				(uintptr_t)script->state_impl_list.ptr, script->state_impl_list.num);
+			int state_cnt = script->state_impl_list.num;
+			if (state_cnt > 16) state_cnt = 16;
+			for (int si = 0; si < state_cnt; si++) {
+				auto* st = script->state_impl_list.ptr[si];
+				if (!st || !is_valid_read_memory(st, 0x80)) continue;
+				uintptr_t vf = *(uintptr_t*)st;
+				uintptr_t vf_rva = (vf >= globals::gameBase && vf < globals::gameBase + 0x3000000) ? (vf - globals::gameBase) : vf;
+				uint32_t st_flags = *(uint32_t*)((uintptr_t)st + 0x40);
+				std::string lbl = std::format("state_impl[{}] (idx_in_m_states={}, vfptr=+0x{:X}, flags=0x{:08X})",
+					si, st->idx_in_m_states, vf_rva, st_flags);
+				dump_raw_mem_block(out, lbl.c_str(), st, 0x100);
+			}
+		}
+
+		if (script->graph && is_valid_read_memory(script->graph, sizeof(STUStatescriptGraph))) {
+			out << std::format("- **Graph Counts**: `m_nodes = {}`, `m_states = {}`, `m_entries = {}`\n",
+				script->graph->m_nodes.count(), script->graph->m_states.count(),
+				script->graph->m_entries.count());
+
+			auto script_state = statescript_logger::GetScriptState(script);
+
+			for (auto* node : script->graph->m_nodes) {
+				if (!node || !is_valid_read_memory(node, sizeof(STUStatescriptBase))) continue;
+				STUInfo* n_info = safe_get_stu_info(node);
+				uint n_hash = n_info ? n_info->name_hash : 0;
+				std::string stu_name = "Unknown";
+				std::string rtti_name = get_rtti_classname(node);
+				auto it = allmighty_hash_lib::hashes.find(n_hash);
+				if (it != allmighty_hash_lib::hashes.end()) stu_name = it->second;
+				else if (!rtti_name.empty()) stu_name = rtti_name;
+				else if (n_hash) stu_name = std::format("0x{:08X}", n_hash);
+
+				auto state_it = script_state.find(node->idx_in_nodes);
+				__int64 last_ts = (state_it != script_state.end()) ? state_it->second.change_timestamp : 0;
+				bool finished = (state_it != script_state.end()) ? state_it->second.is_finish_state : false;
+
+				out << std::format("\n  * **Node {}**: `[{}]` (STU `0x{:08X}`, RTTI `{}`) | isState={}, CO={}, SERVER={} | last_ts={} ({})\n",
+					node->idx_in_nodes, stu_name, n_hash, rtti_name,
+					(int)node->m_isState, (int)node->m_clientOnly, (int)node->m_serverOnly,
+					last_ts, (state_it == script_state.end()) ? "NEVER_ENTERED" : (finished ? "FINISHED" : "ACTIVE"));
+
+				// Output plugs & links
+				auto plug_map = node->get_output_plugs();
+				for (auto& plug_entry : plug_map) {
+					for (auto* plug : plug_entry.second) {
+						if (!plug || !is_valid_read_memory(plug, sizeof(STUGraphPlug))) continue;
+						std::string plug_rtti = get_rtti_classname(plug);
+						STUInfo* p_stu = safe_get_stu_info(plug);
+						uint plug_hash = p_stu ? p_stu->name_hash : 0;
+						out << std::format("    -> OutPlug `0x{:08X}` [{}] (links: {}):\n", plug_hash, plug_rtti, plug->m_links.count());
+						for (auto* link : plug->m_links) {
+							if (!link || !is_valid_read_memory(link, sizeof(STUGraphLink))) continue;
+							if (link->m_inputPlug && is_valid_read_memory(link->m_inputPlug, sizeof(STUStatescriptInputPlug))) {
+								auto* target = link->m_inputPlug->plug_base.m_parentNode;
+								if (target && is_valid_read_memory(target, sizeof(STUStatescriptBase))) {
+									out << std::format("       ==> Link to Node {} [{}]\n", target->idx_in_nodes, get_rtti_classname(target));
+								}
+							}
+						}
+					}
+				}
+
+				// Deep STU fields of the node
+				if (n_info) {
+					std::unordered_set<uintptr_t> visited_ptrs;
+					visited_ptrs.insert((uintptr_t)node);
+					dump_stu_object_fields(out, node, n_info, 2, 4, visited_ptrs);
+				}
+			}
+		}
+	}
+	out << "\n---\n\n";
+}
+
+void OriginClutterTracker::DumpSpawnDoorsToFile(EntityAdminBase* game_ea, const char* trigger_reason) {
+	ensure_known_stu_hashes();
+	if (!game_ea) {
+		s_last_door_dump_status = "Error: GameEntityAdmin is null.";
+		return;
+	}
+
+	std::ofstream out("spawn_doors_diag.log", std::ios::out | std::ios::trunc);
+	if (!out.is_open()) {
+		s_last_door_dump_status = "Error: Failed to open spawn_doors_diag.log for writing.";
+		return;
+	}
+
+	auto* world = get_system27_WorldEngineSystem(game_ea);
+	__int64 map_id = world ? world->loaded_map_id : 0;
+	int wstate = world ? (int)world->world_state : -1;
+
+	out << "# Spawn Doors & Map Statescript Forensic Dump\n";
+	out << "- **Trigger Reason**: `" << (trigger_reason ? trigger_reason : "Manual") << "`\n";
+	out << std::format("- **Loaded Map ID**: `0x{:016X}` (`world_state = {}`)\n", (unsigned long long)map_id, wstate);
+	out << std::format("- **`GameEntityAdmin`**: `0x{:X}` (vfptr `+0x{:X}`)\n\n",
+		(uintptr_t)game_ea, *(uintptr_t*)game_ea - (uintptr_t)globals::gameBase);
+
+	uint32 local_ctrl_id = game_ea->local_entid;
+	uint32 local_mdl_id = 0;
+	if (Entity* lc = game_ea->getLocalEnt()) {
+		if (auto* pet = lc->getById<Component_20_ModelReference>(0x20)) {
+			local_mdl_id = pet->cam_attach_entid ? pet->cam_attach_entid : pet->aim_entid;
+		}
+	}
+
+	int dumped_doors = 0;
+	for (Entity* ent : *game_ea) {
+		if (!ent) continue;
+		if (ent->entity_id == local_ctrl_id || ent->entity_id == local_mdl_id) continue;
+		if (ent->hasComponent(0x15) || ent->hasComponent(0x2F) || ent->hasComponent(0x3F) || ent->hasComponent(0x1D)) continue;
+		if (IsSpawnDoorEntity(ent, local_ctrl_id, local_mdl_id) || (ent->hasComponent(0x12) && ent->hasComponent(0x2A))) {
+			dump_entity_door_forensics(out, ent, "GameEntityAdmin");
+			dumped_doors++;
+		}
+	}
+
+	// Also check LobbyEntityAdmin if it exists and has any door/mover entities
+	EntityAdminBase* lobby_ea = LobbyEntityAdmin();
+	if (lobby_ea && is_valid_read_memory(lobby_ea, sizeof(EntityAdminBase))) {
+		for (Entity* ent : *lobby_ea) {
+			if (!ent) continue;
+			if (ent->hasComponent(0x12) || ent->hasComponent(0x29) || ent->hasComponent(0x2A)) {
+				dump_entity_door_forensics(out, ent, "LobbyEntityAdmin");
+			}
+		}
+	}
+
+	// Section: Summary of all other non-player entities in GameEntityAdmin with Component_23_Statescript
+	out << "## Non-Player Map/System Entities With `Component_23_Statescript` in `GameEntityAdmin`\n";
+	out << "| EntID | STU ID | Resload ID | Pos | `[c23+0xBC]` | `g1_num` | Script IDs (`0x580...`) | Components |\n";
+	out << "|---|---|---|---|---|---|---|---|\n";
+	for (Entity* ent : *game_ea) {
+		if (!ent) continue;
+		if (ent->entity_id == local_ctrl_id || ent->entity_id == local_mdl_id) continue;
+		if (ent->hasComponent(0x15) || ent->hasComponent(0x2F) || ent->hasComponent(0x3F) || ent->hasComponent(0x1D)) continue;
+		auto* c23 = ent->getById<Component_23_Statescript>(0x23);
+		if (!c23 || !is_valid_read_memory(c23, sizeof(Component_23_Statescript))) continue;
+
+		auto* slot = OriginClutterTracker::GetSlot(ent->entity_id, ent);
+		__int64 stu_id = slot ? slot->stu_id : 0;
+		__int64 res_id = (ent->resload_entry && is_valid_read_memory(ent->resload_entry, sizeof(void*)) && ent->resload_entry->valid())
+			? ent->resload_entry->align()->resource_id : 0;
+		auto* c1 = ent->getById<Component_1_SceneRendering>(1);
+		Vector4 pos = (c1 && is_valid_read_memory(c1, sizeof(Component_1_SceneRendering))) ? c1->position : Vector4{};
+		uint8_t init_bc = *(uint8_t*)((uintptr_t)c23 + 0xBC);
+
+		std::string scripts_str;
+		for (int i = 0; i < c23->ss_inner.g1_instanceArr.num; i++) {
+			auto* inst = c23->ss_inner.g1_instanceArr.ptr[i];
+			if (inst && is_valid_read_memory(inst, sizeof(StatescriptInstance))) {
+				if (!scripts_str.empty()) scripts_str += ", ";
+				scripts_str += std::format("0x{:X}(id={})", (unsigned long long)inst->script_id, inst->instance_id);
+			}
+		}
+
+		std::string comps_str;
+		for (int i = 0; i < ent->component_list.num - 1; i++) {
+			if (ent->component_list.ptr[i] && is_valid_read_memory(ent->component_list.ptr[i], sizeof(ComponentBase))) {
+				if (!comps_str.empty()) comps_str += ",";
+				comps_str += std::format("{:02X}", (int)ent->component_list.ptr[i]->component_id);
+			}
+		}
+
+		out << std::format("| `0x{:X}` | `0x{:X}` | `0x{:X}` | `({:.1f},{:.1f},{:.1f})` | `{}` | `{}` | `{}` | `[{}]` |\n",
+			ent->entity_id, (unsigned long long)stu_id, (unsigned long long)res_id,
+			pos.X, pos.Y, pos.Z, (int)init_bc, c23->ss_inner.g1_instanceArr.num,
+			scripts_str.empty() ? "none" : scripts_str, comps_str);
+	}
+
+	out.close();
+	s_last_door_dump_status = std::format("Dumped {} door entities to spawn_doors_diag.log ({})",
+		dumped_doors, trigger_reason ? trigger_reason : "Manual");
+	printf("[OriginClutterTracker] %s\n", s_last_door_dump_status.c_str());
+}
+
 void statescript_diag_window::dump_weapon_nodes_forensics_to_file() {
 	if (!_ss || !is_valid_read_memory(_ss, sizeof(Component_23_Statescript))) {
 		_experiment_status_msg = "Error: No Statescript component selected!";

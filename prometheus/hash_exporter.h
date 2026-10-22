@@ -1,6 +1,6 @@
 #pragma once
 #include "STU.h"
-#include "Statescript.h"ü
+#include "Statescript.h"Ã¼
 #include <fstream>
 #include <iostream>
 #include "stringhash_library.h"

@@ -38,6 +38,7 @@
 #pragma comment(lib, "Bcrypt.lib")
 #pragma comment(lib, "Crypt32.lib")
 #include "Statescript.h"
+#include "StatescriptVar.h"
 #include "game.h"
 #include "ResourceManager.h"
 #include "STU.h"
@@ -370,7 +371,7 @@ __int64 __fastcall createwindow_hook(__int64 gameManager) {
     std::thread([]() {
         while (true) {
             Sleep(100);
-            //teEngine �nstance
+            //teEngine Instance
             DWORD_PTR render = *(DWORD_PTR*)(globals::gameBase + 0x181e3e0);
             if (!render)
                 continue;
@@ -1173,6 +1174,236 @@ void __fastcall SetPosition_hook(Component_1_SceneRendering* comp1, Vector4* pos
     SetPosition_orig(comp1, pos);
 }
 
+bool OriginClutterTracker::IsSpawnDoorEntity(Entity* ent, uint32 local_ctrl_id, uint32 local_mdl_id) {
+    if (!ent) return false;
+    if (local_ctrl_id != 0 && ent->entity_id == local_ctrl_id) return false;
+    if (local_mdl_id != 0 && ent->entity_id == local_mdl_id) return false;
+    // Never touch player controllers, player models, PvP game state, weapons (0x1D), or spawn room aura/trigger volumes (0x13 / 0x2B)
+    if (ent->hasComponent(0x15) || ent->hasComponent(0x2F) || ent->hasComponent(0x3F) ||
+        ent->hasComponent(0x24) || ent->hasComponent(0x1D) || ent->hasComponent(0x13) || ent->hasComponent(0x2B)) {
+        return false;
+    }
+    // Map spawn door entities possess Component_1 (SceneRendering), Component_04 (Animation/Skeleton),
+    // Component_12 (MovementState), Component_1C (3D Model), Component_23 (Statescript),
+    // and the door mover/NavMesh components Component_29 (0x29) & Component_2A (0x2A).
+    if (!ent->hasComponent(0x01) || !ent->hasComponent(0x04) || !ent->hasComponent(0x12) ||
+        !ent->hasComponent(0x1C) || !ent->hasComponent(0x23) ||
+        !ent->hasComponent(0x29) || !ent->hasComponent(0x2A)) {
+        return false;
+    }
+
+    auto* c1 = ent->getById<Component_1_SceneRendering>(1);
+    if (!c1) return false;
+    uintptr_t parent_c1 = *(uintptr_t*)((uintptr_t)c1 + 0x1D0);
+    if (parent_c1 != 0) return false;
+
+    auto* slot = GetSlot(ent->entity_id, ent);
+    if (slot && slot->spawn_caller_rva == 0xD56BFB) return false;
+    return true;
+}
+
+static bool SetDoorVarInBag(StatescriptSyncMgr* ss_inner, StatescriptInstance* script, StatescriptVar_VarBag* vb, __int64 var_id, StatescriptPrimitive new_val) {
+    if (!vb || IsBadReadPtr(vb, sizeof(StatescriptVar_VarBag))) return false;
+    for (int i = 0; i < 16; i++) {
+        auto* item = &vb->sub_items[i];
+        if (!item || !item->arr_ptr || IsBadReadPtr(item->arr_ptr, sizeof(void*))) continue;
+        for (int j = 0; j < item->item_count; j++) {
+            StatescriptVar_Base* rid = item->arr_ptr[j].ptr;
+            if (!rid || IsBadReadPtr(rid, sizeof(StatescriptVar_Base))) continue;
+            if (rid->var_id == var_id && rid->is_cvd()) {
+                auto* prim = (StatescriptVar_Primitive*)rid;
+                StatescriptSyncMgr* mgr = (prim->base.parent_rid && prim->base.parent_rid->ss_compo_inner)
+                    ? prim->base.parent_rid->ss_compo_inner : ss_inner;
+                StatescriptInstance* inst = (prim->base.parent_rid && prim->base.parent_rid->ss_instance)
+                    ? prim->base.parent_rid->ss_instance : script;
+                prim->base.stu_base.vfptr->Primitive_SetValueFromRemote(
+                    &prim->base, mgr, inst, &new_val, &prim->base.user, 1);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool IsDoorScriptOpen(Entity* ent) {
+    if (!ent) return false;
+    auto* c23 = ent->getById<Component_23_Statescript>(0x23);
+    if (!c23 || IsBadReadPtr(c23, sizeof(Component_23_Statescript))) return false;
+    for (int s = 0; s < c23->ss_inner.g1_instanceArr.num; s++) {
+        StatescriptInstance* script = c23->ss_inner.g1_instanceArr.ptr[s];
+        if (!script || IsBadReadPtr(script, sizeof(StatescriptInstance))) continue;
+        StatescriptVar_VarBag* vb = script->rid_instance_varbag;
+        if (!vb || IsBadReadPtr(vb, sizeof(StatescriptVar_VarBag))) continue;
+        for (int i = 0; i < 16; i++) {
+            auto* item = &vb->sub_items[i];
+            if (!item || !item->arr_ptr || IsBadReadPtr(item->arr_ptr, sizeof(void*))) continue;
+            for (int j = 0; j < item->item_count; j++) {
+                StatescriptVar_Base* rid = item->arr_ptr[j].ptr;
+                if (!rid || IsBadReadPtr(rid, sizeof(StatescriptVar_Base))) continue;
+                if (rid->var_id == 0xd80000000000192LL && rid->is_cvd()) {
+                    auto* prim = (StatescriptVar_Primitive*)rid;
+                    if (prim->global_var.get_convert_float(0.0f) > 0.01f) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
+
+int OriginClutterTracker::OpenSpawnDoors(EntityAdminBase* game_ea) {
+    if (!game_ea) return 0;
+    int opened = 0;
+    uint32 local_ctrl_id = game_ea->local_entid;
+    uint32 local_mdl_id = 0;
+    if (Entity* lc = game_ea->getLocalEnt()) {
+        if (auto* pet = lc->getById<Component_20_ModelReference>(0x20)) {
+            local_mdl_id = pet->cam_attach_entid ? pet->cam_attach_entid : pet->aim_entid;
+        }
+    }
+    for (Entity* ent : *game_ea) {
+        if (!IsSpawnDoorEntity(ent, local_ctrl_id, local_mdl_id)) continue;
+        auto* c1 = ent->getById<Component_1_SceneRendering>(1);
+        auto* slot = GetSlot(ent->entity_id, ent);
+        if (slot && slot->culled_by_heracles) {
+            slot->culled_by_heracles = false;
+            if (s_total_culled_props > 0) s_total_culled_props--;
+            if (c1) {
+                Vector4 target_pos = slot->has_nonzero_pos ? slot->latest_nonzero_pos : slot->pre_cull_pos;
+                Vector4 target_rot = slot->has_nonzero_pos ? slot->latest_nonzero_rot : slot->pre_cull_rot;
+                if (target_rot.X == 0.0f && target_rot.Y == 0.0f && target_rot.Z == 0.0f && target_rot.W == 0.0f) {
+                    target_rot.W = 1.0f;
+                }
+                c1->SetScale(Vector4(1.0f, 1.0f, 1.0f, 1.0f));
+                c1->SetPosRotation(target_pos, target_rot);
+                c1->SetVisible();
+            }
+        } else if (c1 && !c1->IsVisible()) {
+            c1->SetVisible();
+        }
+
+        auto* c23 = ent->getById<Component_23_Statescript>(0x23);
+        if (!c23 || IsBadReadPtr(c23, sizeof(Component_23_Statescript))) continue;
+
+        for (int s = 0; s < c23->ss_inner.g1_instanceArr.num; s++) {
+            StatescriptInstance* script = c23->ss_inner.g1_instanceArr.ptr[s];
+            if (!script || IsBadReadPtr(script, sizeof(StatescriptInstance))) continue;
+
+            // 1. Set 0xd800000000002bb = 0 (no wait delay in Node 25 StateWait)
+            StatescriptPrimitive zero_int{ 0, 0, StatescriptPrimitive_INT };
+            SetDoorVarInBag(&c23->ss_inner, script, script->rid_instance_varbag, 0xd800000000002bbLL, zero_int);
+
+            // 2. Set 0xd80000000000192 = 1.0f (triggers Node 6 BooleanSwitch -> True branch -> Node 25 -> Node 2 Open Door)
+            float one_f = 1.0f;
+            StatescriptPrimitive open_flt{ 0, 0, StatescriptPrimitive_FLT };
+            *(float*)&open_flt.value = one_f;
+            SetDoorVarInBag(&c23->ss_inner, script, script->rid_instance_varbag, 0xd80000000000192LL, open_flt);
+
+            // 3. Ensure Node 2 (Open Door State) is started if BooleanSwitch deferred transition
+            if (script->script_id == 0x0580000000000042LL && script->graph && script->graph->m_nodes.count() > 3) {
+                auto st2 = statescript_logger::GetScriptNodeState(script, 2);
+                if (st2.is_finish_state) {
+                    script->StartStopState(3, false);
+                    script->StartStopState(2, true);
+                }
+            }
+            c23->ss_inner.needs_process_e = 1;
+            c23->ss_inner.needs_e_process_0 = 0;
+        }
+        opened++;
+    }
+    return opened;
+}
+
+int OriginClutterTracker::RestoreSpawnDoors(EntityAdminBase* game_ea) {
+    if (!game_ea) return 0;
+    s_auto_open_spawn_doors = false;
+    int restored = 0;
+    uint32 local_ctrl_id = game_ea->local_entid;
+    uint32 local_mdl_id = 0;
+    if (Entity* lc = game_ea->getLocalEnt()) {
+        if (auto* pet = lc->getById<Component_20_ModelReference>(0x20)) {
+            local_mdl_id = pet->cam_attach_entid ? pet->cam_attach_entid : pet->aim_entid;
+        }
+    }
+    for (Entity* ent : *game_ea) {
+        if (!IsSpawnDoorEntity(ent, local_ctrl_id, local_mdl_id)) continue;
+        auto* c1 = ent->getById<Component_1_SceneRendering>(1);
+        auto* slot = GetSlot(ent->entity_id, ent);
+        if (slot && slot->culled_by_heracles) {
+            slot->culled_by_heracles = false;
+            if (s_total_culled_props > 0) s_total_culled_props--;
+            if (c1) {
+                Vector4 target_pos = slot->has_nonzero_pos ? slot->latest_nonzero_pos : slot->pre_cull_pos;
+                Vector4 target_rot = slot->has_nonzero_pos ? slot->latest_nonzero_rot : slot->pre_cull_rot;
+                if (target_rot.X == 0.0f && target_rot.Y == 0.0f && target_rot.Z == 0.0f && target_rot.W == 0.0f) {
+                    target_rot.W = 1.0f;
+                }
+                c1->SetScale(Vector4(1.0f, 1.0f, 1.0f, 1.0f));
+                c1->SetPosRotation(target_pos, target_rot);
+                c1->SetVisible();
+            }
+        } else if (c1 && !c1->IsVisible()) {
+            c1->SetVisible();
+        }
+
+        auto* c23 = ent->getById<Component_23_Statescript>(0x23);
+        if (!c23 || IsBadReadPtr(c23, sizeof(Component_23_Statescript))) continue;
+
+        for (int s = 0; s < c23->ss_inner.g1_instanceArr.num; s++) {
+            StatescriptInstance* script = c23->ss_inner.g1_instanceArr.ptr[s];
+            if (!script || IsBadReadPtr(script, sizeof(StatescriptInstance))) continue;
+
+            // 1. Set 0xd800000000002bb = 0 (no wait delay in Node 26 StateWait)
+            StatescriptPrimitive zero_int{ 0, 0, StatescriptPrimitive_INT };
+            SetDoorVarInBag(&c23->ss_inner, script, script->rid_instance_varbag, 0xd800000000002bbLL, zero_int);
+
+            // 2. Set 0xd80000000000838 = 1 (as Node 21 does before Node 22 so Node 3 plays closing anim)
+            StatescriptPrimitive one_int{ 1, 0, StatescriptPrimitive_INT };
+            SetDoorVarInBag(&c23->ss_inner, script, script->rid_instance_varbag, 0xd80000000000838LL, one_int);
+
+            // 3. Set 0xd80000000000192 = 0.0f (as Node 22 does -> triggers Node 6 BooleanSwitch -> False branch -> Node 26 -> Node 3 Closed Door)
+            StatescriptPrimitive close_flt{ 0, 0, StatescriptPrimitive_FLT };
+            SetDoorVarInBag(&c23->ss_inner, script, script->rid_instance_varbag, 0xd80000000000192LL, close_flt);
+
+            // 4. Ensure Node 3 (Closed Door State) is started if BooleanSwitch deferred transition
+            if (script->script_id == 0x0580000000000042LL && script->graph && script->graph->m_nodes.count() > 3) {
+                auto st3 = statescript_logger::GetScriptNodeState(script, 3);
+                if (st3.is_finish_state) {
+                    script->StartStopState(2, false);
+                    script->StartStopState(3, true);
+                }
+            }
+            c23->ss_inner.needs_process_e = 1;
+            c23->ss_inner.needs_e_process_0 = 0;
+        }
+        restored++;
+    }
+    return restored;
+}
+
+void OriginClutterTracker::GetSpawnDoorCounts(EntityAdminBase* game_ea, int& out_total, int& out_open) {
+    out_total = 0;
+    out_open = 0;
+    if (!game_ea) return;
+    uint32 local_ctrl_id = game_ea->local_entid;
+    uint32 local_mdl_id = 0;
+    if (Entity* lc = game_ea->getLocalEnt()) {
+        if (auto* pet = lc->getById<Component_20_ModelReference>(0x20)) {
+            local_mdl_id = pet->cam_attach_entid ? pet->cam_attach_entid : pet->aim_entid;
+        }
+    }
+    for (Entity* ent : *game_ea) {
+        if (!IsSpawnDoorEntity(ent, local_ctrl_id, local_mdl_id)) continue;
+        out_total++;
+        auto* slot = GetSlot(ent->entity_id, ent);
+        if ((slot && slot->culled_by_heracles) || IsDoorScriptOpen(ent)) {
+            out_open++;
+        }
+    }
+}
+
 int OriginClutterTracker::CullUnplacedOriginProps(EntityAdminBase* game_ea) {
     if (!game_ea) return 0;
     int culled = 0;
@@ -1186,8 +1417,8 @@ int OriginClutterTracker::CullUnplacedOriginProps(EntityAdminBase* game_ea) {
     for (Entity* ent : *game_ea) {
         if (!ent) continue;
         if (ent->entity_id == local_ctrl_id || ent->entity_id == local_mdl_id) continue;
-        // Never touch player controllers, player models, PvP game state, or weapons (Component_1D = Tracer's Pulse Pistols!)
-        if (ent->hasComponent(0x15) || ent->hasComponent(0x2F) || ent->hasComponent(0x3F) || ent->hasComponent(0x24) || ent->hasComponent(0x1D)) continue;
+        // Never touch player controllers, player models, PvP game state, weapons (0x1D = Tracer's Pulse Pistols!), or spawn room auras (0x13 / 0x2B)
+        if (ent->hasComponent(0x15) || ent->hasComponent(0x2F) || ent->hasComponent(0x3F) || ent->hasComponent(0x24) || ent->hasComponent(0x1D) || ent->hasComponent(0x13) || ent->hasComponent(0x2B)) continue;
         // Must have a 3D model component (0x1C) to be visual/physical map clutter
         if (!ent->hasComponent(0x1C)) continue;
 
@@ -1431,6 +1662,13 @@ void OriginClutterTracker::OnTick(EntityAdminBase* game_ea, int world_state) {
     }
 
     if (world_state == 8) {
+        if (s_auto_open_spawn_doors) {
+            int total_doors = 0, open_doors = 0;
+            GetSpawnDoorCounts(game_ea, total_doors, open_doors);
+            if (total_doors > open_doors) {
+                OpenSpawnDoors(game_ea);
+            }
+        }
         if (s_ticks_since_world_ready >= 0) {
             s_ticks_since_world_ready++;
             if (s_ticks_since_world_ready == 90 && !s_dumped_report_for_current_map) {

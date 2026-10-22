@@ -474,15 +474,15 @@ struct Component_1_SceneRendering {
         func(this, flag);
     }
 
-    //From 0xd5b460
+    //From 0xd5b460 (0x200000008000 are invisibility bits in rendering_flags)
     void SetInvisible() {
-        RemoveFlag(0x200000000000LL);
-        RemoveFlag(0x8000);
+        AddFlag(0x200000000000LL);
+        AddFlag(0x8000);
     }
 
     void SetVisible() {
-        AddFlag(0x200000000000LL);
-        AddFlag(0x8000);
+        RemoveFlag(0x200000000000LL);
+        RemoveFlag(0x8000);
     }
 
     bool IsVisible() {
@@ -1096,6 +1096,7 @@ struct OriginClutterTracker {
     static inline OriginEntitySlot s_slots[MAX_SLOTS]{};
     static inline bool s_block_zero_overwrites = true;
     static inline bool s_auto_cull_unplaced_origin_props = false;
+    static inline bool s_auto_open_spawn_doors = false;
     static inline int s_total_zero_overwrites_blocked = 0;
     static inline int s_total_culled_props = 0;
     static inline int s_ticks_since_world_ready = -1;
@@ -1125,9 +1126,15 @@ struct OriginClutterTracker {
     }
 
     static void OnTick(EntityAdminBase* game_ea, int world_state);
+    static bool IsSpawnDoorEntity(Entity* ent, uint32 local_ctrl_id = 0, uint32 local_mdl_id = 0);
+    static int OpenSpawnDoors(EntityAdminBase* game_ea);
+    static int RestoreSpawnDoors(EntityAdminBase* game_ea);
+    static void GetSpawnDoorCounts(EntityAdminBase* game_ea, int& out_total, int& out_open);
     static int CullUnplacedOriginProps(EntityAdminBase* game_ea);
     static int RestoreCulledProps(EntityAdminBase* game_ea);
     static void DumpReportToFile(EntityAdminBase* game_ea, const char* trigger_reason);
+    static void DumpSpawnDoorsToFile(EntityAdminBase* game_ea, const char* trigger_reason);
+    static inline std::string s_last_door_dump_status = "Not dumped yet.";
 };
 
 struct WeaponHardpointDiag {

@@ -278,6 +278,26 @@ class player_spawner_deluxe : public window {
 				template_teamplayer();
 			}
 
+			int total_spawn_doors = 0, open_spawn_doors = 0;
+			OriginClutterTracker::GetSpawnDoorCounts(GameEntityAdmin(), total_spawn_doors, open_spawn_doors);
+			if (ImGui::Button("Open Spawn Doors")) {
+				OriginClutterTracker::OpenSpawnDoors(GameEntityAdmin());
+				OriginClutterTracker::GetSpawnDoorCounts(GameEntityAdmin(), total_spawn_doors, open_spawn_doors);
+			}
+			ImGui::SameLine();
+			if (ImGui::Button("Close / Restore Spawn Doors")) {
+				OriginClutterTracker::RestoreSpawnDoors(GameEntityAdmin());
+				OriginClutterTracker::GetSpawnDoorCounts(GameEntityAdmin(), total_spawn_doors, open_spawn_doors);
+			}
+			ImGui::SameLine();
+			ImGui::Checkbox("Auto-Open Doors", &OriginClutterTracker::s_auto_open_spawn_doors);
+			ImGui::SameLine();
+			ImGui::TextColored(
+				(total_spawn_doors > 0 && open_spawn_doors == total_spawn_doors)
+					? ImVec4(0.2f, 1.0f, 0.2f, 1.0f)
+					: ImVec4(1.0f, 0.8f, 0.2f, 1.0f),
+				"Doors: %d/%d Open", open_spawn_doors, total_spawn_doors);
+
 			ImGui::NewLine();
 			if (ImGui::RadioButton("0x400000000000013 (PvPGame 1)", _spawn_entid == 0x400000000000013)) {
 				_spawn_entid = 0x400000000000013;
@@ -433,6 +453,14 @@ class origin_clutter_diag_window : public window {
 				OriginClutterTracker::s_total_culled_props,
 				OriginClutterTracker::s_ticks_since_world_ready);
 
+			if (ImGui::Button("Open Spawn Doors")) {
+				OriginClutterTracker::OpenSpawnDoors(GameEntityAdmin());
+			}
+			ImGui::SameLine();
+			if (ImGui::Button("Close / Restore Spawn Doors")) {
+				OriginClutterTracker::RestoreSpawnDoors(GameEntityAdmin());
+			}
+			ImGui::SameLine();
 			if (ImGui::Button("Cull Unplaced (0,0,0) Dynamic Props Now")) {
 				OriginClutterTracker::CullUnplacedOriginProps(GameEntityAdmin());
 			}
@@ -443,6 +471,10 @@ class origin_clutter_diag_window : public window {
 			ImGui::SameLine();
 			if (ImGui::Button("Dump Origin Report (origin_clutter_diag.log)")) {
 				OriginClutterTracker::DumpReportToFile(GameEntityAdmin(), "Manual UI Button");
+			}
+			ImGui::SameLine();
+			if (ImGui::Button("Dump Door Info (spawn_doors_diag.log)")) {
+				OriginClutterTracker::DumpSpawnDoorsToFile(GameEntityAdmin(), "Manual Origin Inspector Button");
 			}
 
 			if (ImGui::BeginChild("OriginClutterList", ImVec2(0, 0), true)) {

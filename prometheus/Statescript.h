@@ -66,7 +66,7 @@ struct StatescriptRTTI
 	__int32 field_20;                     ///< zero
 	__int32 field_24;
 	__int64 field_28;                     ///< 0x1854d20 bei stustatescriptstatewait
-	///< int ref für statistics?
+	///< int ref fÃ¼r statistics?
 };
 
 struct StatescriptInstanceListWithId {
@@ -526,7 +526,7 @@ struct STUStatescriptGraph {
 	STUBase<STUBase_vt> base;
 	STUGraph m_graph;
 	STUBullshitListFull<STUStatescriptBase*> m_nodes;
-	STUBullshitListFull<STUStatescriptState*> m_states; // flag für m_states 0xf49a06
+	STUBullshitListFull<STUStatescriptState*> m_states; // flag fÃ¼r m_states 0xf49a06
 	STUBullshitListFull<STUStatescriptBase*> m_entries;
 	__int64 m_consoleCommand;
 	__int64 field_88;
