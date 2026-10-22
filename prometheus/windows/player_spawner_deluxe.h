@@ -7,6 +7,9 @@
 #include "../stu_resources.h"
 #include "../player_spawner.h"
 #include "../MovementState.h"
+#include "../Statescript.h"
+#include "../StatescriptVar.h"
+#include <cmath>
 
 //2f und 33 sind bei controller
 //-> ist prob local player
@@ -123,6 +126,122 @@ class player_spawner_deluxe : public window {
 		_spawner.model_info.weapon_attach = true;
 		_spawner.model_info.fixup_player_statescript = true;
 		_spawner.model_info.team = 1;
+	}
+
+	static bool compute_local_player_spawn_transform(float forward_dist, Vector4& out_pos, Vector4& out_rot, bool face_towards_player) {
+		auto* ea = GameEntityAdmin();
+		if (!ea) return false;
+		Entity* local = ea->getLocalEnt();
+		if (!local) return false;
+		auto* pet = local->getById<Component_20_ModelReference>(0x20);
+		if (!pet) return false;
+		uint32 mdl_id = pet->cam_attach_entid ? pet->cam_attach_entid : (pet->aim_entid ? pet->aim_entid : pet->movement_attach_entid);
+		Entity* model = ea->getEntById(mdl_id);
+		if (!model) return false;
+
+		Vector4 base_pos{};
+		Vector4 base_rot(0.0f, 0.0f, 0.0f, 1.0f);
+		bool found_pos = false;
+
+		if (auto* c1 = model->getById<Component_1_SceneRendering>(1)) {
+			base_pos = c1->position;
+			base_rot = c1->rotation;
+			found_pos = true;
+		}
+		if (auto* c15 = model->getById<Component_15_STUCharacterMoverComponent>(0x15)) {
+			float abs15 = fabsf(c15->movement_state_2.absolute_position.X) +
+			              fabsf(c15->movement_state_2.absolute_position.Y) +
+			              fabsf(c15->movement_state_2.absolute_position.Z);
+			if (abs15 > 0.5f) {
+				base_pos = c15->movement_state_2.absolute_position;
+				base_rot = c15->movement_state_2.rotation_quaternion;
+				found_pos = true;
+			}
+		}
+		if (!found_pos) return false;
+
+		if (base_rot.X == 0.0f && base_rot.Y == 0.0f && base_rot.Z == 0.0f && base_rot.W == 0.0f) {
+			base_rot.W = 1.0f;
+		}
+
+		// Compute horizontal forward vector on XZ plane from quaternion q = (x, y, z, w) rotating +Z (0, 0, 1)
+		float qx = base_rot.X, qy = base_rot.Y, qz = base_rot.Z, qw = base_rot.W;
+		float fx = 2.0f * (qx * qz + qw * qy);
+		float fz = 1.0f - 2.0f * (qx * qx + qy * qy);
+		float flen = sqrtf(fx * fx + fz * fz);
+		if (flen > 0.001f) {
+			fx /= flen;
+			fz /= flen;
+		} else {
+			fx = 0.0f;
+			fz = 1.0f;
+		}
+
+		out_pos = base_pos;
+		out_pos.X += fx * forward_dist;
+		out_pos.Z += fz * forward_dist;
+
+		if (face_towards_player) {
+			// Rotate 180 degrees around Y axis: q_180_y * q = (0, 1, 0, 0) * (qx, qy, qz, qw) = (-qz, qw, qx, -qy)
+			out_rot = Vector4(-qz, qw, qx, -qy);
+		} else {
+			out_rot = base_rot;
+		}
+		return true;
+	}
+
+	static void apply_dummy_transform(Entity* model_ent, const Vector4& pos, const Vector4& rot) {
+		if (!model_ent) return;
+		Vector4 valid_rot = rot;
+		if (valid_rot.X == 0.0f && valid_rot.Y == 0.0f && valid_rot.Z == 0.0f && valid_rot.W == 0.0f) {
+			valid_rot.W = 1.0f;
+		}
+		if (auto* slot = OriginClutterTracker::GetSlot(model_ent->entity_id, model_ent)) {
+			slot->culled_by_heracles = false;
+			slot->has_nonzero_pos = true;
+			slot->latest_nonzero_pos = pos;
+			slot->latest_nonzero_rot = valid_rot;
+		}
+		if (auto* c1 = model_ent->getById<Component_1_SceneRendering>(1)) {
+			c1->SetScale(Vector4(1.0f, 1.0f, 1.0f, 1.0f));
+			c1->SetPosRotation(pos, valid_rot);
+			c1->SetVisible();
+		}
+		if (auto* c15 = model_ent->getById<Component_15_STUCharacterMoverComponent>(0x15)) {
+			c15->movement_state_1.absolute_position = pos;
+			c15->movement_state_1.rotation_quaternion = valid_rot;
+			c15->movement_state_2.absolute_position = pos;
+			c15->movement_state_2.rotation_quaternion = valid_rot;
+		}
+		if (auto* c12 = model_ent->getById<Component_12_STUMovementStateComponent>(0x12)) {
+			auto* ea = GameEntityAdmin();
+			c12->mov_state.absolute_position = pos;
+			c12->mov_state.rotation_quaternion = valid_rot;
+			if (c12->mov_state.command_frame <= 0) {
+				c12->mov_state.command_frame = (ea && ea->GameEA_timing) ? ea->GameEA_timing->tick_count : 1;
+			}
+			auto CreateRotMatrix = (void(__fastcall*)(MovementState*, Matrix4x4*))(globals::gameBase + 0x102a610);
+			CreateRotMatrix(&c12->mov_state, &c12->mov_state.rotation_matrix);
+			c12->PasteMovementState(&c12->mov_state);
+		}
+	}
+
+	static void sync_entity_health_varbag(Entity* model_ent) {
+		if (!model_ent) return;
+		auto* ss = model_ent->getById<Component_23_Statescript>(0x23);
+		auto* health_stru = model_ent->getById<Component_28_STUHealthComponent>(0x28);
+		if (ss && health_stru && ss->ss_inner.rid_entity_varbag) {
+			StatescriptPrimitive health_cv{};
+			health_cv.type = StatescriptPrimitive_FLT;
+
+			*(float*)&health_cv.value = health_stru->CalcTotalCurrentHealth();
+			ss->ss_inner.rid_entity_varbag->SetVar({ 0x0D800000000006C4 }, health_cv);
+			ss->ss_inner.rid_entity_varbag->SetVar({ StatescriptVar_ENTITY_VARBAG, 0x0D800000000006C4 }, health_cv);
+
+			*(float*)&health_cv.value = health_stru->CalcTotalMaxHealth();
+			ss->ss_inner.rid_entity_varbag->SetVar({ 0x0D800000000006C9 }, health_cv);
+			ss->ss_inner.rid_entity_varbag->SetVar({ StatescriptVar_ENTITY_VARBAG, 0x0D800000000006C9 }, health_cv);
+		}
 	}
 
 	inline void render() override {
@@ -278,6 +397,175 @@ class player_spawner_deluxe : public window {
 				template_teamplayer();
 			}
 
+			ImGui::Separator();
+			ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f), "One-Click Enemy Target Dummy Spawner (Team 1):");
+			ImGui::SetNextItemWidth(140.0f);
+			ImGui::SliderFloat("Forward Dist (m)", &_dummy_forward_dist, 0.0f, 12.0f, "%.1f m");
+			ImGui::SameLine();
+			ImGui::Checkbox("Face Player", &_dummy_face_player);
+			ImGui::SameLine();
+			if (ImGui::Button("Spawn Jeff Kaplan")) {
+				Vector4 spawn_pos{}, spawn_rot{};
+				if (compute_local_player_spawn_transform(_dummy_forward_dist, spawn_pos, spawn_rot, _dummy_face_player)) {
+					template_teamplayer();
+					_spawner.model_info.set_position = true;
+					_spawner.model_info.spawn_position = spawn_pos;
+					_spawner.model_info.spawn_rotation = spawn_rot;
+					_spawner.spawn();
+				}
+			}
+			ImGui::SameLine();
+			if (ImGui::Button("Spawn Jeff Kaplan At Exact Player Pos")) {
+				Vector4 spawn_pos{}, spawn_rot{};
+				if (compute_local_player_spawn_transform(0.0f, spawn_pos, spawn_rot, _dummy_face_player)) {
+					template_teamplayer();
+					_spawner.model_info.set_position = true;
+					_spawner.model_info.spawn_position = spawn_pos;
+					_spawner.model_info.spawn_rotation = spawn_rot;
+					_spawner.spawn();
+				}
+			}
+			ImGui::SameLine();
+			if (ImGui::Button("Dump Dummy & Shot Forensics (dummy_combat_diag.log)")) {
+				WeaponHardpointDiag::DumpDummyCombatForensics(GameEntityAdmin(), "Manual Spawner Button");
+			}
+			if (WeaponHardpointDiag::s_shot_raycast_calls > 0 || WeaponHardpointDiag::s_last_dummy_dump_status != "Not dumped yet.") {
+				ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "Shot Raycasts(+0xD354B0): %d | %s",
+					WeaponHardpointDiag::s_shot_raycast_calls, WeaponHardpointDiag::s_last_dummy_dump_status.c_str());
+			}
+			ImGui::Checkbox("Offline Dummy Damage (local hitscan authority)", &WeaponHardpointDiag::s_dummy_damage_enabled);
+			ImGui::SameLine();
+			ImGui::SetNextItemWidth(120.0f);
+			ImGui::SliderFloat("Dmg/pellet", &WeaponHardpointDiag::s_dummy_damage_per_pellet, 1.0f, 200.0f, "%.0f");
+			ImGui::SameLine();
+			ImGui::SetNextItemWidth(90.0f);
+			ImGui::SliderFloat("Crit x", &WeaponHardpointDiag::s_dummy_crit_mult, 1.0f, 3.0f, "%.1f");
+			ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "%s", WeaponHardpointDiag::s_last_dummy_hit.c_str());
+
+			// Compact Live Enemy Dummies / Non-Local Hero Models Status List
+			if (EntityAdminBase* ea = GameEntityAdmin()) {
+				Entity* local_ctrl = ea->getLocalEnt();
+				uint32 local_ctrl_id = ea->local_entid;
+				uint32 local_mdl_id = 0;
+				if (local_ctrl) {
+					if (auto* pet = local_ctrl->getById<Component_20_ModelReference>(0x20)) {
+						local_mdl_id = pet->cam_attach_entid ? pet->cam_attach_entid : (pet->aim_entid ? pet->aim_entid : pet->movement_attach_entid);
+					}
+				}
+
+				int dummy_count = 0;
+				for (Entity* ent : *ea) {
+					if (!ent || ent->entity_id == local_ctrl_id || ent->entity_id == local_mdl_id) continue;
+					if (ent->hasComponent(0x15) && ent->hasComponent(0x28)) {
+						dummy_count++;
+					}
+				}
+
+				if (dummy_count > 0) {
+					ImGui::TextColored(ImVec4(0.3f, 0.9f, 1.0f, 1.0f), "Active Non-Local Hero Dummies (%d):", dummy_count);
+					if (ImGui::BeginChild("EnemyDummiesList", ImVec2(0, 125), true)) {
+						uint32 del_ctrl_id = 0;
+						uint32 del_mdl_id = 0;
+						for (Entity* ent : *ea) {
+							if (!ent || ent->entity_id == local_ctrl_id || ent->entity_id == local_mdl_id) continue;
+							if (!ent->hasComponent(0x15) || !ent->hasComponent(0x28)) continue;
+
+							uint32 ctrl_id = 0;
+							if (auto* c1f = ent->getById<Component_1F_Backref>(0x1F)) {
+								ctrl_id = c1f->backref_entid;
+							}
+							Entity* ctrl_ent = ctrl_id ? ea->getEntById(ctrl_id) : nullptr;
+							auto* c1 = ent->getById<Component_1_SceneRendering>(1);
+							auto* c10 = ent->getById<Component_10_FilterBits>(0x10);
+							auto* c28 = ent->getById<Component_28_STUHealthComponent>(0x28);
+							auto* slot = OriginClutterTracker::GetSlot(ent->entity_id, ent);
+
+							float cur_hp = c28 ? c28->CalcTotalCurrentHealth() : 0.0f;
+							float max_hp = c28 ? c28->CalcTotalMaxHealth() : 0.0f;
+							sync_entity_health_varbag(ent);
+
+							__int64 fb = c10 ? c10->filter_bits : 0;
+							const char* team_str = (fb & 0x80000) ? "Team 1 (Enemy)" : ((fb & 0x40000) ? "Team 0 (Ally)" : "NoTeam");
+							Vector4 pos = c1 ? c1->position : Vector4{};
+							bool is_vis = c1 ? c1->IsVisible() : false;
+							int zero_blk = slot ? slot->zero_overwrite_blocked_count : 0;
+
+							ImGui::PushID((int)ent->entity_id);
+							if (ImGui::SmallButton("TP In Front")) {
+								Vector4 tp_pos{}, tp_rot{};
+								if (compute_local_player_spawn_transform(_dummy_forward_dist, tp_pos, tp_rot, _dummy_face_player)) {
+									apply_dummy_transform(ent, tp_pos, tp_rot);
+								}
+							}
+							ImGui::SameLine();
+							if (ImGui::SmallButton("-50 HP") && c28) {
+								for (int i = 0; i < 0x10; i++) {
+									if (c28->normal_health[i].part_enabled && c28->normal_health[i].curr_health > 0.0f) {
+										c28->normal_health[i].curr_health = (c28->normal_health[i].curr_health > 50.0f)
+											? (c28->normal_health[i].curr_health - 50.0f) : 0.0f;
+										break;
+									}
+								}
+								sync_entity_health_varbag(ent);
+							}
+							ImGui::SameLine();
+							if (ImGui::SmallButton("Reset HP") && c28) {
+								if (c28->CalcTotalMaxHealth() <= 0.0f) {
+									c28->normal_health[0].part_enabled = 1;
+									c28->normal_health[0].max_health = 200.0f;
+									c28->normal_health[0].curr_health = 200.0f;
+									c28->normal_health[0].field_10 = 1;
+									c28->normal_health[0].some_other_flag = 1;
+								} else {
+									for (int i = 0; i < 0x10; i++) {
+										if (c28->normal_health[i].part_enabled) c28->normal_health[i].curr_health = c28->normal_health[i].max_health;
+										if (c28->armour_health[i].part_enabled) c28->armour_health[i].curr_health = c28->armour_health[i].max_health;
+										if (c28->shield_health[i].part_enabled) c28->shield_health[i].curr_health = c28->shield_health[i].max_health;
+									}
+								}
+								sync_entity_health_varbag(ent);
+							}
+							ImGui::SameLine();
+							if (ImGui::SmallButton("Team 1")) {
+								if (c10) {
+									c10->pre_filter_bits |= 0x800000;
+									c10->set_team(1);
+									c10->FilterBitsMakeFinal();
+								}
+								if (ctrl_ent) {
+									if (auto* cc10 = ctrl_ent->getById<Component_10_FilterBits>(0x10)) {
+										cc10->set_team(1);
+										cc10->FilterBitsMakeFinal();
+									}
+								}
+							}
+							ImGui::SameLine();
+							if (ImGui::SmallButton("Inspect")) {
+								entity_window::get_latest_or_create(this)->nav_to_ent(ent);
+							}
+							ImGui::SameLine();
+							if (ImGui::SmallButton("Del")) {
+								del_ctrl_id = ctrl_id;
+								del_mdl_id = ent->entity_id;
+							}
+							ImGui::SameLine();
+							ImGui::Text("M:0x%x C:0x%x | HP:%.0f/%.0f | %s (0x%llx) | Pos(%.1f,%.1f,%.1f) Vis:%s Blk:%d",
+								ent->entity_id, ctrl_id, cur_hp, max_hp, team_str, (unsigned long long)fb,
+								pos.X, pos.Y, pos.Z, is_vis ? "Y" : "N", zero_blk);
+							ImGui::PopID();
+						}
+						if (del_mdl_id != 0) {
+							if (Entity* m = ea->getEntById(del_mdl_id)) ea->delEnt(m);
+							if (del_ctrl_id != 0 && del_ctrl_id != local_ctrl_id) {
+								if (Entity* c = ea->getEntById(del_ctrl_id)) ea->delEnt(c);
+							}
+						}
+					}
+					ImGui::EndChild();
+				}
+			}
+			ImGui::Separator();
+
 			int total_spawn_doors = 0, open_spawn_doors = 0;
 			OriginClutterTracker::GetSpawnDoorCounts(GameEntityAdmin(), total_spawn_doors, open_spawn_doors);
 			if (ImGui::Button("Open Spawn Doors")) {
@@ -399,6 +687,8 @@ private:
 	bool _spawn_lobby = false;
 	bool _spawn_setloc = false;
 	uint _pvpgame_entid = 0;
+	float _dummy_forward_dist = 3.5f;
+	bool _dummy_face_player = true;
 };
 
 WINDOW_REGISTER(player_spawner_deluxe);
@@ -489,6 +779,8 @@ class origin_clutter_diag_window : public window {
 					}
 					for (Entity* ent : *ea) {
 						if (!ent || ent == local_ctrl || ent->entity_id == local_mdl_id)
+							continue;
+						if (ent->hasComponent(0x15) || ent->hasComponent(0x2F) || ent->hasComponent(0x3F) || ent->hasComponent(0x1D))
 							continue;
 						auto* c1 = ent->getById<Component_1_SceneRendering>(1);
 						if (!c1)

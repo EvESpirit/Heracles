@@ -1144,11 +1144,22 @@ struct WeaponHardpointDiag {
     static inline int s_attach_calls = 0;
     static inline int s_resolve_weapon_calls = 0;
     static inline int s_update_weapon_calls = 0;
+    static inline int s_shot_raycast_calls = 0;
     static inline std::string s_last_dump_status = "Not dumped yet.";
+    static inline std::string s_last_dummy_dump_status = "Not dumped yet.";
+    // Offline damage authority for spawned enemy dummies (no server exists to apply hitscan damage).
+    static inline bool s_dummy_damage_enabled = true;
+    static inline float s_dummy_damage_per_pellet = 6.0f;
+    static inline float s_dummy_crit_mult = 2.0f;
+    static inline int s_dummy_hits = 0;
+    static inline std::string s_last_dummy_hit = "No dummy hits yet.";
 
     static void ClearTrace();
     static void ForceUpdateWeapons(EntityAdminBase* game_ea, uint8_t is_1p);
     static void DumpReportToFile(EntityAdminBase* game_ea, const char* trigger_reason);
+    static void DumpDummyCombatForensics(EntityAdminBase* game_ea, const char* trigger_reason);
+    static void TrackProjectile(Entity* proj);
+    static void TickProjectileTracker(EntityAdminBase* game_ea);
 };
 
 struct OriginClutterDummyEnd {

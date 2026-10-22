@@ -23,11 +23,41 @@ void player_spawner::modify_ent(spawn_info info, Entity* ent) {
 	Component_1_SceneRendering* scene_comp = ent->getById<Component_1_SceneRendering>(1);
 	if (scene_comp) {
 		if (info.set_position) {
+			if (auto* slot = OriginClutterTracker::GetSlot(ent->entity_id, ent)) {
+				float abs_sum = fabsf(info.spawn_position.X) + fabsf(info.spawn_position.Y) + fabsf(info.spawn_position.Z);
+				if (abs_sum > 0.5f && info.spawn_position.Y > -4000.0f) {
+					slot->has_nonzero_pos = true;
+					slot->latest_nonzero_pos = info.spawn_position;
+					slot->latest_nonzero_rot = valid_rot;
+				}
+			}
 			scene_comp->SetPosRotation(info.spawn_position, valid_rot);
 		}
 		if (!info.set_filterbits_controller && ent == model_ent) {
 			scene_comp->SetScale(Vector4(1.0f, 1.0f, 1.0f, 1.0f));
 			scene_comp->SetVisible();
+		}
+	}
+
+	if (info.set_position && ent == model_ent) {
+		if (auto* c15 = ent->getById<Component_15_STUCharacterMoverComponent>(0x15)) {
+			c15->movement_state_1.absolute_position = info.spawn_position;
+			c15->movement_state_1.rotation_quaternion = valid_rot;
+			c15->movement_state_1.movement_flags = (c15->movement_state_1.movement_flags & ~0x2000) | 0x200;
+			c15->movement_state_2.absolute_position = info.spawn_position;
+			c15->movement_state_2.rotation_quaternion = valid_rot;
+			c15->movement_state_2.movement_flags = (c15->movement_state_2.movement_flags & ~0x2000) | 0x200;
+		}
+		if (auto* c12 = ent->getById<Component_12_STUMovementStateComponent>(0x12)) {
+			c12->mov_state.absolute_position = info.spawn_position;
+			c12->mov_state.rotation_quaternion = valid_rot;
+			c12->mov_state.movement_flags = (c12->mov_state.movement_flags & ~0x2000) | 0x200;
+			if (c12->mov_state.command_frame <= 0) {
+				c12->mov_state.command_frame = (game_ea && game_ea->GameEA_timing) ? game_ea->GameEA_timing->tick_count : 1;
+			}
+			auto CreateRotMatrix = (void(__fastcall*)(MovementState*, Matrix4x4*))(globals::gameBase + 0x102a610);
+			CreateRotMatrix(&c12->mov_state, &c12->mov_state.rotation_matrix);
+			c12->PasteMovementState(&c12->mov_state);
 		}
 	}
 
@@ -352,8 +382,10 @@ void player_spawner::tick_deferred_spawn() {
 				petref->backref_entid = backref_ent->entity_id;
 				petref->backref_global_entid = backref_ent->entity_global_id;
 			}
-			auto tell_statescript_this_is_localent = (void(__fastcall*)(Entity*, uint*))(globals::gameBase + 0xd07830);
-			tell_statescript_this_is_localent(m_ent, &c_ent->entity_id);
+			if (pending_controller_info.set_localent && c_ent->getById<Component_2F_LocalPlayer>(0x2F) != nullptr) {
+				auto tell_statescript_this_is_localent = (void(__fastcall*)(Entity*, uint*))(globals::gameBase + 0xd07830);
+				tell_statescript_this_is_localent(m_ent, &c_ent->entity_id);
+			}
 		}
 
 		modify_ent(pending_model_info, m_ent);

@@ -756,6 +756,7 @@ void PrometheusSystem::OnTick(float tick) {
 
 	process_pending_hero_swap();
 	s_hero_select_spawner.tick_deferred_spawn();
+	WeaponHardpointDiag::TickProjectileTracker(_game_ea);
 
 
 	Entity* local_controller = _game_ea->getLocalEnt();
