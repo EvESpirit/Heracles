@@ -311,6 +311,8 @@ struct Component_28_STUHealthComponent {
         }
         return total;
     }
+
+    void InitHeroHealthPools(uint64_t heroid, uint64_t model_res_id = 0);
 };
 
 enum class WalkDirectionLR : unsigned char {

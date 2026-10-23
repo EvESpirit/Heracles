@@ -4,6 +4,103 @@
 #include "Statescript.h"
 #include "StatescriptVar.h"
 #include "MovementState.h"
+#include <cstring>
+
+void Component_28_STUHealthComponent::InitHeroHealthPools(uint64_t heroid, uint64_t model_res_id) {
+	base.is_mirrored = 1;
+	const char* hero_name = nullptr;
+	if (heroid == 0 && model_res_id != 0) {
+		for (auto& hero : stu_resources::GetIfAssignableTo(stringHash("STUHero"))) {
+			auto stu = hero.second->to_editable();
+			auto* ent_ref = stu.get_argument_resource("m_gameplayEntity");
+			if (ent_ref && (uint64_t)ent_ref->resource_id == model_res_id) {
+				heroid = (uint64_t)hero.first;
+				break;
+			}
+		}
+	}
+	if (heroid != 0) {
+		if (auto* hero_stu = stu_resources::GetByID((__int64)heroid)) {
+			auto stu = hero_stu->to_editable();
+			if (auto* name_ref = stu.get_argument_resource(0xcd16baa)) {
+				hero_name = name_ref->get_UXDisplayString();
+			}
+			if (model_res_id == 0) {
+				if (auto* ent_ref = stu.get_argument_resource("m_gameplayEntity")) {
+					model_res_id = (uint64_t)ent_ref->resource_id;
+				}
+			}
+		}
+	}
+
+	float norm_hp = 200.0f;
+	float arm_hp = 0.0f;
+	float shld_hp = 0.0f;
+
+	// Overwatch 0.8.0 (Build 24919) Hero Health / Armor / Shield Pool Definitions
+	if (heroid == 0x02E0000000000007ULL || model_res_id == 0x0400000000000044ULL || (hero_name && strstr(hero_name, "Reinhardt"))) {
+		norm_hp = 300.0f; arm_hp = 200.0f;
+	} else if (heroid == 0x02E0000000000003ULL || model_res_id == 0x0400000000000001ULL || (hero_name && strstr(hero_name, "Tracer"))) {
+		norm_hp = 150.0f;
+	} else if (heroid == 0x02E0000000000009ULL || (hero_name && strstr(hero_name, "Winston"))) {
+		norm_hp = 400.0f; arm_hp = 100.0f;
+	} else if (heroid == 0x02E000000000007AULL || (hero_name && strstr(hero_name, "D.Va"))) {
+		norm_hp = 100.0f; arm_hp = 400.0f;
+	} else if (heroid == 0x02E0000000000015ULL || (hero_name && strstr(hero_name, "Bastion"))) {
+		norm_hp = 200.0f; arm_hp = 100.0f;
+	} else if (heroid == 0x02E0000000000040ULL || (hero_name && strstr(hero_name, "Roadhog"))) {
+		norm_hp = 600.0f;
+	} else if (heroid == 0x02E0000000000068ULL || (hero_name && strstr(hero_name, "Zarya"))) {
+		norm_hp = 200.0f; shld_hp = 200.0f;
+	} else if (heroid == 0x02E0000000000020ULL || (hero_name && strstr(hero_name, "Zenyatta"))) {
+		norm_hp = 50.0f; shld_hp = 100.0f;
+	} else if (heroid == 0x02E0000000000016ULL || (hero_name && strstr(hero_name, "Symmetra"))) {
+		norm_hp = 100.0f; shld_hp = 100.0f;
+	} else if (heroid == 0x02E0000000000002ULL || heroid == 0x02E00000000000DDULL ||
+	           (hero_name && (strstr(hero_name, "Reaper") || strstr(hero_name, "Mei")))) {
+		norm_hp = 250.0f;
+	}
+
+	for (int i = 0; i < 0x10; i++) {
+		normal_health[i].part_enabled = 0;
+		normal_health[i].max_health = 0.0f;
+		normal_health[i].curr_health = 0.0f;
+		armour_health[i].part_enabled = 0;
+		armour_health[i].max_health = 0.0f;
+		armour_health[i].curr_health = 0.0f;
+		shield_health[i].part_enabled = 0;
+		shield_health[i].max_health = 0.0f;
+		shield_health[i].curr_health = 0.0f;
+	}
+
+	if (norm_hp > 0.0f) {
+		normal_health[0].part_enabled = 1;
+		normal_health[0].max_health = norm_hp;
+		normal_health[0].curr_health = norm_hp;
+		normal_health[0].field_C = 0;
+		normal_health[0].field_10 = 1;
+		normal_health[0].some_other_flag = 1;
+		normal_health[0].field_12 = 0;
+	}
+	if (arm_hp > 0.0f) {
+		armour_health[0].part_enabled = 1;
+		armour_health[0].max_health = arm_hp;
+		armour_health[0].curr_health = arm_hp;
+		armour_health[0].field_C = 0;
+		armour_health[0].field_10 = 1;
+		armour_health[0].some_other_flag = 1;
+		armour_health[0].field_12 = 0;
+	}
+	if (shld_hp > 0.0f) {
+		shield_health[0].part_enabled = 1;
+		shield_health[0].max_health = shld_hp;
+		shield_health[0].curr_health = shld_hp;
+		shield_health[0].field_C = 0;
+		shield_health[0].field_10 = 1;
+		shield_health[0].some_other_flag = 1;
+		shield_health[0].field_12 = 0;
+	}
+}
 
 void player_spawner::modify_ent(spawn_info info, Entity* ent) {
 	auto game_ea = GameEntityAdmin();
@@ -83,25 +180,7 @@ void player_spawner::modify_ent(spawn_info info, Entity* ent) {
 
 	Component_28_STUHealthComponent* health = ent->getById<Component_28_STUHealthComponent>(0x28);
 	if (health && info.set_health) {
-		if (health->CalcTotalMaxHealth() <= 0.0f) {
-			auto& part = health->normal_health[0];
-			part.part_enabled = 1;
-			part.max_health = 200.0f;
-			part.curr_health = 200.0f;
-			part.field_C = 0;
-			part.field_10 = 1;
-			part.some_other_flag = 1;
-			part.field_12 = 0;
-		} else {
-			for (int i = 0; i < 0x10; i++) {
-				if (health->normal_health[i].part_enabled && health->normal_health[i].curr_health <= 0.0f)
-					health->normal_health[i].curr_health = health->normal_health[i].max_health;
-				if (health->armour_health[i].part_enabled && health->armour_health[i].curr_health <= 0.0f)
-					health->armour_health[i].curr_health = health->armour_health[i].max_health;
-				if (health->shield_health[i].part_enabled && health->shield_health[i].curr_health <= 0.0f)
-					health->shield_health[i].curr_health = health->shield_health[i].max_health;
-			}
-		}
+		health->InitHeroHealthPools((uint64_t)info.heroid, (uint64_t)info.resource_id);
 	}
 
 	Component_2F_LocalPlayer* lp = ent->getById<Component_2F_LocalPlayer>(0x2F);

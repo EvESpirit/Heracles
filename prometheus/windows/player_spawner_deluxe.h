@@ -499,30 +499,32 @@ class player_spawner_deluxe : public window {
 							}
 							ImGui::SameLine();
 							if (ImGui::SmallButton("-50 HP") && c28) {
-								for (int i = 0; i < 0x10; i++) {
-									if (c28->normal_health[i].part_enabled && c28->normal_health[i].curr_health > 0.0f) {
-										c28->normal_health[i].curr_health = (c28->normal_health[i].curr_health > 50.0f)
-											? (c28->normal_health[i].curr_health - 50.0f) : 0.0f;
-										break;
+								float rem = 50.0f;
+								HealthPart* pools[3] = { c28->shield_health, c28->armour_health, c28->normal_health };
+								for (int p = 0; p < 3 && rem > 0.0f; p++) {
+									for (int i = 0; i < 0x10 && rem > 0.0f; i++) {
+										if (pools[p][i].part_enabled && pools[p][i].curr_health > 0.0f) {
+											if (pools[p][i].curr_health >= rem) {
+												pools[p][i].curr_health -= rem;
+												rem = 0.0f;
+											} else {
+												rem -= pools[p][i].curr_health;
+												pools[p][i].curr_health = 0.0f;
+											}
+										}
 									}
 								}
 								sync_entity_health_varbag(ent);
 							}
 							ImGui::SameLine();
 							if (ImGui::SmallButton("Reset HP") && c28) {
-								if (c28->CalcTotalMaxHealth() <= 0.0f) {
-									c28->normal_health[0].part_enabled = 1;
-									c28->normal_health[0].max_health = 200.0f;
-									c28->normal_health[0].curr_health = 200.0f;
-									c28->normal_health[0].field_10 = 1;
-									c28->normal_health[0].some_other_flag = 1;
-								} else {
-									for (int i = 0; i < 0x10; i++) {
-										if (c28->normal_health[i].part_enabled) c28->normal_health[i].curr_health = c28->normal_health[i].max_health;
-										if (c28->armour_health[i].part_enabled) c28->armour_health[i].curr_health = c28->armour_health[i].max_health;
-										if (c28->shield_health[i].part_enabled) c28->shield_health[i].curr_health = c28->shield_health[i].max_health;
+								uint64_t h_id = 0;
+								if (ctrl_ent) {
+									if (auto* c3f = ctrl_ent->getById<Component_3F_PlayerInfo>(0x3F)) {
+										h_id = (uint64_t)c3f->selected_heroid;
 									}
 								}
+								c28->InitHeroHealthPools(h_id, 0);
 								sync_entity_health_varbag(ent);
 							}
 							ImGui::SameLine();

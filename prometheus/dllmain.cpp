@@ -1390,15 +1390,54 @@ static float ClosestSegSeg(const Vector4& p1, const Vector4& q1, const Vector4& 
 static float ApplyDamageToHealthComponent(Component_28_STUHealthComponent* c28, float dmg) {
     // Shields -> armour -> health, part by part.
     HealthPart* pools[3] = { c28->shield_health, c28->armour_health, c28->normal_health };
-    for (HealthPart* pool : pools) {
+    for (int p_idx = 0; p_idx < 3; p_idx++) {
+        HealthPart* pool = pools[p_idx];
+        bool is_armour = (p_idx == 1);
         for (int i = 0; i < 0x10 && dmg > 0.f; i++) {
             if (!pool[i].part_enabled || pool[i].curr_health <= 0.f) continue;
-            float take = (pool[i].curr_health < dmg) ? pool[i].curr_health : dmg;
-            pool[i].curr_health -= take;
-            dmg -= take;
+            // Overwatch 1 armor mitigation: reduces damage by half, up to a maximum reduction of 5.0f per hit
+            float eff_dmg = is_armour ? (dmg - ((dmg * 0.5f < 5.0f) ? (dmg * 0.5f) : 5.0f)) : dmg;
+            if (eff_dmg <= 0.f) break;
+            if (pool[i].curr_health >= eff_dmg) {
+                pool[i].curr_health -= eff_dmg;
+                dmg = 0.f;
+            } else {
+                float absorbed_ratio = pool[i].curr_health / eff_dmg;
+                pool[i].curr_health = 0.f;
+                dmg *= (1.0f - absorbed_ratio);
+            }
         }
     }
     return c28->CalcTotalCurrentHealth();
+}
+
+// Synchronizes Bit 16 (0x10000) on Component_01 + 0x1B8 for all enemy hero models:
+// - Alive enemies (curr_hp > 0.0f) get Bit 16 set so +0x10830C0 Loop 1 (+0x1083B68: bt rax, 10h) includes them in
+//   skeletal hitbox candidates (even on Shot #1 when +0x1032CB0 pre-computes [pellet_c27 + 0x228] before +0x1038860).
+// - Dead ragdoll corpses (curr_hp <= 0.0f) get Bit 16 cleared so bullets pass right through corpses without triggering
+//   live hitmarkers or hurt audio (Phase 7 Stage 2A).
+static void SyncEnemyHitboxFlags(EntityAdminBase* ea) {
+    if (!ea || !ea->local_entid) return;
+    uint32_t local_ctrl_id = ea->local_entid;
+    uint32_t local_mdl_id = 0;
+    if (Entity* local_ctrl = ea->getLocalEnt()) {
+        if (auto* pet = local_ctrl->getById<Component_20_ModelReference>(0x20)) {
+            local_mdl_id = pet->cam_attach_entid ? pet->cam_attach_entid : (pet->aim_entid ? pet->aim_entid : pet->movement_attach_entid);
+        }
+    }
+    for (Entity* ent : *ea) {
+        if (!ent || ent->entity_id == local_ctrl_id || ent->entity_id == local_mdl_id) continue;
+        if (!ent->hasComponent(0x15) || !ent->hasComponent(0x28)) continue;
+        auto* c1 = ent->getById<Component_1_SceneRendering>(1);
+        auto* c28 = ent->getById<Component_28_STUHealthComponent>(0x28);
+        if (!c1 || !c28) continue;
+        float curr_hp = c28->CalcTotalCurrentHealth();
+        if (curr_hp > 0.0f) {
+            *(uint32_t*)((uintptr_t)c1 + 0x1B8) |= 0x10000u;
+        } else {
+            *(uint32_t*)((uintptr_t)c1 + 0x1B8) &= ~0x10000u;
+        }
+    }
 }
 
 static void AppendHeroEntityForensics(std::string& out, const char* label, Entity* ctrl_ent, Entity* mdl_ent);
@@ -1596,6 +1635,9 @@ void __fastcall ExecuteShotRaycast_hook(uintptr_t shot_ctx, uint8_t flag) {
         Entity* shooter = SafeReadVal<Entity*>(shot_ctx + 0x08);
         EntityAdminBase* ea = shooter ? SafeReadVal<EntityAdminBase*>((uintptr_t)shooter + 0x28) : nullptr;
         if (ea && ea->local_entid) {
+            // Synchronize Bit 16 (0x10000) on Component_01 + 0x1B8 BEFORE ExecuteShotRaycast_orig spawns pellets
+            // and calls +0x1032CB0 (which pre-computes [pellet_c27 + 0x228] via +0x10830C0 on Shot #1).
+            SyncEnemyHitboxFlags(ea);
             Entity* ctrl = ea->getEntById(ea->local_entid);
             auto* c20 = ctrl ? ctrl->getById<Component_20_ModelReference>(0x20) : nullptr;
             uint32_t shooter_id = shooter->entity_id;
@@ -1613,7 +1655,8 @@ void __fastcall ExecuteShotRaycast_hook(uintptr_t shot_ctx, uint8_t flag) {
         }
     }
     ExecuteShotRaycast_orig(shot_ctx, flag);
-    if (flag == 1) EmulateDummyHitscanDamage(shot_ctx); // flag=1: local fire path (+0xD455FD); flag=0 is queue re-sim (+0xC34D80)
+    // Legacy ClosestSegSeg cylinder damage (EmulateDummyHitscanDamage) replaced in Phase 7 Stage 1 by native
+    // skeletal hitbox damage inside OnPelletHitboxHit_hook (+0xD381F0).
     if (shot_ctx) {
         Entity* shooter = SafeReadVal<Entity*>(shot_ctx + 0x08);
         uint32 shooter_id = shooter ? SafeReadVal<uint32>((uintptr_t)&shooter->entity_id) : 0;
@@ -1908,11 +1951,67 @@ void __fastcall OnPelletHitboxHit_hook(uintptr_t cb_vt, uintptr_t ctx_ptr, uintp
     uintptr_t out_hit = ctx_ptr ? SafeReadVal<uintptr_t>(ctx_ptr + 0x08) : 0;
     Entity* hit_ent = out_hit ? SafeReadVal<Entity*>(out_hit + 0x20) : nullptr;
     uint32_t hit_entid = hit_ent ? SafeReadVal<uint32_t>((uintptr_t)&hit_ent->entity_id) : 0;
+    Vector4 hit_pos = out_hit ? SafeReadVal<Vector4>(out_hit + 0x00) : Vector4{};
+    float hit_frac = out_hit ? SafeReadVal<float>(out_hit + 0x30) : -1.0f;
+    uint16_t w34 = out_hit ? SafeReadVal<uint16_t>(out_hit + 0x34) : 0xFFFF;
     uint16_t bone36 = out_hit ? SafeReadVal<uint16_t>(out_hit + 0x36) : 0xFFFF;
+    uint32_t f50 = out_hit ? SafeReadVal<uint32_t>(out_hit + 0x50) : 0;
+    uint32_t f54 = out_hit ? SafeReadVal<uint32_t>(out_hit + 0x54) : 0;
+    uint16_t w60 = out_hit ? SafeReadVal<uint16_t>(out_hit + 0x60) : 0;
     uint8_t c27_230 = pellet_c27 ? SafeReadVal<uint8_t>(pellet_c27 + 0x230) : 0xFF;
-    ShotDiagLogFmt("[HITBOX_CB (+0xD381F0 vt+0x68)] pellet_c27=%p out_hit=%p hit_ent=0x%X bone36=0x%X c27_230=%u",
-        (void*)pellet_c27, (void*)out_hit, hit_entid, bone36, c27_230);
+    int32_t pre_a38 = pellet_c27 ? SafeReadVal<int32_t>(pellet_c27 + 0xA38) : 0;
+
     OnPelletHitboxHit_orig(cb_vt, ctx_ptr, a3);
+
+    int32_t post_a38 = pellet_c27 ? SafeReadVal<int32_t>(pellet_c27 + 0xA38) : 0;
+    float r12_4c = a3 ? SafeReadVal<float>(a3 + 0x4C) : 0.0f;
+    uintptr_t r12_88 = a3 ? SafeReadVal<uintptr_t>(a3 + 0x88) : 0;
+    uintptr_t r12_b0 = a3 ? SafeReadVal<uintptr_t>(a3 + 0xB0) : 0;
+
+    ShotDiagLogFmt("[HITBOX_CB (+0xD381F0 vt+0x68)] pellet_c27=%p out_hit=%p hit_ent=0x%X w34=0x%X bone36=0x%X f50=0x%X f54=0x%X w60=0x%X a38=%d->%d c27_230=%u a3=%p(4C=%.2f,88=%p,B0=%p) pos=(%.2f,%.2f,%.2f)",
+        (void*)pellet_c27, (void*)out_hit, hit_entid, w34, bone36, f50, f54, w60, pre_a38, post_a38, c27_230,
+        (void*)a3, r12_4c, (void*)r12_88, (void*)r12_b0, hit_pos.X, hit_pos.Y, hit_pos.Z);
+}
+
+static std::mutex s_pellet_hit_mutex;
+static void NotifyTrackedHealthbarViewModels(uint32_t target_entid, Component_28_STUHealthComponent* target_c28, float cur_hp);
+
+struct PendingDamagePacket {
+    uint32_t target_entid;
+    int32_t damage_int;
+    uint8_t flags; // Bit 0 (0x01) = Critical Hit, Bit 1 (0x02) = Kill
+};
+static PendingDamagePacket s_pending_dmg_pkts[32] = {};
+static int s_pending_dmg_pkt_count = 0;
+static Component_28_STUHealthComponent* s_last_crit_c28 = nullptr;
+static uint64_t s_last_crit_capsule_tag = 0;
+static uint64_t s_last_crit_ms = 0;
+static uint32_t s_pending_snapshot_entid = 0;
+static uintptr_t s_last_sys46 = 0;
+
+// +0x1023E80: IsCriticalHitCapsule(Component_28_STUHealthComponent* c28, uint64_t capsule_tag)
+// Called by the hit audio/impact worker +0xCB9F60 at +0xCBA214 to decide whether to play the critical hit "dink" sound
+// and spawn crit impact effects ([rsp+40h] = al).
+// Note: +0x1023E80 first calls +0xCB05A0(c28) which reads dword ptr [c28 + 0x14] (c28->base.is_mirrored) and returns 0
+// immediately if != 1. Then it calls +0xF193A0(c28) and checks if capsule_tag is in STUHealthComponent + 0x38.
+typedef uint8_t(__fastcall* is_crit_capsule_fn)(Component_28_STUHealthComponent* c28, uint64_t capsule_tag);
+static is_crit_capsule_fn IsCriticalHitCapsule_orig = nullptr;
+uint8_t __fastcall IsCriticalHitCapsule_hook(Component_28_STUHealthComponent* c28, uint64_t capsule_tag) {
+    uint32_t pre_mir14 = c28 ? SafeReadVal<uint32_t>((uintptr_t)c28 + 0x14) : 0;
+    uint32_t hash18 = c28 ? SafeReadVal<uint32_t>((uintptr_t)c28 + 0x18) : 0;
+    if (c28 && pre_mir14 != 1) {
+        *(uint32_t*)((uintptr_t)c28 + 0x14) = 1;
+    }
+    uint8_t orig_ret = IsCriticalHitCapsule_orig ? IsCriticalHitCapsule_orig(c28, capsule_tag) : 0;
+    uint8_t final_ret = orig_ret;
+    if (final_ret == 0 && c28 && c28 == s_last_crit_c28 && (GetTickCount64() - s_last_crit_ms) < 250) {
+        if (capsule_tag == s_last_crit_capsule_tag || s_last_crit_capsule_tag == 0 || capsule_tag == 0) {
+            final_ret = 1;
+        }
+    }
+    ShotDiagLogFmt("[CRIT_CHECK (+0x1023E80)] c28=%p mir14=%u->1 hash18=0x%X tag=0x%llX orig_ret=%u final_ret=%u",
+        (void*)c28, pre_mir14, hash18, (unsigned long long)capsule_tag, orig_ret, final_ret);
+    return final_ret;
 }
 
 typedef uint8_t(__fastcall* get_c1_world_aabb_fn)(Component_1_SceneRendering* c1, Vector4* out_aabb_min_max);
@@ -1961,11 +2060,7 @@ uint8_t __fastcall PerformPelletWorldAndHitboxRaycast_hook(
             if (c1) {
                 dmy_1b8_pre = SafeReadVal<uint64_t>((uintptr_t)c1 + 0x1B8);
                 dmy_198 = SafeReadVal<uintptr_t>((uintptr_t)c1 + 0x198);
-                // Ensure Bit 16 (0x10000) of Component_01 + 0x1B8 is set so +0x10830C0 Loop 1 (+0x1083B68: bt rax, 10h) includes the Enemy Dummy
-                if ((dmy_1b8_pre & 0x10000ULL) == 0) {
-                    *(uint32_t*)((uintptr_t)c1 + 0x1B8) |= 0x10000u;
-                }
-                dmy_1b8_post = SafeReadVal<uint64_t>((uintptr_t)c1 + 0x1B8);
+                dmy_1b8_post = dmy_1b8_pre;
             }
             if (c12) {
                 uintptr_t aabb_addr = (uintptr_t)c12 + 0xA2D0;
@@ -2000,16 +2095,88 @@ uint8_t __fastcall PerformPelletWorldAndHitboxRaycast_hook(
     float hit_frac = out_hit ? SafeReadVal<float>(out_hit + 0x30) : -1.0f;
     uint16_t hit_w34 = out_hit ? SafeReadVal<uint16_t>(out_hit + 0x34) : 0;
     uint16_t hit_bone36 = out_hit ? SafeReadVal<uint16_t>(out_hit + 0x36) : 0xFFFF;
+    uint64_t hit_tag40 = out_hit ? SafeReadVal<uint64_t>(out_hit + 0x40) : 0;
     uint32_t hit_f50 = out_hit ? SafeReadVal<uint32_t>(out_hit + 0x50) : 0;
+    uint32_t hit_f54 = out_hit ? SafeReadVal<uint32_t>(out_hit + 0x54) : 0;
     uint16_t hit_w60 = out_hit ? SafeReadVal<uint16_t>(out_hit + 0x60) : 0;
 
-    ShotDiagLogFmt("[RAY_1038860] ret=%u c27(228=0x%llX,230=%u) a45aa0(tot=%d,dmy=%d,dret=%d) hb(aa49=%u,aa48=%u) c1(1b8=0x%llX->0x%llX,198=%p) c12_aabb((%.1f,%.1f,%.1f)..(%.1f,%.1f,%.1f)) -> HIT(ent=0x%X,t=%.3f,w34=0x%X,bone36=0x%X,f50=0x%X,w60=0x%X,pos=(%.2f,%.2f,%.2f))",
+    ShotDiagLogFmt("[RAY_1038860] ret=%u c27(228=0x%llX,230=%u) a45aa0(tot=%d,dmy=%d,dret=%d) hb(aa49=%u,aa48=%u) c1(1b8=0x%llX->0x%llX,198=%p) c12_aabb((%.1f,%.1f,%.1f)..(%.1f,%.1f,%.1f)) -> HIT(ent=0x%X,t=%.3f,w34=0x%X,bone36=0x%X,tag40=0x%llX,f50=0x%X,f54=0x%X,w60=0x%X,pos=(%.2f,%.2f,%.2f))",
         ret, (unsigned long long)c27_228, c27_230,
         s_a45aa0_total_calls, s_a45aa0_dummy_calls, s_a45aa0_dummy_last_ret,
         hb_aa49, hb_aa48,
         (unsigned long long)dmy_1b8_pre, (unsigned long long)dmy_1b8_post, (void*)dmy_198,
         dmy_c12_min_pre.X, dmy_c12_min_pre.Y, dmy_c12_min_pre.Z, dmy_c12_max_pre.X, dmy_c12_max_pre.Y, dmy_c12_max_pre.Z,
-        hit_entid, hit_frac, hit_w34, hit_bone36, hit_f50, hit_w60, hit_pos.X, hit_pos.Y, hit_pos.Z);
+        hit_entid, hit_frac, hit_w34, hit_bone36, (unsigned long long)hit_tag40, hit_f50, hit_f54, hit_w60, hit_pos.X, hit_pos.Y, hit_pos.Z);
+
+    // Apply native skeletal hitbox damage when +0x1038860 intersects a skeletal hitbox capsule (hit_w34 != 0xFFFF, hit_f54 != 0xFFFFFFFF).
+    // NOTE: +0x1032CB0 -> +0x1038860 runs in parallel on worker threads for multi-pellet weapons (e.g. Tracer's 2 pellets per shot),
+    // so guard all shared state with s_pellet_hit_mutex and leave VarBag / UI ViewModel / System #46 notifications to the main thread (+0xCA7200).
+    if (WeaponHardpointDiag::s_dummy_damage_enabled && ret != 0 && hit_ent && hit_w34 != 0xFFFF && hit_f54 != 0xFFFFFFFF && c27_230 == 0) {
+        std::lock_guard<std::mutex> hit_lock(s_pellet_hit_mutex);
+        uint32_t local_ctrl_id = ea ? ea->local_entid : 0;
+        uint32_t local_mdl_id = 0;
+        if (ea && local_ctrl_id) {
+            if (Entity* ctrl = ea->getEntById(local_ctrl_id)) {
+                if (auto* c20 = ctrl->getById<Component_20_ModelReference>(0x20)) {
+                    local_mdl_id = c20->cam_attach_entid ? c20->cam_attach_entid : c20->aim_entid;
+                }
+            }
+        }
+        if (hit_entid != local_ctrl_id && hit_entid != local_mdl_id && hit_entid != s_last_shot_shooter_id) {
+            auto* c10 = hit_ent->getById<Component_10_FilterBits>(0x10);
+            bool same_team = (s_last_shot_team && c10 && (c10->filter_bits & 0x3C0000ULL) == (s_last_shot_team & 0x3C0000ULL));
+            auto* c28 = hit_ent->getById<Component_28_STUHealthComponent>(0x28);
+            auto* c1 = hit_ent->getById<Component_1_SceneRendering>(1);
+            if (!same_team && c28 && c28->CalcTotalCurrentHealth() > 0.0f) {
+                // Ensure c28->base.is_mirrored (+0x14) is 1 so +0x1023E80 -> +0xCB05A0(c28) allows critical hit checks
+                *(uint32_t*)((uintptr_t)c28 + 0x14) = 1;
+                float base_y = c1 ? c1->position.Y : 0.0f;
+                float rel_y = hit_pos.Y - base_y;
+                // Native critical hit region tag 0x0DA000000000000D, skeletal head bone 0x11, or head capsule 0x2A
+                bool crit = (hit_tag40 == 0x0DA000000000000DULL || hit_f54 == 0x11 || hit_w34 == 0x2A);
+                if (crit) {
+                    if (out_hit) {
+                        *(uint64_t*)(out_hit + 0x40) = 0x0DA000000000000DULL;
+                    }
+                    hit_tag40 = 0x0DA000000000000DULL;
+                    s_last_crit_c28 = c28;
+                    s_last_crit_capsule_tag = hit_tag40;
+                    s_last_crit_ms = GetTickCount64();
+                } else if (s_last_crit_c28 == c28 && (GetTickCount64() - s_last_crit_ms) >= 50) {
+                    s_last_crit_c28 = nullptr;
+                }
+                float dmg = WeaponHardpointDiag::s_dummy_damage_per_pellet * (crit ? WeaponHardpointDiag::s_dummy_crit_mult : 1.0f);
+                float hp = ApplyDamageToHealthComponent(c28, dmg);
+                // Immediately clear Bit 16 (0x10000) when HP reaches 0 so remaining pellets / shots pass through the ragdoll corpse
+                if (hp <= 0.0f && c1) {
+                    *(uint32_t*)((uintptr_t)c1 + 0x1B8) &= ~0x10000u;
+                }
+                if (s_pending_dmg_pkt_count < 32) {
+                    int32_t dmg_int = (int32_t)(dmg + 0.5f);
+                    if (dmg_int < 1) dmg_int = 1;
+                    uint8_t pkt_flags = (uint8_t)((crit ? 1 : 0) | (hp <= 0.0f ? 2 : 0));
+                    s_pending_dmg_pkts[s_pending_dmg_pkt_count++] = PendingDamagePacket{ hit_entid, dmg_int, pkt_flags };
+                }
+                s_last_hit_dummy_entid = hit_entid;
+                s_last_hit_dummy_ms = GetTickCount64();
+                s_redirect_dummy_c1 = c1;
+                s_redirect_hit_pos = hit_pos;
+                s_redirect_hit_pos.W = 1.0f;
+                WeaponHardpointDiag::s_dummy_hits++;
+                if (WeaponHardpointDiag::s_dummy_hits == 1 && hp > 0.0f) {
+                    s_pending_snapshot_entid = hit_entid;
+                    s_pending_dummy_hit_dump_ticks = 4;
+                } else if (hp <= 0.0f) {
+                    s_pending_dummy_hit_dump_ticks = 4;
+                }
+                std::string hit_msg = std::format(
+                    "Hit #{} on 0x{:X} (bone=0x{:X},w34=0x{:X},tag40=0x{:X},relY={:.2f}m): -{:.1f}{} -> HP {:.1f}",
+                    WeaponHardpointDiag::s_dummy_hits, hit_entid, hit_f54, hit_w34, (unsigned long long)hit_tag40, rel_y, dmg, crit ? " CRIT" : "", hp);
+                WeaponHardpointDiag::s_last_dummy_hit = hit_msg;
+                ShotDiagLogFmt("[DUMMY_HIT] %s", hit_msg.c_str());
+            }
+        }
+    }
 
     return ret;
 }
@@ -2017,15 +2184,17 @@ uint8_t __fastcall PerformPelletWorldAndHitboxRaycast_hook(
 // +0xCA7200: System #46's per-frame overhead healthbar visibility updater (called at the end of System #46::Tick
 // via +0xCA5C8D -> jmp +0xCA7200). In online games, network damage packets (+0xCA7860) append 16-byte entries
 // { target_entid, hit_timestamp, damage_int, flags } to the LocalPlayer's Component_2F ring buffer at +0x15E0
-// (capacity at +0x17E0, head at +0x17F0, count at +0x17F4), and +0xCA7200 sets Component_28 + 0x485 = 1 for all
-// unexpired targets and fires SetStatescriptFlags(0x800000) when byte_484 != byte_485.
-// In offline mode, +0xCA7860 is never called. Here we keep comp2F + 0x15E0 populated for any alive, damaged enemy
-// hero (0 < curr_hp < max_hp) and expire it when at full health or dead.
+// (capacity at +0x17E0, head at +0x17F0, count at +0x17F4), increment the LocalPlayer's reticle HitPip counters
+// (HitPip_HitCount at +0xC0, HitPip_CritCount at +0xC4, HitPip_KillCount at +0xC8 via +0xCF7B10), mark the reticle
+// ViewModel (0x400) dirty, and broadcast a 0x160-byte combat event to System #46 listeners.
+// Here we drain s_pending_dmg_pkts through the native +0xCA7860 handler on the main thread and expire the ring-buffer
+// entry when the target is at full health or dead.
 typedef void(__fastcall* update_hb_vis_fn)(uintptr_t sys46);
 static update_hb_vis_fn UpdateHealthbarVisibility_orig = nullptr;
 static uint8_t s_last_logged_dummy_485 = 0xFF;
 static float s_last_logged_dummy_hp = -1.0f;
 static uintptr_t s_tracked_hb_subobjs[16] = {};
+static float s_tracked_hb_last_hp[16] = {};
 
 static void TrackHealthbarSubobj(uintptr_t subobj) {
     if (!subobj) return;
@@ -2037,6 +2206,7 @@ static void TrackHealthbarSubobj(uintptr_t subobj) {
     for (int i = 0; i < 16; i++) {
         if (!s_tracked_hb_subobjs[i] || SafeReadVal<uintptr_t>(s_tracked_hb_subobjs[i]) != expected_vt) {
             s_tracked_hb_subobjs[i] = subobj;
+            s_tracked_hb_last_hp[i] = -1.0f;
             return;
         }
     }
@@ -2052,19 +2222,22 @@ static void NotifyTrackedHealthbarViewModels(uint32_t target_entid, Component_28
         if (!subobj) continue;
         if (SafeReadVal<uintptr_t>(subobj) != expected_sub_vt) {
             s_tracked_hb_subobjs[i] = 0;
+            s_tracked_hb_last_hp[i] = -1.0f;
             continue;
         }
         uintptr_t vm = subobj - 0x3E0;
         if (SafeReadVal<uintptr_t>(vm) != expected_vm_vt) continue;
         if (SafeReadVal<uint32_t>(subobj + 0x10) != target_entid) continue;
         float vm_cached_hp = SafeReadVal<float>(subobj + 0x14);
-        if (fabsf(vm_cached_hp - cur_hp) > 0.01f) {
+        if (fabsf(s_tracked_hb_last_hp[i] - cur_hp) > 0.01f || fabsf(vm_cached_hp - cur_hp) > 0.01f) {
+            s_tracked_hb_last_hp[i] = cur_hp;
             on_c28_changed(target_c28, 0, 0x28, vm);
         }
     }
 }
 
 void __fastcall UpdateHealthbarVisibility_hook(uintptr_t sys46) {
+    s_last_sys46 = sys46;
     EntityAdminBase* ea = sys46 ? SafeReadVal<EntityAdminBase*>(sys46 + 0x08) : nullptr;
     Entity* target_dummy = nullptr;
     Component_28_STUHealthComponent* target_c28 = nullptr;
@@ -2073,6 +2246,7 @@ void __fastcall UpdateHealthbarVisibility_hook(uintptr_t sys46) {
     bool should_show_hb = false;
 
     if (ea && ea->local_entid) {
+        SyncEnemyHitboxFlags(ea);
         Entity* local_ctrl = ea->getEntById(ea->local_entid);
         local_c2f = local_ctrl ? local_ctrl->getById<Component_2F_LocalPlayer>(0x2F) : nullptr;
         uint32_t local_mdl_id = 0;
@@ -2082,37 +2256,77 @@ void __fastcall UpdateHealthbarVisibility_hook(uintptr_t sys46) {
             }
         }
         if (local_c2f) {
+            if (local_c2f->field_17E0 <= 0) local_c2f->field_17E0 = 0x20;
+
+            // Drain any pending damage confirmation packets queued by PerformPelletWorldAndHitboxRaycast_hook (+0x1038860)
+            PendingDamagePacket local_pkts[32];
+            int pkt_cnt = 0;
+            uint32_t snap_entid = 0;
+            {
+                std::lock_guard<std::mutex> hit_lock(s_pellet_hit_mutex);
+                pkt_cnt = s_pending_dmg_pkt_count;
+                for (int i = 0; i < pkt_cnt; i++) local_pkts[i] = s_pending_dmg_pkts[i];
+                s_pending_dmg_pkt_count = 0;
+                snap_entid = s_pending_snapshot_entid;
+                s_pending_snapshot_entid = 0;
+            }
+            if (pkt_cnt > 0) {
+                auto on_net_dmg = (void(__fastcall*)(uintptr_t, uintptr_t, const uint8_t*))(globals::gameBase + 0xCA7860);
+                Entity* local_mdl_ent = local_mdl_id ? ea->getEntById(local_mdl_id) : nullptr;
+                uintptr_t local_c1f = local_mdl_ent ? (uintptr_t)local_mdl_ent->getById(0x1F) : 0;
+                for (int i = 0; i < pkt_cnt; i++) {
+                    uint8_t pkt[0x80] = {};
+                    *(uint32_t*)(pkt + 0x68) = local_pkts[i].target_entid;
+                    *(int32_t*)(pkt + 0x6C) = local_pkts[i].damage_int;
+                    *(int32_t*)(pkt + 0x70) = 62500; // ~1000s duration_ticks so cur_tick + 62500 >= prev_ts at +0xCA79AF
+                    *(uint8_t*)(pkt + 0x74) = local_pkts[i].flags;
+                    on_net_dmg(sys46, 0, pkt);
+                    // Read HitPip counters directly from local hero model's Component_1F (+0x170/+0x174/+0x178);
+                    // NEVER call +0xCF7B10 directly as it has an 'MZ' (0x5A4D) return-address check at +0xCF8291!
+                    uint32_t pip_hit = local_c1f ? SafeReadVal<uint32_t>(local_c1f + 0x170) : 0;
+                    uint32_t pip_crit = local_c1f ? SafeReadVal<uint32_t>(local_c1f + 0x174) : 0;
+                    uint32_t pip_kill = local_c1f ? SafeReadVal<uint32_t>(local_c1f + 0x178) : 0;
+                    ShotDiagLogFmt("[DMG_PKT (+0xCA7860)] target=0x%X dmg=%d flags=0x%X -> HitPip(hit=%u,crit=%u,kill=%u)",
+                        local_pkts[i].target_entid, local_pkts[i].damage_int, local_pkts[i].flags,
+                        pip_hit, pip_crit, pip_kill);
+                }
+            }
+            if (snap_entid != 0 && s_alive_hit_snapshot.empty()) {
+                if (Entity* snap_ent = ea->getEntById(snap_entid)) {
+                    uint32 ctrl_id = 0;
+                    if (auto* c1f = snap_ent->getById<Component_1F_Backref>(0x1F)) ctrl_id = c1f->backref_entid;
+                    Entity* d_ctrl = ctrl_id ? ea->getEntById(ctrl_id) : nullptr;
+                    s_alive_hit_snapshot.reserve(8192);
+                    AppendHeroEntityForensics(s_alive_hit_snapshot, "ENEMY DUMMY SNAPSHOT AT HIT #1 (WHILE ALIVE & DAMAGED)", d_ctrl, snap_ent);
+                }
+            }
+
             for (Entity* ent : *ea) {
                 if (!ent || ent->entity_id == ea->local_entid || ent->entity_id == local_mdl_id) continue;
                 if (!ent->hasComponent(0x15) || !ent->hasComponent(0x28)) continue;
                 auto* c28 = ent->getById<Component_28_STUHealthComponent>(0x28);
                 if (!c28) continue;
-                target_dummy = ent;
-                target_c28 = c28;
-                cur_hp = c28->CalcTotalCurrentHealth();
-                max_hp = c28->CalcTotalMaxHealth();
-                should_show_hb = (cur_hp > 0.0f && max_hp > 0.0f && cur_hp < max_hp);
-                break;
-            }
-            if (target_dummy && target_c28) {
-                uintptr_t ring = (uintptr_t)local_c2f + 0x15E0;
-                if (local_c2f->field_17E0 <= 0) local_c2f->field_17E0 = 0x20;
-                uint8_t cur_485 = SafeReadVal<uint8_t>((uintptr_t)target_c28 + 0x485);
-                if (should_show_hb) {
-                    *(uint32_t*)(ring + 0x00) = target_dummy->entity_id;
-                    *(uint32_t*)(ring + 0x04) = 0x70000000u; // Unexpired unsigned timestamp (> r12d)
-                    *(uint32_t*)(ring + 0x08) = (uint32_t)(max_hp - cur_hp);
-                    *(uint32_t*)(ring + 0x0C) = 0;
-                    local_c2f->field_17F0 = 0;
-                    if (local_c2f->field_17F4 <= 0) local_c2f->field_17F4 = 1;
-                    if (cur_485 == 0) {
-                        *(uint8_t*)(sys46 + 0x99) = 1;
+                float ent_cur_hp = c28->CalcTotalCurrentHealth();
+                float ent_max_hp = c28->CalcTotalMaxHealth();
+                bool ent_show_hb = (ent_cur_hp > 0.0f && ent_max_hp > 0.0f && ent_cur_hp < ent_max_hp);
+                if (!ent_show_hb) {
+                    uintptr_t ring = (uintptr_t)local_c2f + 0x15E0;
+                    int32_t cap = local_c2f->field_17E0 > 0 ? local_c2f->field_17E0 : 0x20;
+                    if (cap > 0x20) cap = 0x20;
+                    for (int32_t idx = 0; idx < cap; idx++) {
+                        uintptr_t entry = ring + (uintptr_t)idx * 0x10;
+                        if (*(uint32_t*)(entry + 0x00) == ent->entity_id && *(uint32_t*)(entry + 0x04) != 0) {
+                            *(uint32_t*)(entry + 0x04) = 0;
+                            *(uint8_t*)(sys46 + 0x99) = 1;
+                        }
                     }
-                } else {
-                    if (*(uint32_t*)(ring + 0x00) == target_dummy->entity_id && *(uint32_t*)(ring + 0x04) != 0) {
-                        *(uint32_t*)(ring + 0x04) = 0;
-                        *(uint8_t*)(sys46 + 0x99) = 1;
-                    }
+                }
+                if (!target_dummy || ent->entity_id == s_last_hit_dummy_entid || ent_show_hb) {
+                    target_dummy = ent;
+                    target_c28 = c28;
+                    cur_hp = ent_cur_hp;
+                    max_hp = ent_max_hp;
+                    should_show_hb = ent_show_hb;
                 }
             }
         }
@@ -2120,8 +2334,27 @@ void __fastcall UpdateHealthbarVisibility_hook(uintptr_t sys46) {
 
     UpdateHealthbarVisibility_orig(sys46);
 
+    if (ea && ea->local_entid && local_c2f) {
+        uint32_t local_mdl_id = 0;
+        if (Entity* local_ctrl = ea->getEntById(ea->local_entid)) {
+            if (auto* c20 = local_ctrl->getById<Component_20_ModelReference>(0x20)) {
+                local_mdl_id = c20->cam_attach_entid ? c20->cam_attach_entid : c20->aim_entid;
+            }
+        }
+        for (Entity* ent : *ea) {
+            if (!ent || ent->entity_id == ea->local_entid || ent->entity_id == local_mdl_id) continue;
+            if (!ent->hasComponent(0x15) || !ent->hasComponent(0x28)) continue;
+            auto* c28 = ent->getById<Component_28_STUHealthComponent>(0x28);
+            if (!c28) continue;
+            float ent_cur_hp = c28->CalcTotalCurrentHealth();
+            NotifyTrackedHealthbarViewModels(ent->entity_id, c28, ent_cur_hp);
+        }
+    }
+
     if (target_dummy && target_c28 && local_c2f) {
-        NotifyTrackedHealthbarViewModels(target_dummy->entity_id, target_c28, cur_hp);
+        if (cur_hp != s_last_logged_dummy_hp) {
+            SyncEntityHealthVarBag(target_dummy);
+        }
         uint8_t post_484 = SafeReadVal<uint8_t>((uintptr_t)target_c28 + 0x484);
         uint8_t post_485 = SafeReadVal<uint8_t>((uintptr_t)target_c28 + 0x485);
         uint8_t sys46_99 = SafeReadVal<uint8_t>(sys46 + 0x99);
@@ -3232,15 +3465,96 @@ static void AppendHeroEntityForensics(std::string& out, const char* label, Entit
     if (auto* c28 = mdl_ent->getById<Component_28_STUHealthComponent>(0x28)) {
         uint8_t b484 = SafeReadVal<uint8_t>((uintptr_t)c28 + 0x484);
         uint8_t b485 = SafeReadVal<uint8_t>((uintptr_t)c28 + 0x485);
-        out.append(std::format("  - **Model `Component_28_STUHealthComponent` (`0x{:X}`)**: `CurrHP={:.1f}`, `MaxHP={:.1f}`, `b484={}`, `b485(hb_vis)={}`, `part0:(en={}, cur={:.1f}, max={:.1f}, f10={}, f11={})`\n    ",
+        out.append(std::format("  - **Model `Component_28_STUHealthComponent` (`0x{:X}`)**: `CurrHP={:.1f}`, `MaxHP={:.1f}`, `b484={}`, `b485(hb_vis)={}`, `norm0:(en={}, cur={:.1f}/{:.1f})`, `arm0:(en={}, cur={:.1f}/{:.1f})`, `shd0:(en={}, cur={:.1f}/{:.1f})`\n    ",
             (unsigned long long)c28, c28->CalcTotalCurrentHealth(), c28->CalcTotalMaxHealth(), b484, b485,
             c28->normal_health[0].part_enabled, c28->normal_health[0].curr_health, c28->normal_health[0].max_health,
-            (int)c28->normal_health[0].field_10, (int)c28->normal_health[0].some_other_flag));
+            c28->armour_health[0].part_enabled, c28->armour_health[0].curr_health, c28->armour_health[0].max_health,
+            c28->shield_health[0].part_enabled, c28->shield_health[0].curr_health, c28->shield_health[0].max_health));
         for (int off = 0x18; off <= 0x488; off += 8) {
             uint64_t v = SafeReadVal<uint64_t>((uintptr_t)c28 + off);
             if (v) out.append(std::format("+0x{:03X}=0x{:X} ", off, v));
         }
         out += "\n";
+
+        // Dump the STUHealthComponent STU resource (+0xF193A0) and its child fields / arrays
+        auto get_comp_stu = (STUBase<>*(__fastcall*)(ComponentBase*))(globals::gameBase + 0xF193A0);
+        STUBase<>* stu_hc = get_comp_stu(&c28->base);
+        if (stu_hc && !IsBadReadPtr(stu_hc, 0x40)) {
+            STUInfo* hc_info = (stu_hc->vfptr && !IsBadReadPtr(stu_hc->vfptr, 8) && stu_hc->vfptr->GetSTUInfo)
+                ? stu_hc->vfptr->GetSTUInfo() : nullptr;
+            uint32_t hc_hash = (hc_info && !IsBadReadPtr(hc_info, sizeof(STUInfo))) ? hc_info->name_hash : 0;
+            uint32_t hc_size = (hc_info && !IsBadReadPtr(hc_info, sizeof(STUInfo))) ? hc_info->instance_size : 0x50;
+            out.append(std::format("    - **`STUHealthComponent` STU Resource (`+0xF193A0` = `0x{:X}`, hash=`0x{:08X}`, size=`0x{:X}`)**:\n      raw: ",
+                (unsigned long long)stu_hc, hc_hash, hc_size));
+            int dump_sz = (hc_size > 0 && hc_size <= 0x100) ? (int)hc_size : 0x60;
+            for (int off = 0; off < dump_sz; off += 8) {
+                uint64_t qw = SafeReadVal<uint64_t>((uintptr_t)stu_hc + off);
+                float fl0 = SafeReadVal<float>((uintptr_t)stu_hc + off);
+                float fl1 = SafeReadVal<float>((uintptr_t)stu_hc + off + 4);
+                out.append(std::format("+0x{:02X}=0x{:X}({:.1f},{:.1f}) ", off, qw, fl0, fl1));
+            }
+            out += "\n";
+            if (hc_info && !IsBadReadPtr(hc_info, sizeof(STUInfo))) {
+                for (auto arg_pair : *hc_info) {
+                    STUArgumentInfo* arg = arg_pair.second;
+                    if (!arg || IsBadReadPtr(arg, sizeof(STUArgumentInfo))) continue;
+                    uintptr_t f_addr = (uintptr_t)stu_hc + arg->offset;
+                    uint64_t f_raw = SafeReadVal<uint64_t>(f_addr);
+                    float f_flt = SafeReadVal<float>(f_addr);
+                    STUConstraintType ctype = (arg->constraint && !IsBadReadPtr(arg->constraint, 8))
+                        ? arg->constraint->get_type_flag() : (STUConstraintType)-1;
+                    out.append(std::format("      - Field `0x{:08X}` (`{}`) at `+0x{:X}` (type={}): raw=`0x{:X}` flt=`{:.2f}`\n",
+                        arg->name_hash, allmighty_hash_lib::hashes.count(arg->name_hash) ? allmighty_hash_lib::hashes[arg->name_hash] : "?",
+                        arg->offset, (int)ctype, f_raw, f_flt));
+                    if (ctype == STU_ConstraintType_BSList_Object || ctype == STU_ConstraintType_BSList_InlinedObject ||
+                        ctype == STU_ConstraintType_BSList_Primitive || ctype == STU_ConstraintType_BSList_ResourceRef) {
+                        auto* bs = (STUBullshitListFull<uint64_t>*)f_addr;
+                        if (!IsBadReadPtr(bs, sizeof(*bs)) && bs->list_ptr && !IsBadReadPtr(bs->list_ptr, 16)) {
+                            int cnt = bs->count();
+                            out.append(std::format("        BSList count={}: ", cnt));
+                            for (int k = 0; k < cnt && k < 16; k++) {
+                                uintptr_t elem_addr = (uintptr_t)&bs->list()[k];
+                                out.append(std::format("[{}:0x{:X}] ", k, SafeReadVal<uint64_t>(elem_addr)));
+                            }
+                            out += "\n";
+                            if (ctype == STU_ConstraintType_BSList_Object || ctype == STU_ConstraintType_BSList_InlinedObject) {
+                                STU_ObjectList obj_list(arg, (void*)f_addr);
+                                if (obj_list.valid()) {
+                                    for (int k = 0; k < cnt && k < 8; k++) {
+                                        STU_Object elem = obj_list[k];
+                                        if (elem.valid() && elem.value && !IsBadReadPtr(elem.value, 0x20)) {
+                                            STU_Object root_e = elem.get_runtime_root();
+                                            uint32_t eh = root_e.struct_info ? root_e.struct_info->name_hash : 0;
+                                            uint32_t esz = root_e.struct_info ? root_e.struct_info->instance_size : 0x30;
+                                            out.append(std::format("        elem[{}] (`0x{:X}`, hash=`0x{:08X}`, sz=`0x{:X}`): ",
+                                                k, (unsigned long long)elem.value, eh, esz));
+                                            for (int eo = 0; eo < (int)esz && eo < 0x48; eo += 4) {
+                                                uint32_t dw = SafeReadVal<uint32_t>((uintptr_t)elem.value + eo);
+                                                float ef = SafeReadVal<float>((uintptr_t)elem.value + eo);
+                                                out.append(std::format("+0x{:02X}=0x{:X}({:.1f}) ", eo, dw, ef));
+                                            }
+                                            out += "\n";
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if (ctype == STU_ConstraintType_Object && f_raw > 0x10000ULL && !IsBadReadPtr((const void*)f_raw, 0x20)) {
+                        STUBase<>* child = (STUBase<>*)f_raw;
+                        STUInfo* ci = (child->vfptr && !IsBadReadPtr(child->vfptr, 8) && child->vfptr->GetSTUInfo) ? child->vfptr->GetSTUInfo() : nullptr;
+                        uint32_t ch = (ci && !IsBadReadPtr(ci, sizeof(STUInfo))) ? ci->name_hash : 0;
+                        uint32_t csz = (ci && !IsBadReadPtr(ci, sizeof(STUInfo))) ? ci->instance_size : 0x30;
+                        out.append(std::format("        child (`0x{:X}`, hash=`0x{:08X}`, sz=`0x{:X}`): ", f_raw, ch, csz));
+                        for (int co = 0; co < (int)csz && co < 0x48; co += 4) {
+                            uint32_t dw = SafeReadVal<uint32_t>(f_raw + co);
+                            float cf = SafeReadVal<float>(f_raw + co);
+                            out.append(std::format("+0x{:02X}=0x{:X}({:.1f}) ", co, dw, cf));
+                        }
+                        out += "\n";
+                    }
+                }
+            }
+        }
     }
     AppendVarBagSummary(out, "Model", mdl_ent);
 }
@@ -3251,6 +3565,24 @@ void WeaponHardpointDiag::DumpDummyCombatForensics(EntityAdminBase* game_ea, con
     out += "# Local Player vs Enemy Dummy Combat & Shot Raycast Forensics\n\n";
     out.append(std::format("- **Trigger**: `{}` | **Shot Raycasts (`+0xD354B0`)**: `{}` | **FireShot (`+0xD46060`)**: `{}`\n\n",
         trigger_reason ? trigger_reason : "Manual", s_shot_raycast_calls, s_fire_shot_calls));
+
+    if (s_last_sys46) {
+        uintptr_t lst_arr = SafeReadVal<uintptr_t>(s_last_sys46 + 0x50);
+        int32_t lst_cnt = SafeReadVal<int32_t>(s_last_sys46 + 0x58);
+        out.append(std::format("- **System #46 (`0x{:X}`) Combat Listeners (`+0x50`=`0x{:X}`, count=`{}`)**: ",
+            (unsigned long long)s_last_sys46, (unsigned long long)lst_arr, lst_cnt));
+        if (lst_arr && lst_cnt > 0 && lst_cnt < 64) {
+            for (int32_t i = 0; i < lst_cnt; i++) {
+                uintptr_t l_obj = SafeReadVal<uintptr_t>(lst_arr + (uintptr_t)i * 8);
+                uintptr_t l_vt = l_obj ? SafeReadVal<uintptr_t>(l_obj) : 0;
+                uintptr_t l_vt_rva = (l_vt >= globals::gameBase && l_vt < globals::gameBase + globals::gameSize) ? (l_vt - globals::gameBase) : l_vt;
+                uintptr_t l_fn = l_vt ? SafeReadVal<uintptr_t>(l_vt) : 0;
+                uintptr_t l_fn_rva = (l_fn >= globals::gameBase && l_fn < globals::gameBase + globals::gameSize) ? (l_fn - globals::gameBase) : l_fn;
+                out.append(std::format("[{}:obj=0x{:X},vt=+0x{:X},fn0=+0x{:X}] ", i, (unsigned long long)l_obj, (unsigned long long)l_vt_rva, (unsigned long long)l_fn_rva));
+            }
+        }
+        out += "\n\n";
+    }
 
     if (game_ea) {
         Entity* local_ctrl = game_ea->getLocalEnt();
@@ -3483,7 +3815,9 @@ void __cdecl StartHook(void*) {
     MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xd8bc90)));
     MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xd1d7f0), UpdateHealthbarState_hook, (PVOID*)&UpdateHealthbarState_orig));
     MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xd1d7f0)));
-    printf("hooked Component_1 transforms, weapon hardpoint fixes, shot/projectile impact & healthbar visibility hooks (+0xca7200, +0xd8bc90, +0xd1d7f0)\n");
+    MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0x1023e80), IsCriticalHitCapsule_hook, (PVOID*)&IsCriticalHitCapsule_orig));
+    MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0x1023e80)));
+    printf("hooked Component_1 transforms, weapon hardpoint fixes, shot/projectile impact & healthbar visibility hooks (+0xca7200, +0xd8bc90, +0xd1d7f0, +0x1023e80)\n");
 
     /*MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xbff460), testVIGSTickHook, (PVOID*)&VigsTickOrig));
     MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xbff460)));*/
@@ -3790,13 +4124,15 @@ int __stdcall VectoredExceptionHandler(EXCEPTION_POINTERS* exception) {
     }
     ShotDiagLogFmt("[CRASH_STACK] %s", stack_rvas.c_str());
 
-    // Immediately write full forensics + crash info to dummy_combat_diag.log
-    WeaponHardpointDiag::DumpDummyCombatForensics(GameEntityAdmin(), "AUTO_CRASH_VEH_DUMP");
-    if (FILE* f = fopen("dummy_combat_diag.log", "ab")) {
-        fprintf(f, "\n## 4. CRASH EXCEPTION DUMP\n```text\ngameRVA=+0x%llX modRVA=+0x%llX\nstack: %s\n%s\n```\n",
-            (unsigned long long)rva, (unsigned long long)mod_rva, stack_rvas.c_str(), fmt.c_str());
-        fflush(f);
-        fclose(f);
+    // Only write dummy_combat_diag.log from VEH when shots have been fired in this session (never overwrite combat logs on startup exceptions)
+    if (WeaponHardpointDiag::s_shot_raycast_calls > 0) {
+        WeaponHardpointDiag::DumpDummyCombatForensics(GameEntityAdmin(), "AUTO_CRASH_VEH_DUMP");
+        if (FILE* f = fopen("dummy_combat_diag.log", "ab")) {
+            fprintf(f, "\n## 4. CRASH EXCEPTION DUMP\n```text\ngameRVA=+0x%llX modRVA=+0x%llX\nstack: %s\n%s\n```\n",
+                (unsigned long long)rva, (unsigned long long)mod_rva, stack_rvas.c_str(), fmt.c_str());
+            fflush(f);
+            fclose(f);
+        }
     }
     return EXCEPTION_CONTINUE_SEARCH;
 }
