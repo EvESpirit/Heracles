@@ -272,6 +272,11 @@ void player_spawner::modify_ent(spawn_info info, Entity* ent) {
 				} else {
 					inst->execution_flags = (inst->execution_flags | 0x400009u) & ~(0x1004u | 0x200000u);
 				}
+				if (inst->graph) {
+					for (auto* node : inst->graph->m_nodes) {
+						if (node) node->m_serverOnly = 0;
+					}
+				}
 				inst->vfptr->RedoCheckIsAimEnt(inst);
 			}
 		}

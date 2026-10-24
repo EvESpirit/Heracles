@@ -43,7 +43,7 @@ public:
         return EmptyLog;
     }
     static const std::map<int, ScriptState>& GetScriptState(StatescriptInstance* ss) {
-        if (s_scriptStates.find(ss) != s_scriptStates.end())
+        if (s_subscriptions_or_states_valid(ss) && s_scriptStates.find(ss) != s_scriptStates.end())
             return s_scriptStates[ss];
         return EmptyScriptState;
     }
@@ -65,23 +65,27 @@ public:
         s_deletionSubs.push_back(func);
     }
 
-    // Compact H-key trace (hero swap anywhere): prints node entries / logical button
-    // notifications for a short window after StartTrace(), capped at kTraceMaxLines.
-    static constexpr int kTraceMaxLines = 100;
+    // Compact trace: prints node entries / logical button notifications and records them
+    // into s_trace_history for inclusion in dummy_combat_diag.log.
+    static constexpr int kTraceMaxLines = 250;
     static inline ULONGLONG s_trace_until = 0;
     static inline int s_trace_lines = 0;
+    static inline std::vector<std::string> s_trace_history{};
     static bool TraceActive() {
         return s_trace_until != 0 && s_trace_lines < kTraceMaxLines && GetTickCount64() < s_trace_until;
     }
-    static void StartTrace(ULONGLONG ms) {
+    static void StartTrace(ULONGLONG ms, const char* reason = "H_KEY") {
         s_trace_until = GetTickCount64() + ms;
         s_trace_lines = 0;
-        printf("[SSTrace] ---- H pressed, tracing %llums ----\n", ms);
+        char hdr[160];
+        snprintf(hdr, sizeof(hdr), "[SSTrace] ==== Trace Start (%s, %llums) ====", reason ? reason : "Manual", ms);
+        printf("%s\n", hdr);
+        if (s_trace_history.size() < 600) s_trace_history.emplace_back(hdr);
     }
     static const char* TraceNodeName(STUStatescriptBase* stu, char* buf, size_t sz) {
-        if (!stu || !stu->graph_node.base.vfptr) return "?";
+        if (!stu || IsBadReadPtr(stu, sizeof(STUStatescriptBase)) || !stu->graph_node.base.vfptr || IsBadReadPtr(stu->graph_node.base.vfptr, 8)) return "?";
         auto info = stu->graph_node.base.vfptr->GetSTUInfo();
-        if (!info) return "?";
+        if (!info || IsBadReadPtr(info, sizeof(STUInfo))) return "?";
         auto it = allmighty_hash_lib::hashes.find(info->name_hash);
         if (it != allmighty_hash_lib::hashes.end()) return it->second.c_str();
         snprintf(buf, sz, "0x%08x", (uint32)info->name_hash);
@@ -91,10 +95,14 @@ public:
     static inline __int64(__fastcall* TickScript_orig)(StatescriptInstance*, StatescriptNotification_Base*);
     static __int64 __fastcall TickScript(StatescriptInstance* ss, StatescriptNotification_Base* ss_e) {
         if (ss_e && ss_e->type != ETYPE_TIMER && ss_e->type != ETYPE_LIFETIME && TraceActive()) {
-            char tbuf[128];
+            char tbuf[128]{};
             ss_e->vfptr->ToString(ss_e, tbuf, 128);
             s_trace_lines++;
-            printf("[SSTrace] NOTIFY t=%d script=", (int)ss_e->type); printf("0x%llx inst=%hd : %s\n", (unsigned long long)ss->script_id, ss->instance_id, tbuf);
+            char lbuf[256];
+            snprintf(lbuf, sizeof(lbuf), "[SSTrace] NOTIFY t=%d script=0x%llx inst=%hd exec=0x%X : %s",
+                (int)ss_e->type, (unsigned long long)ss->script_id, ss->instance_id, ss->execution_flags, tbuf);
+            printf("%s\n", lbuf);
+            if (s_trace_history.size() < 600) s_trace_history.emplace_back(lbuf);
         }
         //printf("Tick [%hd %p] ", ss->instance_id, ss->script_id);
         if (s_subscriptions.find(ss) != s_subscriptions.end()) {
@@ -153,6 +161,9 @@ public:
         return result;
     }
 private:
+    static bool s_subscriptions_or_states_valid(StatescriptInstance* ss) {
+        return ss != nullptr;
+    }
     static inline void(__fastcall* StateEntry_orig)(StatescriptSyncMgr*, StatescriptInstance*, StatescriptState*);
     static inline void(__fastcall* StateFinish_orig)(StatescriptSyncMgr*, StatescriptInstance*, StatescriptState*);
     static inline void(__fastcall* ActionEntry_orig)(StatescriptSyncMgr*, StatescriptInstance*, StatescriptState*, int);
@@ -160,7 +171,6 @@ private:
     static inline void(__fastcall* Deallocate_orig)(StatescriptInstance*, char);
 
     static void __fastcall OnNodeStateEntry(StatescriptSyncMgr* inner, StatescriptInstance* ss, StatescriptState* istate) {
-        //printf("State Became Active: %hhd:%d\n", ss->instance_id, istate->idx_in_m_states);
         if (!ss->graph) {
             printf("Invalid state update from %p/%p/%p\n", inner, ss, istate);
             return;
@@ -170,15 +180,25 @@ private:
         state.is_finish_state = false;
         if (TraceActive()) {
             auto stu_state = ss->graph->STUFromState(istate);
-            char nbuf[16];
+            uintptr_t vt = (istate && !IsBadReadPtr(istate, 8)) ? *(uintptr_t*)istate : 0;
+            uintptr_t vt_rva = (vt >= globals::gameBase && vt < globals::gameBase + 0x3000000) ? (vt - globals::gameBase) : vt;
+            uint32_t stu_hash = (stu_state && stu_state->ss_base.graph_node.base.vfptr && stu_state->ss_base.graph_node.base.vfptr->GetSTUInfo())
+                ? stu_state->ss_base.graph_node.base.vfptr->GetSTUInfo()->name_hash : 0;
+            char nbuf[32]{};
             s_trace_lines++;
-            printf("[SSTrace] STATE+ script=0x%llx inst=%hd node=%d %s\n", (unsigned long long)ss->script_id, ss->instance_id,
-                stu_state ? stu_state->ss_base.idx_in_nodes : -1, stu_state ? TraceNodeName(&stu_state->ss_base, nbuf, sizeof(nbuf)) : "?");
+            char lbuf[256];
+            snprintf(lbuf, sizeof(lbuf), "[SSTrace] STATE+ script=0x%llx inst=%hd exec=0x%X node=%d(m_st=%d) %s(0x%08X,cO=%d,sO=%d) vt=+0x%llX flg=0x%X",
+                (unsigned long long)ss->script_id, ss->instance_id, ss->execution_flags,
+                stu_state ? stu_state->ss_base.idx_in_nodes : -1, istate ? istate->idx_in_m_states : -1,
+                stu_state ? TraceNodeName(&stu_state->ss_base, nbuf, sizeof(nbuf)) : "?", stu_hash,
+                stu_state ? (int)stu_state->ss_base.m_clientOnly : -1, stu_state ? (int)stu_state->ss_base.m_serverOnly : -1,
+                (unsigned long long)vt_rva, istate ? (uint32_t)istate->state_flags : 0);
+            printf("%s\n", lbuf);
+            if (s_trace_history.size() < 600) s_trace_history.emplace_back(lbuf);
         }
         StateEntry_orig(inner, ss, istate);
     }
     static void __fastcall OnNodeStateFinished(StatescriptSyncMgr* inner, StatescriptInstance* ss, StatescriptState* istate) {
-        //printf("State Became Inactive: %hhd:%d\n", ss->instance_id, istate->idx_in_m_states);
         if (!ss->graph) {
             printf("Invalid state update from %p/%p/%p\n", inner, ss, istate);
             return;
@@ -188,23 +208,50 @@ private:
         state.is_finish_state = true;
         if (TraceActive()) {
             auto stu_state = ss->graph->STUFromState(istate);
-            char nbuf[16];
+            uintptr_t vt = (istate && !IsBadReadPtr(istate, 8)) ? *(uintptr_t*)istate : 0;
+            uintptr_t vt_rva = (vt >= globals::gameBase && vt < globals::gameBase + 0x3000000) ? (vt - globals::gameBase) : vt;
+            uint32_t stu_hash = (stu_state && stu_state->ss_base.graph_node.base.vfptr && stu_state->ss_base.graph_node.base.vfptr->GetSTUInfo())
+                ? stu_state->ss_base.graph_node.base.vfptr->GetSTUInfo()->name_hash : 0;
+            char nbuf[32]{};
             s_trace_lines++;
-            printf("[SSTrace] STATE- script=0x%llx inst=%hd node=%d %s\n", (unsigned long long)ss->script_id, ss->instance_id,
-                stu_state ? stu_state->ss_base.idx_in_nodes : -1, stu_state ? TraceNodeName(&stu_state->ss_base, nbuf, sizeof(nbuf)) : "?");
+            char lbuf[256];
+            snprintf(lbuf, sizeof(lbuf), "[SSTrace] STATE- script=0x%llx inst=%hd exec=0x%X node=%d(m_st=%d) %s(0x%08X,cO=%d,sO=%d) vt=+0x%llX flg=0x%X",
+                (unsigned long long)ss->script_id, ss->instance_id, ss->execution_flags,
+                stu_state ? stu_state->ss_base.idx_in_nodes : -1, istate ? istate->idx_in_m_states : -1,
+                stu_state ? TraceNodeName(&stu_state->ss_base, nbuf, sizeof(nbuf)) : "?", stu_hash,
+                stu_state ? (int)stu_state->ss_base.m_clientOnly : -1, stu_state ? (int)stu_state->ss_base.m_serverOnly : -1,
+                (unsigned long long)vt_rva, istate ? (uint32_t)istate->state_flags : 0);
+            printf("%s\n", lbuf);
+            if (s_trace_history.size() < 600) s_trace_history.emplace_back(lbuf);
         }
         StateFinish_orig(inner, ss, istate);
     }
     static void __fastcall OnNodeActionEntry(StatescriptSyncMgr* inner, StatescriptInstance* ss, StatescriptState* istate, int idx_in_m_nodes) {
-        //printf("Action Became Active: %hhd:%d\n", ss->instance_id, idx_in_m_nodes);
         auto& state = s_scriptStates[ss][idx_in_m_nodes];
         state.change_timestamp = inner->cf_timestamp;
         state.is_finish_state = true;
         if (TraceActive() && ss->graph) {
             STUStatescriptBase* node = (idx_in_m_nodes >= 0 && idx_in_m_nodes < (int)ss->graph->m_nodes.count()) ? ss->graph->m_nodes.list()[idx_in_m_nodes] : nullptr;
-            char nbuf[16];
+            StatescriptAction* act = (ss->action_impl_list.ptr && idx_in_m_nodes >= 0 && idx_in_m_nodes < ss->action_impl_list.num)
+                ? ss->action_impl_list.ptr[idx_in_m_nodes] : nullptr;
+            uintptr_t avt = (act && !IsBadReadPtr(act, 8)) ? *(uintptr_t*)act : 0;
+            uintptr_t avt_rva = (avt >= globals::gameBase && avt < globals::gameBase + 0x3000000) ? (avt - globals::gameBase) : avt;
+            uintptr_t fnF8 = (avt && !IsBadReadPtr((const void*)(avt + 0xF8), 8)) ? *(uintptr_t*)(avt + 0xF8) : 0;
+            uintptr_t fnF8_rva = (fnF8 >= globals::gameBase && fnF8 < globals::gameBase + 0x3000000) ? (fnF8 - globals::gameBase) : fnF8;
+            uintptr_t fn100 = (avt && !IsBadReadPtr((const void*)(avt + 0x100), 8)) ? *(uintptr_t*)(avt + 0x100) : 0;
+            uintptr_t fn100_rva = (fn100 >= globals::gameBase && fn100 < globals::gameBase + 0x3000000) ? (fn100 - globals::gameBase) : fn100;
+            uint32_t stu_hash = (node && node->graph_node.base.vfptr && node->graph_node.base.vfptr->GetSTUInfo())
+                ? node->graph_node.base.vfptr->GetSTUInfo()->name_hash : 0;
+            char nbuf[32]{};
             s_trace_lines++;
-            printf("[SSTrace] ACTION script=0x%llx inst=%hd node=%d %s\n", (unsigned long long)ss->script_id, ss->instance_id, idx_in_m_nodes, TraceNodeName(node, nbuf, sizeof(nbuf)));
+            char lbuf[256];
+            snprintf(lbuf, sizeof(lbuf), "[SSTrace] ACTION script=0x%llx inst=%hd exec=0x%X node=%d %s(0x%08X,cO=%d,sO=%d) act_vt=+0x%llX(fnF8=+0x%llX,fn100=+0x%llX)",
+                (unsigned long long)ss->script_id, ss->instance_id, ss->execution_flags, idx_in_m_nodes,
+                TraceNodeName(node, nbuf, sizeof(nbuf)), stu_hash,
+                node ? (int)node->m_clientOnly : -1, node ? (int)node->m_serverOnly : -1,
+                (unsigned long long)avt_rva, (unsigned long long)fnF8_rva, (unsigned long long)fn100_rva);
+            printf("%s\n", lbuf);
+            if (s_trace_history.size() < 600) s_trace_history.emplace_back(lbuf);
         }
         ActionEntry_orig(inner, ss, istate, idx_in_m_nodes);
     }
@@ -215,20 +262,25 @@ private:
             if (ss != s_last_ss || stu->idx_in_nodes != s_last_idx) {
                 s_last_ss = ss;
                 s_last_idx = stu->idx_in_nodes;
-                char nbuf[16];
+                uint32_t stu_hash = (stu->graph_node.base.vfptr && stu->graph_node.base.vfptr->GetSTUInfo())
+                    ? stu->graph_node.base.vfptr->GetSTUInfo()->name_hash : 0;
+                char nbuf[32]{};
                 s_trace_lines++;
-                printf("[SSTrace] ENTRY script=0x%llx inst=%hd node=%d %s\n",
-                    (unsigned long long)ss->script_id, ss->instance_id, stu->idx_in_nodes, TraceNodeName(stu, nbuf, sizeof(nbuf)));
+                char lbuf[256];
+                snprintf(lbuf, sizeof(lbuf), "[SSTrace] ENTRY script=0x%llx inst=%hd exec=0x%X node=%d %s(0x%08X,cO=%d,sO=%d)",
+                    (unsigned long long)ss->script_id, ss->instance_id, ss->execution_flags, stu->idx_in_nodes,
+                    TraceNodeName(stu, nbuf, sizeof(nbuf)), stu_hash,
+                    (int)stu->m_clientOnly, (int)stu->m_serverOnly);
+                printf("%s\n", lbuf);
+                if (s_trace_history.size() < 600) s_trace_history.emplace_back(lbuf);
             }
         }
-        //printf("Took Node Entry: %hhd:%d\n", ss->instance_id, stu->idx_in_nodes);
         auto& state = s_scriptStates[ss][stu->idx_in_nodes];
         state.change_timestamp = ss->ss_inner->cf_timestamp;
         state.is_finish_state = true;
         return ScriptEntry_orig(a1, ss, stu);
     }
     static void __fastcall Deallocate(StatescriptInstance* script, char a2) {
-        //printf("Script %p (%d) deallocated\n", script->script_id, script->instance_id);
         s_subscriptions.erase(script);
         s_scriptStates.erase(script);
         for (auto it = s_deletionSubs.begin(); it != s_deletionSubs.end(); ) {
