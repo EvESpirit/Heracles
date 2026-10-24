@@ -2193,19 +2193,30 @@ typedef void(__fastcall* update_hb_vis_fn)(uintptr_t sys46);
 static update_hb_vis_fn UpdateHealthbarVisibility_orig = nullptr;
 static uint8_t s_last_logged_dummy_485 = 0xFF;
 static float s_last_logged_dummy_hp = -1.0f;
-static uintptr_t s_tracked_hb_subobjs[16] = {};
-static float s_tracked_hb_last_hp[16] = {};
+static constexpr int kMaxTrackedHbSubobjs = 64;
+static uintptr_t s_tracked_hb_subobjs[kMaxTrackedHbSubobjs] = {};
+static uint32_t s_tracked_hb_entids[kMaxTrackedHbSubobjs] = {};
+static float s_tracked_hb_last_hp[kMaxTrackedHbSubobjs] = {};
 
 static void TrackHealthbarSubobj(uintptr_t subobj) {
     if (!subobj) return;
     uintptr_t expected_vt = globals::gameBase + 0x15D1B08;
     if (SafeReadVal<uintptr_t>(subobj) != expected_vt) return;
-    for (int i = 0; i < 16; i++) {
+    for (int i = 0; i < kMaxTrackedHbSubobjs; i++) {
         if (s_tracked_hb_subobjs[i] == subobj) return;
     }
-    for (int i = 0; i < 16; i++) {
+    for (int i = 0; i < kMaxTrackedHbSubobjs; i++) {
         if (!s_tracked_hb_subobjs[i] || SafeReadVal<uintptr_t>(s_tracked_hb_subobjs[i]) != expected_vt) {
             s_tracked_hb_subobjs[i] = subobj;
+            s_tracked_hb_entids[i] = 0;
+            s_tracked_hb_last_hp[i] = -1.0f;
+            return;
+        }
+    }
+    for (int i = 0; i < kMaxTrackedHbSubobjs; i++) {
+        if (SafeReadVal<uint32_t>(s_tracked_hb_subobjs[i] + 0x10) == 0) {
+            s_tracked_hb_subobjs[i] = subobj;
+            s_tracked_hb_entids[i] = 0;
             s_tracked_hb_last_hp[i] = -1.0f;
             return;
         }
@@ -2217,22 +2228,252 @@ static void NotifyTrackedHealthbarViewModels(uint32_t target_entid, Component_28
     uintptr_t expected_sub_vt = globals::gameBase + 0x15D1B08;
     uintptr_t expected_vm_vt = globals::gameBase + 0x15D1B20;
     auto on_c28_changed = (void(__fastcall*)(Component_28_STUHealthComponent*, uintptr_t, uint8_t, uintptr_t))(globals::gameBase + 0xD1D6F0);
-    for (int i = 0; i < 16; i++) {
+    for (int i = 0; i < kMaxTrackedHbSubobjs; i++) {
         uintptr_t subobj = s_tracked_hb_subobjs[i];
         if (!subobj) continue;
         if (SafeReadVal<uintptr_t>(subobj) != expected_sub_vt) {
             s_tracked_hb_subobjs[i] = 0;
+            s_tracked_hb_entids[i] = 0;
             s_tracked_hb_last_hp[i] = -1.0f;
             continue;
         }
         uintptr_t vm = subobj - 0x3E0;
         if (SafeReadVal<uintptr_t>(vm) != expected_vm_vt) continue;
-        if (SafeReadVal<uint32_t>(subobj + 0x10) != target_entid) continue;
+        uint32_t bound_entid = SafeReadVal<uint32_t>(subobj + 0x10);
+        if (bound_entid != target_entid) continue;
+        if (s_tracked_hb_entids[i] != target_entid) {
+            s_tracked_hb_entids[i] = target_entid;
+            s_tracked_hb_last_hp[i] = -1.0f;
+        }
         float vm_cached_hp = SafeReadVal<float>(subobj + 0x14);
         if (fabsf(s_tracked_hb_last_hp[i] - cur_hp) > 0.01f || fabsf(vm_cached_hp - cur_hp) > 0.01f) {
             s_tracked_hb_last_hp[i] = cur_hp;
             on_c28_changed(target_c28, 0, 0x28, vm);
         }
+    }
+}
+
+static void TriggerHeroDeathScream(EntityAdminBase* ea, Entity* victim_mdl, uint32_t attacker_entid) {
+    if (!ea || !victim_mdl) return;
+    STUBase<>* vs_stu = nullptr;
+    // +0xC4070F..+0xC40798: STUVoiceSetComponent is Component_46 (0x46, bit 6 of bitmask_A0, key 0x528F2F94), NOT 0x40!
+    if (ComponentBase* c46 = victim_mdl->getById(0x46)) {
+        auto get_comp_stu = (STUBase<>*(__fastcall*)(ComponentBase*))(globals::gameBase + 0xF193A0);
+        STUBase<>* stu_vc = get_comp_stu(c46);
+        uint8_t b30 = SafeReadVal<uint8_t>((uintptr_t)c46 + 0x30);
+        if (b30 != 0 || (stu_vc && !IsBadReadPtr(stu_vc, 0x18))) {
+            // +0x1019430(Component_46*): native non-obfuscated getter returning STUVoiceSet* directly
+            // (Only call when b30 != 0 or stu_vc != nullptr, because +0x101944A dereferences [rax+0x10] without a null check!)
+            auto get_voiceset_stu = (STUBase<>*(__fastcall*)(ComponentBase*))(globals::gameBase + 0x1019430);
+            vs_stu = get_voiceset_stu(c46);
+        }
+        if ((!vs_stu || IsBadReadPtr(vs_stu, 0x58)) && stu_vc && !IsBadReadPtr(stu_vc, 0x18)) {
+            auto* vd_ref = (STUResourceReference*)((uintptr_t)stu_vc + 0x08);
+            vs_stu = vd_ref->get_STU();
+            if (!vs_stu && vd_ref->resource_id) vs_stu = stu_resources::GetByID(vd_ref->resource_id);
+        }
+    }
+    if (!vs_stu || IsBadReadPtr(vs_stu, 0x58)) {
+        ShotDiagLogFmt("[DEATH_SCREAM] victim=0x%X ABORT: no STUVoiceSet on Component_46", victim_mdl->entity_id);
+        return;
+    }
+
+    struct DeadStimGroup {
+        uint64_t stim_id = 0;
+        STUBase<>* stim_stu = nullptr;
+        uint32_t u7c = 0;
+        std::vector<uint64_t> uncond_vls;
+        std::vector<uint64_t> cond_vls;
+    };
+    std::vector<DeadStimGroup> groups;
+
+    // +0x104D191..+0x104D1C2: STUBullshitListFull<STUVoiceLineInstance*> at vs_stu + 0x48 (flag at +0x50)
+    uintptr_t bs_ptr = SafeReadVal<uintptr_t>((uintptr_t)vs_stu + 0x48);
+    uint64_t bs_flag = SafeReadVal<uint64_t>((uintptr_t)vs_stu + 0x50);
+    int32_t vl_count = 0;
+    uintptr_t vl_arr = 0;
+    if (bs_ptr && !IsBadReadPtr((const void*)bs_ptr, 0x10)) {
+        if (bs_flag == 1) {
+            vl_arr = SafeReadVal<uintptr_t>(bs_ptr + 0x00);
+            vl_count = SafeReadVal<int32_t>(bs_ptr + 0x08);
+        } else {
+            vl_count = SafeReadVal<int32_t>(bs_ptr + 0x00);
+            vl_arr = SafeReadVal<uintptr_t>(bs_ptr + 0x08);
+        }
+    }
+    if (vl_arr && vl_count > 0 && vl_count < 4096 && !IsBadReadPtr((const void*)vl_arr, (size_t)vl_count * 8)) {
+        for (int32_t i = 0; i < vl_count; i++) {
+            uintptr_t inst = SafeReadVal<uintptr_t>(vl_arr + (uintptr_t)i * 8);
+            if (!inst || IsBadReadPtr((const void*)inst, 0x30)) continue;
+            // Verify STUVoiceLineInstance has audio data at +0x28 (checked by +0x104CE30)
+            if (SafeReadVal<uintptr_t>(inst + 0x28) == 0) continue;
+            // STUResourceReference for m_voiceLine at inst + 0x08 (resource_id at inst + 0x10)
+            auto* vl_ref = (STUResourceReference*)(inst + 0x08);
+            uint64_t vl_id = SafeReadVal<uint64_t>(inst + 0x10);
+            if (!vl_id) continue;
+            STUBase<>* vl_stu = vl_ref->get_STU();
+            if (!vl_stu) vl_stu = stu_resources::GetByID(vl_id);
+            if (!vl_stu || IsBadReadPtr(vl_stu, 0x40)) continue;
+
+            // STUResourceReference for STUVoiceStimulus at vl_stu + 0x18 (resource_id at vl_stu + 0x20)
+            auto* stim_ref = (STUResourceReference*)((uintptr_t)vl_stu + 0x18);
+            uint64_t stim_id = SafeReadVal<uint64_t>((uintptr_t)vl_stu + 0x20);
+            uintptr_t crit_ptr = SafeReadVal<uintptr_t>((uintptr_t)vl_stu + 0x38);
+            if (!stim_id) continue;
+            STUBase<>* stim_stu = stim_ref->get_STU();
+            if (!stim_stu) stim_stu = stu_resources::GetByID(stim_id);
+            if (!stim_stu || IsBadReadPtr(stim_stu, 0x94)) continue;
+
+            // +0xC40835 in PlayVoice (+0xC40350): byte ptr [stim_stu + 0x90] != 0 allows playing while dead!
+            uint8_t allow_dead = SafeReadVal<uint8_t>((uintptr_t)stim_stu + 0x90);
+            if (!allow_dead) continue;
+            // +0xC40858..+0xC408B2 in PlayVoice (+0xC40350): dword ptr [stim_stu + 0x7C] is audience team filter:
+            //   0 = ally-only, 1 = enemy-only, >=2 = audible to both teams
+            uint32_t u7c = SafeReadVal<uint32_t>((uintptr_t)stim_stu + 0x7C);
+
+            DeadStimGroup* grp = nullptr;
+            for (auto& g : groups) {
+                if (g.stim_id == stim_id) { grp = &g; break; }
+            }
+            if (!grp) {
+                groups.push_back(DeadStimGroup{ stim_id, stim_stu, u7c, {}, {} });
+                grp = &groups.back();
+            }
+            if (crit_ptr == 0) grp->uncond_vls.push_back(vl_id);
+            else grp->cond_vls.push_back(vl_id);
+        }
+    }
+
+    if (groups.empty()) {
+        ShotDiagLogFmt("[DEATH_SCREAM] victim=0x%X ABORT: no STUVoiceStimulus with byte_90 != 0 (vl_count=%d)", victim_mdl->entity_id, vl_count);
+        return;
+    }
+
+    // Sort candidate death stimuli:
+    //   1. Prefer u7c >= 2 (audible to both teams) over u7c == 1 (enemy-only) over u7c == 0 (ally-only)
+    //   2. Prefer more unconditional voice lines (normal combat death scream)
+    auto tier_of = [](uint32_t u7c) -> int {
+        if (u7c >= 2) return 2;
+        if (u7c == 1) return 1;
+        return 0;
+    };
+    std::sort(groups.begin(), groups.end(), [&](const DeadStimGroup& a, const DeadStimGroup& b) {
+        int ta = tier_of(a.u7c), tb = tier_of(b.u7c);
+        if (ta != tb) return ta > tb;
+        if (a.uncond_vls.size() != b.uncond_vls.size()) return a.uncond_vls.size() > b.uncond_vls.size();
+        return a.cond_vls.size() > b.cond_vls.size();
+    });
+
+    static uint32_t s_scream_rng = 0x13579BDFu;
+    s_scream_rng = s_scream_rng * 1664525u + 1013904223u;
+
+    VoiceSystem* voicesys = GetVoiceSystem(ea);
+    uint8_t play_ret = 0;
+    uint64_t used_stim = 0;
+    uint64_t used_vl = 0;
+    uint32_t used_u7c = 0;
+    size_t used_uncond = 0, used_cond = 0;
+
+    if (voicesys && voicesys->vfptr && voicesys->vfptr->PlayVoice) {
+        // +0xC40935 calls +0xC40950(voicesys, speaking_ent_id, new_handle) to stop prior active voice lines on speaking_ent.
+        // Calling it with 0xFFFFFFFFu BEFORE PlayVoice clears any active hurt grunt on victim_mdl so +0xC408DD concurrency checks pass!
+        auto stop_ent_voice = (void(__fastcall*)(VoiceSystem*, uint32_t, uint32_t))(globals::gameBase + 0xC40950);
+        stop_ent_voice(voicesys, victim_mdl->entity_id, 0xFFFFFFFFu);
+
+        auto play_fn = (uint8_t(__fastcall*)(VoiceSystem*, VoiceSystem_PlayVoice*))voicesys->vfptr->PlayVoice;
+        for (const auto& g : groups) {
+            const auto& pool = !g.uncond_vls.empty() ? g.uncond_vls : g.cond_vls;
+            if (pool.empty()) continue;
+            uint64_t chosen_vl = pool[s_scream_rng % pool.size()];
+            used_stim = g.stim_id;
+            used_vl = chosen_vl;
+            used_u7c = g.u7c;
+            used_uncond = g.uncond_vls.size();
+            used_cond = g.cond_vls.size();
+
+            VoiceSystem_PlayVoice vp{};
+            vp.entity_1 = victim_mdl->entity_id;
+            vp.entity_2 = victim_mdl->entity_id;
+            vp.instigator_ent = victim_mdl->entity_id;
+            vp.voice_stimulus = g.stim_id;
+            vp.voice_line = chosen_vl;
+            vp.field_20 = 0;
+            vp.field_21 = 0;
+            play_ret = play_fn(voicesys, &vp);
+            if (!play_ret && attacker_entid != 0) {
+                // Retry with LocalPlayer attacker_entid as instigator (+0xC40697 sets sil=1 to bypass team filter at +0xC40858)
+                vp.instigator_ent = attacker_entid;
+                play_ret = play_fn(voicesys, &vp);
+            }
+            if (play_ret) break;
+        }
+    }
+    ShotDiagLogFmt("[DEATH_SCREAM] victim=0x%X groups=%zu stim=0x%llX u7c=%u vl=0x%llX (uncond=%zu,cond=%zu) -> play_ret=%u",
+        victim_mdl->entity_id, groups.size(),
+        (unsigned long long)used_stim, used_u7c, (unsigned long long)used_vl,
+        used_uncond, used_cond, play_ret);
+}
+
+// +0x1027940: GetEntityDisplayName(Entity* ent, uint8_t sanitize_flag, char* out_buf)
+// Offline, *(uintptr_t*)(gameBase + 0x1854DE0) (BNet player-name callback) is null or fails for locally spawned dummies,
+// causing +0x1027940 to write "" into out_buf (0x40 bytes). Hooking +0x1027940 populates out_buf from the entity's
+// STUHero display name (0xcd16baa, e.g. "Tracer", "Reinhardt") when out_buf[0] == '\0'.
+typedef void(__fastcall* get_entity_display_name_fn)(Entity* ent, uint8_t sanitize_flag, char* out_buf);
+static get_entity_display_name_fn GetEntityDisplayName_orig = nullptr;
+
+static void __fastcall GetEntityDisplayName_hook(Entity* ent, uint8_t sanitize_flag, char* out_buf) {
+    GetEntityDisplayName_orig(ent, sanitize_flag, out_buf);
+    if (!ent || !out_buf || out_buf[0] != '\0') return;
+
+    EntityAdminBase* ea = GameEntityAdmin();
+    uint64_t heroid = 0;
+    uint64_t model_res_id = ent->resload_entry ? (uint64_t)ent->resload_entry->resource_id : 0;
+
+    if (auto* c3f = ent->getById<Component_3F_PlayerInfo>(0x3F)) {
+        heroid = (uint64_t)c3f->selected_heroid;
+        if (heroid == 0 && ea) {
+            if (auto* c20 = ent->getById<Component_20_ModelReference>(0x20)) {
+                uint32_t mdl_id = c20->cam_attach_entid ? c20->cam_attach_entid : c20->aim_entid;
+                if (Entity* mdl_ent = mdl_id ? ea->getEntById(mdl_id) : nullptr) {
+                    if (mdl_ent->resload_entry) model_res_id = (uint64_t)mdl_ent->resload_entry->resource_id;
+                }
+            }
+        }
+    } else if (auto* c1f = ent->getById<Component_1F_Backref>(0x1F)) {
+        if (c1f->backref_entid && ea) {
+            if (Entity* ctrl_ent = ea->getEntById(c1f->backref_entid)) {
+                if (auto* c3f = ctrl_ent->getById<Component_3F_PlayerInfo>(0x3F)) {
+                    heroid = (uint64_t)c3f->selected_heroid;
+                }
+            }
+        }
+    }
+
+    if (heroid == 0 && model_res_id != 0) {
+        for (auto& hero : stu_resources::GetIfAssignableTo(stringHash("STUHero"))) {
+            auto stu = hero.second->to_editable();
+            auto* ent_ref = stu.get_argument_resource("m_gameplayEntity");
+            if (ent_ref && (uint64_t)ent_ref->resource_id == model_res_id) {
+                heroid = (uint64_t)hero.first;
+                break;
+            }
+        }
+    }
+
+    const char* hero_name = nullptr;
+    if (heroid != 0) {
+        if (auto* hero_stu = stu_resources::GetByID((__int64)heroid)) {
+            auto stu = hero_stu->to_editable();
+            if (auto* name_ref = stu.get_argument_resource(0xcd16baa)) {
+                hero_name = name_ref->get_UXDisplayString();
+            }
+        }
+    }
+
+    if (hero_name && hero_name[0] != '\0') {
+        strncpy_s(out_buf, 0x40, hero_name, _TRUNCATE);
+    } else {
+        strncpy_s(out_buf, 0x40, "BOT", _TRUNCATE);
     }
 }
 
@@ -2289,6 +2530,20 @@ void __fastcall UpdateHealthbarVisibility_hook(uintptr_t sys46) {
                     ShotDiagLogFmt("[DMG_PKT (+0xCA7860)] target=0x%X dmg=%d flags=0x%X -> HitPip(hit=%u,crit=%u,kill=%u)",
                         local_pkts[i].target_entid, local_pkts[i].damage_int, local_pkts[i].flags,
                         pip_hit, pip_crit, pip_kill);
+                    if ((local_pkts[i].flags & 2) != 0) {
+                        if (Entity* victim_ent = ea->getEntById(local_pkts[i].target_entid)) {
+                            TriggerHeroDeathScream(ea, victim_ent, local_mdl_id);
+                        }
+                        // Dispatch native Elimination Banner ("ELIMINATED [HERO] 100") & 2D Elimination Audio Sting via +0xCA7EE0
+                        auto on_elim_banner = (int(__fastcall*)(uintptr_t, __int64, const uint8_t*))(globals::gameBase + 0xCA7EE0);
+                        uint8_t elim_pkt[0x80] = {};
+                        *(uint64_t*)(elim_pkt + 0x68) = 0ULL; // label_res_id (unused in Branch B)
+                        *(uint32_t*)(elim_pkt + 0x70) = *(const uint32_t*)(globals::gameBase + 0x185A0C8); // INVALID_ENTITY_ID -> Branch B (Solo Elimination)
+                        *(uint32_t*)(elim_pkt + 0x74) = local_pkts[i].target_entid; // victim_entid
+                        *(uint16_t*)(elim_pkt + 0x78) = 100; // fire_points ("100")
+                        int elim_rc = on_elim_banner(sys46, 0, elim_pkt);
+                        ShotDiagLogFmt("[ELIM_BANNER (+0xCA7EE0)] victim=0x%X points=100 rc=%d", local_pkts[i].target_entid, elim_rc);
+                    }
                 }
             }
             if (snap_entid != 0 && s_alive_hit_snapshot.empty()) {
@@ -2301,6 +2556,25 @@ void __fastcall UpdateHealthbarVisibility_hook(uintptr_t sys46) {
                 }
             }
 
+            // Clean up deleted entities from local_c2f + 0x15E0 ring buffer
+            // IMPORTANT (+0xCA7414..+0xCA741D & +0xCA748C..+0xCA748F):
+            // Never zero entry->timestamp (+0x04) on an active ring buffer, because +0xCA741D ('jbe +0xCA7555')
+            // aborts the ENTIRE ring-buffer scan on the first expired timestamp!
+            // Instead, zero entry->target_entid (+0x00) while preserving entry->timestamp (+0x04), which causes
+            // +0xCA748F ('je +0xCA753B') to skip that slot and continue scanning the rest of the ring buffer!
+            uintptr_t ring = (uintptr_t)local_c2f + 0x15E0;
+            int32_t cap = local_c2f->field_17E0 > 0 ? local_c2f->field_17E0 : 0x20;
+            if (cap > 0x20) cap = 0x20;
+            for (int32_t idx = 0; idx < cap; idx++) {
+                uintptr_t entry = ring + (uintptr_t)idx * 0x10;
+                uint32_t eid = *(uint32_t*)(entry + 0x00);
+                if (eid != 0 && !ea->getEntById(eid)) {
+                    *(uint32_t*)(entry + 0x00) = 0;
+                    *(uint8_t*)(sys46 + 0x99) = 1;
+                }
+            }
+
+            bool any_show_hb = false;
             for (Entity* ent : *ea) {
                 if (!ent || ent->entity_id == ea->local_entid || ent->entity_id == local_mdl_id) continue;
                 if (!ent->hasComponent(0x15) || !ent->hasComponent(0x28)) continue;
@@ -2309,14 +2583,13 @@ void __fastcall UpdateHealthbarVisibility_hook(uintptr_t sys46) {
                 float ent_cur_hp = c28->CalcTotalCurrentHealth();
                 float ent_max_hp = c28->CalcTotalMaxHealth();
                 bool ent_show_hb = (ent_cur_hp > 0.0f && ent_max_hp > 0.0f && ent_cur_hp < ent_max_hp);
-                if (!ent_show_hb) {
-                    uintptr_t ring = (uintptr_t)local_c2f + 0x15E0;
-                    int32_t cap = local_c2f->field_17E0 > 0 ? local_c2f->field_17E0 : 0x20;
-                    if (cap > 0x20) cap = 0x20;
+                if (ent_show_hb) {
+                    any_show_hb = true;
+                } else {
                     for (int32_t idx = 0; idx < cap; idx++) {
                         uintptr_t entry = ring + (uintptr_t)idx * 0x10;
-                        if (*(uint32_t*)(entry + 0x00) == ent->entity_id && *(uint32_t*)(entry + 0x04) != 0) {
-                            *(uint32_t*)(entry + 0x04) = 0;
+                        if (*(uint32_t*)(entry + 0x00) == ent->entity_id) {
+                            *(uint32_t*)(entry + 0x00) = 0;
                             *(uint8_t*)(sys46 + 0x99) = 1;
                         }
                     }
@@ -2328,6 +2601,16 @@ void __fastcall UpdateHealthbarVisibility_hook(uintptr_t sys46) {
                     max_hp = ent_max_hp;
                     should_show_hb = ent_show_hb;
                 }
+            }
+            if (!any_show_hb && local_c2f->field_17F4 > 0) {
+                for (int32_t idx = 0; idx < cap; idx++) {
+                    uintptr_t entry = ring + (uintptr_t)idx * 0x10;
+                    *(uint32_t*)(entry + 0x00) = 0;
+                    *(uint32_t*)(entry + 0x04) = 0;
+                }
+                local_c2f->field_17F0 = 0;
+                local_c2f->field_17F4 = 0;
+                *(uint8_t*)(sys46 + 0x99) = 1;
             }
         }
     }
@@ -3413,6 +3696,96 @@ static void AppendHeroEntityForensics(std::string& out, const char* label, Entit
         }
     }
 
+    if (ComponentBase* c46 = mdl_ent->getById(0x46)) {
+        auto get_comp_stu = (STUBase<>*(__fastcall*)(ComponentBase*))(globals::gameBase + 0xF193A0);
+        STUBase<>* stu_vc = get_comp_stu(c46);
+        uint8_t b30 = SafeReadVal<uint8_t>((uintptr_t)c46 + 0x30);
+        STUBase<>* vs_stu = nullptr;
+        if (b30 != 0 || (stu_vc && !IsBadReadPtr(stu_vc, 0x18))) {
+            auto get_voiceset_stu = (STUBase<>*(__fastcall*)(ComponentBase*))(globals::gameBase + 0x1019430);
+            vs_stu = get_voiceset_stu(c46);
+        }
+        if ((!vs_stu || IsBadReadPtr(vs_stu, 0x58)) && stu_vc && !IsBadReadPtr(stu_vc, 0x18)) {
+            auto* vd_ref = (STUResourceReference*)((uintptr_t)stu_vc + 0x08);
+            vs_stu = vd_ref->get_STU();
+            if (!vs_stu && vd_ref->resource_id) vs_stu = stu_resources::GetByID(vd_ref->resource_id);
+        }
+        if (vs_stu && !IsBadReadPtr(vs_stu, 0x58)) {
+            uintptr_t bs_ptr = SafeReadVal<uintptr_t>((uintptr_t)vs_stu + 0x48);
+            uint64_t bs_flag = SafeReadVal<uint64_t>((uintptr_t)vs_stu + 0x50);
+            int32_t vl_count = 0;
+            uintptr_t vl_arr = 0;
+            if (bs_ptr && !IsBadReadPtr((const void*)bs_ptr, 0x10)) {
+                if (bs_flag == 1) {
+                    vl_arr = SafeReadVal<uintptr_t>(bs_ptr + 0x00);
+                    vl_count = SafeReadVal<int32_t>(bs_ptr + 0x08);
+                } else {
+                    vl_count = SafeReadVal<int32_t>(bs_ptr + 0x00);
+                    vl_arr = SafeReadVal<uintptr_t>(bs_ptr + 0x08);
+                }
+            }
+            if (vl_arr && vl_count > 0 && vl_count < 4096 && !IsBadReadPtr((const void*)vl_arr, (size_t)vl_count * 8)) {
+                struct StimForensic {
+                    uint64_t stim_id = 0;
+                    STUBase<>* stim_stu = nullptr;
+                    int uncond_cnt = 0;
+                    int cond_cnt = 0;
+                    uint64_t sample_vl = 0;
+                };
+                std::vector<StimForensic> dead_stims;
+                int total_vls = 0;
+                for (int32_t i = 0; i < vl_count; i++) {
+                    uintptr_t inst = SafeReadVal<uintptr_t>(vl_arr + (uintptr_t)i * 8);
+                    if (!inst || IsBadReadPtr((const void*)inst, 0x30)) continue;
+                    total_vls++;
+                    if (SafeReadVal<uintptr_t>(inst + 0x28) == 0) continue;
+                    auto* vl_ref = (STUResourceReference*)(inst + 0x08);
+                    uint64_t vl_id = SafeReadVal<uint64_t>(inst + 0x10);
+                    if (!vl_id) continue;
+                    STUBase<>* vl_stu = vl_ref->get_STU();
+                    if (!vl_stu) vl_stu = stu_resources::GetByID(vl_id);
+                    if (!vl_stu || IsBadReadPtr(vl_stu, 0x40)) continue;
+                    auto* stim_ref = (STUResourceReference*)((uintptr_t)vl_stu + 0x18);
+                    uint64_t stim_id = SafeReadVal<uint64_t>((uintptr_t)vl_stu + 0x20);
+                    uintptr_t crit_ptr = SafeReadVal<uintptr_t>((uintptr_t)vl_stu + 0x38);
+                    if (!stim_id) continue;
+                    STUBase<>* stim_stu = stim_ref->get_STU();
+                    if (!stim_stu) stim_stu = stu_resources::GetByID(stim_id);
+                    if (!stim_stu || IsBadReadPtr(stim_stu, 0x94)) continue;
+                    if (SafeReadVal<uint8_t>((uintptr_t)stim_stu + 0x90) != 0) {
+                        StimForensic* sf = nullptr;
+                        for (auto& ds : dead_stims) {
+                            if (ds.stim_id == stim_id) { sf = &ds; break; }
+                        }
+                        if (!sf) {
+                            dead_stims.push_back(StimForensic{ stim_id, stim_stu, 0, 0, vl_id });
+                            sf = &dead_stims.back();
+                        }
+                        if (crit_ptr == 0) {
+                            sf->uncond_cnt++;
+                            sf->sample_vl = vl_id;
+                        } else {
+                            sf->cond_cnt++;
+                        }
+                    }
+                }
+                out.append(std::format("    - **`STUVoiceSet` (`0x{:X}`, total_vls={}, allow_dead_stims={})**:\n",
+                    (unsigned long long)vs_stu, total_vls, dead_stims.size()));
+                for (const auto& ds : dead_stims) {
+                    uint32_t f68 = SafeReadVal<uint32_t>((uintptr_t)ds.stim_stu + 0x68);
+                    uint32_t u7c = SafeReadVal<uint32_t>((uintptr_t)ds.stim_stu + 0x7C);
+                    uint8_t b90 = SafeReadVal<uint8_t>((uintptr_t)ds.stim_stu + 0x90);
+                    uint8_t b91 = SafeReadVal<uint8_t>((uintptr_t)ds.stim_stu + 0x91);
+                    uint8_t b92 = SafeReadVal<uint8_t>((uintptr_t)ds.stim_stu + 0x92);
+                    out.append(std::format("      - DeadStim `0x{:X}` (`0x{:X}`): uncond={}, cond={}, sample_vl=`0x{:X}`, f68=`0x{:X}`, u7c=`{}`, b90/91/92=`{}/{}/{}`\n",
+                        (unsigned long long)ds.stim_id, (unsigned long long)ds.stim_stu,
+                        ds.uncond_cnt, ds.cond_cnt, (unsigned long long)ds.sample_vl,
+                        f68, u7c, b90, b91, b92));
+                }
+            }
+        }
+    }
+
     if (auto* c10 = mdl_ent->getById<Component_10_FilterBits>(0x10)) {
         out.append(std::format("  - **Model `Component_10_FilterBits` (`0x{:X}`)**: `f20=0x{:X}`, `f48=0x{:X}`, `f8C=0x{:X}`, `f8E=0x{:X}`, `pre(+0x90)=0x{:016X}`, `final(+0x98)=0x{:016X}`\n",
             (unsigned long long)c10, c10->field_20, c10->field_48, (uint16_t)c10->field_8C, (uint8_t)c10->field_8E,
@@ -3817,7 +4190,9 @@ void __cdecl StartHook(void*) {
     MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xd1d7f0)));
     MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0x1023e80), IsCriticalHitCapsule_hook, (PVOID*)&IsCriticalHitCapsule_orig));
     MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0x1023e80)));
-    printf("hooked Component_1 transforms, weapon hardpoint fixes, shot/projectile impact & healthbar visibility hooks (+0xca7200, +0xd8bc90, +0xd1d7f0, +0x1023e80)\n");
+    MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0x1027940), GetEntityDisplayName_hook, (PVOID*)&GetEntityDisplayName_orig));
+    MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0x1027940)));
+    printf("hooked Component_1 transforms, weapon hardpoint fixes, shot/projectile impact & healthbar visibility hooks (+0xca7200, +0xd8bc90, +0xd1d7f0, +0x1023e80, +0x1027940)\n");
 
     /*MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xbff460), testVIGSTickHook, (PVOID*)&VigsTickOrig));
     MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xbff460)));*/
@@ -4080,6 +4455,11 @@ int __stdcall VectoredExceptionHandler(EXCEPTION_POINTERS* exception) {
         if (exception->ContextRecord->Rip >= globals::modBase && exception->ContextRecord->Rip < globals::modBase + globals::modSize) {
             return EXCEPTION_CONTINUE_SEARCH;
         }
+        if (exception->ExceptionRecord->NumberParameters >= 2 &&
+            exception->ExceptionRecord->ExceptionInformation[1] >= globals::modBase &&
+            exception->ExceptionRecord->ExceptionInformation[1] < globals::modBase + globals::modSize) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
     }
     if (exception->ExceptionRecord->ExceptionCode == 0x40010006 ||
         exception->ExceptionRecord->ExceptionCode == 0x406D1388 ||
@@ -4125,7 +4505,16 @@ int __stdcall VectoredExceptionHandler(EXCEPTION_POINTERS* exception) {
     ShotDiagLogFmt("[CRASH_STACK] %s", stack_rvas.c_str());
 
     // Only write dummy_combat_diag.log from VEH when shots have been fired in this session (never overwrite combat logs on startup exceptions)
-    if (WeaponHardpointDiag::s_shot_raycast_calls > 0) {
+    static bool s_in_veh_dump = false;
+    if (WeaponHardpointDiag::s_shot_raycast_calls > 0 && !s_in_veh_dump) {
+        s_in_veh_dump = true;
+        // Write raw crash exception info FIRST before calling DumpDummyCombatForensics so recursive faults can never lose the crash log
+        if (FILE* f = fopen("dummy_combat_diag.log", "wb")) {
+            fprintf(f, "## CRASH EXCEPTION DUMP (PRE-FORENSICS)\n```text\ngameRVA=+0x%llX modRVA=+0x%llX\nstack: %s\n%s\n```\n",
+                (unsigned long long)rva, (unsigned long long)mod_rva, stack_rvas.c_str(), fmt.c_str());
+            fflush(f);
+            fclose(f);
+        }
         WeaponHardpointDiag::DumpDummyCombatForensics(GameEntityAdmin(), "AUTO_CRASH_VEH_DUMP");
         if (FILE* f = fopen("dummy_combat_diag.log", "ab")) {
             fprintf(f, "\n## 4. CRASH EXCEPTION DUMP\n```text\ngameRVA=+0x%llX modRVA=+0x%llX\nstack: %s\n%s\n```\n",
@@ -4133,6 +4522,7 @@ int __stdcall VectoredExceptionHandler(EXCEPTION_POINTERS* exception) {
             fflush(f);
             fclose(f);
         }
+        s_in_veh_dump = false;
     }
     return EXCEPTION_CONTINUE_SEARCH;
 }
