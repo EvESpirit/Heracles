@@ -101,8 +101,13 @@ void entity_window::render() {
 				if (imgui_helpers::beginTable("Entities", { "ID", "Addr", "Components" })) {
 					EntityListItem* entities = _entity_admin->entity_list_array;
 					for (int i = 0; i < 0x1000; i++) {
-						if (entities->is_possessed_by_a_demon_ && entities->entity_im->ent->parent == nullptr) {
-							render_entity(entities->entity_im->ent);
+						if (entities->entity_im) {
+							for (int j = 0; j < entities->is_possessed_by_a_demon_; j++) {
+								Entity* ent = entities->entity_im[j].ent;
+								if (ent && ent->parent == nullptr) {
+									render_entity(ent);
+								}
+							}
 						}
 						entities++;
 					}

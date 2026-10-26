@@ -452,6 +452,43 @@ class player_spawner_deluxe : public window {
 						local_mdl_id = pet->cam_attach_entid ? pet->cam_attach_entid : (pet->aim_entid ? pet->aim_entid : pet->movement_attach_entid);
 					}
 				}
+				if (Entity* local_mdl = local_mdl_id ? ea->getEntById(local_mdl_id) : nullptr) {
+					if (auto* lc28 = local_mdl->getById<Component_28_STUHealthComponent>(0x28)) {
+						float lcur = lc28->CalcTotalCurrentHealth();
+						float lmax = lc28->CalcTotalMaxHealth();
+						ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.5f, 1.0f), "Local Hero (0x%X) HP: %.0f / %.0f", local_mdl_id, lcur, lmax);
+						ImGui::SameLine();
+						if (ImGui::SmallButton("Self-Damage (-100 HP)")) {
+							float rem = (lcur > 125.0f) ? 100.0f : ((lcur > 25.0f) ? (lcur - 25.0f) : 0.0f);
+							HealthPart* pools[3] = { lc28->shield_health, lc28->armour_health, lc28->normal_health };
+							for (int p = 0; p < 3 && rem > 0.0f; p++) {
+								for (int i = 0; i < 0x10 && rem > 0.0f; i++) {
+									if (!pools[p][i].part_enabled || pools[p][i].curr_health <= 0.0f) continue;
+									if (pools[p][i].curr_health >= rem) {
+										pools[p][i].curr_health -= rem;
+										rem = 0.0f;
+									} else {
+										rem -= pools[p][i].curr_health;
+										pools[p][i].curr_health = 0.0f;
+									}
+								}
+							}
+							sync_entity_health_varbag(local_mdl);
+						}
+						ImGui::SameLine();
+						if (ImGui::SmallButton("Full Heal Local Hero")) {
+							HealthPart* pools[3] = { lc28->normal_health, lc28->armour_health, lc28->shield_health };
+							for (int p = 0; p < 3; p++) {
+								for (int i = 0; i < 0x10; i++) {
+									if (pools[p][i].part_enabled && pools[p][i].max_health > 0.0f) {
+										pools[p][i].curr_health = pools[p][i].max_health;
+									}
+								}
+							}
+							sync_entity_health_varbag(local_mdl);
+						}
+					}
+				}
 
 				int dummy_count = 0;
 				for (Entity* ent : *ea) {

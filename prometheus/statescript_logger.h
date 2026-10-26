@@ -169,6 +169,10 @@ private:
     static inline void(__fastcall* ActionEntry_orig)(StatescriptSyncMgr*, StatescriptInstance*, StatescriptState*, int);
     static inline char(__fastcall* ScriptEntry_orig)(__int64, StatescriptInstance*, STUStatescriptBase*);
     static inline void(__fastcall* Deallocate_orig)(StatescriptInstance*, char);
+public:
+    static inline void(*s_universal_state_entry_cb)(StatescriptSyncMgr*, StatescriptInstance*, StatescriptState*) = nullptr;
+    static inline void(*s_universal_state_exit_cb)(StatescriptSyncMgr*, StatescriptInstance*, StatescriptState*) = nullptr;
+private:
 
     static void __fastcall OnNodeStateEntry(StatescriptSyncMgr* inner, StatescriptInstance* ss, StatescriptState* istate) {
         if (!ss->graph) {
@@ -195,6 +199,9 @@ private:
                 (unsigned long long)vt_rva, istate ? (uint32_t)istate->state_flags : 0);
             printf("%s\n", lbuf);
             if (s_trace_history.size() < 600) s_trace_history.emplace_back(lbuf);
+        }
+        if (s_universal_state_entry_cb) {
+            s_universal_state_entry_cb(inner, ss, istate);
         }
         StateEntry_orig(inner, ss, istate);
     }
@@ -223,6 +230,9 @@ private:
                 (unsigned long long)vt_rva, istate ? (uint32_t)istate->state_flags : 0);
             printf("%s\n", lbuf);
             if (s_trace_history.size() < 600) s_trace_history.emplace_back(lbuf);
+        }
+        if (s_universal_state_exit_cb) {
+            s_universal_state_exit_cb(inner, ss, istate);
         }
         StateFinish_orig(inner, ss, istate);
     }

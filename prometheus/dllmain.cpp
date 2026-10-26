@@ -434,14 +434,7 @@ __int64 cascLogHook(int level, const char* culprit, const char* msg) {
 
 int (*statescript_load_orig)(StatescriptInstance*);
 int statescript_load_hook(StatescriptInstance* ss) {
-    int result = statescript_load_orig(ss);
-    auto entres = ss->ss_inner->component_ref->base.entity_backref->resload_entry;
-    /*if (ss->script_id == 0x580000000000200) {
-        printf("loadasd: \n");
-        stacktrace();
-    }*/
-    //printf("---- Load Statescript %p - Entity %x: (entres: %p)\n", ss->script_id, ss->ss_inner->component_ref->base.entity_backref->entity_id, entres->valid() ? entres->align()->resource_id : 0);
-    return result;
+    return statescript_load_orig(ss);
 }
 
 typedef __int64 (*stuux_string_hash_fn)(char* input);
@@ -1149,9 +1142,9 @@ uint8_t __fastcall SpawnStatescriptEffect_hook(uintptr_t effect_node, uintptr_t 
     return ret;
 }
 
-typedef void(__fastcall* attach_c1_hp_fn)(Component_1_SceneRendering* child_c1, Component_1_SceneRendering* parent_c1, uint64_t hp_id, Vector4* rot, Vector4* pos);
+typedef uint8_t(__fastcall* attach_c1_hp_fn)(Component_1_SceneRendering* child_c1, Component_1_SceneRendering* parent_c1, uint64_t hp_id, Vector4* rot, Vector4* pos);
 attach_c1_hp_fn AttachComponent1ToHardpoint_orig = nullptr;
-void __fastcall AttachComponent1ToHardpoint_hook(Component_1_SceneRendering* child_c1, Component_1_SceneRendering* parent_c1, uint64_t hp_id, Vector4* rot, Vector4* pos) {
+uint8_t __fastcall AttachComponent1ToHardpoint_hook(Component_1_SceneRendering* child_c1, Component_1_SceneRendering* parent_c1, uint64_t hp_id, Vector4* rot, Vector4* pos) {
     uintptr_t caller = (uintptr_t)_ReturnAddress();
     uintptr_t caller_rva = (caller >= globals::gameBase && caller < globals::gameBase + globals::gameSize)
         ? (caller - globals::gameBase) : caller;
@@ -1159,21 +1152,22 @@ void __fastcall AttachComponent1ToHardpoint_hook(Component_1_SceneRendering* chi
     Entity* p_ent = parent_c1 ? SafeReadVal<Entity*>((uintptr_t)&parent_c1->base.entity_backref) : nullptr;
     uint32 child_id = c_ent ? SafeReadVal<uint32>((uintptr_t)&c_ent->entity_id) : 0;
     uint32 parent_id = p_ent ? SafeReadVal<uint32>((uintptr_t)&p_ent->entity_id) : 0;
-    AttachComponent1ToHardpoint_orig(child_c1, parent_c1, hp_id, rot, pos);
+    uint8_t ret = AttachComponent1ToHardpoint_orig(child_c1, parent_c1, hp_id, rot, pos);
     uint16_t bone_idx = SafeReadVal<uint16_t>((uintptr_t)child_c1 + 0x1F4, 0xFFFF);
     Vector4 c_world = SafeReadVal<Vector4>((uintptr_t)child_c1 + 0xC0);
     WeaponDiagLogFmt("[ATTACH_HP (+0xA01160)] caller=+0x%llX child=0x%X parent=0x%X hp=0x%llX -> bone=%u world=(%.2f,%.2f,%.2f)",
         (unsigned long long)caller_rva, child_id, parent_id, (unsigned long long)hp_id, bone_idx, c_world.X, c_world.Y, c_world.Z);
+    return ret;
 }
 
-typedef void(__fastcall* attach_c1_internal_fn)(Component_1_SceneRendering* child_c1, Component_1_SceneRendering* parent_c1, uintptr_t hp_info, Vector4* rot, Vector4* pos);
+typedef uint8_t(__fastcall* attach_c1_internal_fn)(Component_1_SceneRendering* child_c1, Component_1_SceneRendering* parent_c1, uintptr_t hp_info, Vector4* rot, Vector4* pos);
 attach_c1_internal_fn AttachComponent1Internal_orig = nullptr;
-void __fastcall AttachComponent1Internal_hook(Component_1_SceneRendering* child_c1, Component_1_SceneRendering* parent_c1, uintptr_t hp_info, Vector4* rot, Vector4* pos) {
+uint8_t __fastcall AttachComponent1Internal_hook(Component_1_SceneRendering* child_c1, Component_1_SceneRendering* parent_c1, uintptr_t hp_info, Vector4* rot, Vector4* pos) {
     uintptr_t caller = (uintptr_t)_ReturnAddress();
     uintptr_t caller_rva = (caller >= globals::gameBase && caller < globals::gameBase + globals::gameSize)
         ? (caller - globals::gameBase) : caller;
     WeaponHardpointDiag::s_attach_calls++;
-    AttachComponent1Internal_orig(child_c1, parent_c1, hp_info, rot, pos);
+    uint8_t ret = AttachComponent1Internal_orig(child_c1, parent_c1, hp_info, rot, pos);
 
     Entity* c_ent = child_c1 ? SafeReadVal<Entity*>((uintptr_t)&child_c1->base.entity_backref) : nullptr;
     Entity* p_ent = parent_c1 ? SafeReadVal<Entity*>((uintptr_t)&parent_c1->base.entity_backref) : nullptr;
@@ -1193,6 +1187,7 @@ void __fastcall AttachComponent1Internal_hook(Component_1_SceneRendering* child_
             (unsigned long long)p_1a8, (unsigned long long)p_1b8,
             c_world.X, c_world.Y, c_world.Z, p_world.X, p_world.Y, p_world.Z);
     }
+    return ret;
 }
 
 typedef uint8_t(__fastcall* try_play_barrel_muzzle_fn)(uintptr_t entry, uintptr_t game_ea);
@@ -1406,6 +1401,9 @@ static float ClosestSegSeg(const Vector4& p1, const Vector4& q1, const Vector4& 
     Vector4 diff = Sub3(c1, c2);
     return Dot3(diff, diff);
 }
+
+static float ResolveShotBaseDamage(Entity* shooter, Entity* proj_ent);
+static float ApplyHealingToHealthComponent(Component_28_STUHealthComponent* c28, float heal_amt);
 
 static float ApplyDamageToHealthComponent(Component_28_STUHealthComponent* c28, float dmg) {
     // Shields -> armour -> health, part by part.
@@ -1868,18 +1866,12 @@ Entity* __fastcall PerformBulletRaycast_hook(uintptr_t cb_vt, uintptr_t shot_ctx
             }
 
             // 2. If the spawned projectile has Component_23_Statescript (0x23), enable local execution
-            //    and clear m_serverOnly (+0x76) on all nodes in its graphs!
             if (auto* proj_c23 = hit_ent->getById<Component_23_Statescript>(0x23)) {
                 proj_c23->ss_inner.flag_374 = 0;
                 for (int i = 0; i < proj_c23->ss_inner.g1_instanceArr.num; ++i) {
                     StatescriptInstance* inst = proj_c23->ss_inner.g1_instanceArr.ptr[i];
                     if (!inst) continue;
                     inst->execution_flags = (inst->execution_flags | 0x400009u | 0x200000u) & ~0x1004u;
-                    if (inst->graph) {
-                        for (auto* node : inst->graph->m_nodes) {
-                            if (node) node->m_serverOnly = 0;
-                        }
-                    }
                 }
             }
         }
@@ -2429,29 +2421,47 @@ uint8_t __fastcall PerformPelletWorldAndHitboxRaycast_hook(
         dmy_c12_min_pre.X, dmy_c12_min_pre.Y, dmy_c12_min_pre.Z, dmy_c12_max_pre.X, dmy_c12_max_pre.Y, dmy_c12_max_pre.Z,
         hit_entid, hit_frac, hit_w34, hit_bone36, (unsigned long long)hit_tag40, hit_f50, hit_f54, hit_w60, hit_pos.X, hit_pos.Y, hit_pos.Z);
 
-    // Apply native skeletal hitbox damage when +0x1038860 intersects a skeletal hitbox capsule (hit_w34 != 0xFFFF, hit_f54 != 0xFFFFFFFF).
+    // Apply native skeletal hitbox damage when +0x1038860 intersects a skeletal hitbox capsule (hit_w34 != 0xFFFF, hit_f54 != 0xFFFFFFFF),
+    // AND apply distance-falloff AoE splash damage when an explosive projectile (e.g. Soldier: 76 Helix Rockets) hits level geometry or an enemy.
     // NOTE: +0x1032CB0 -> +0x1038860 runs in parallel on worker threads for multi-pellet weapons (e.g. Tracer's 2 pellets per shot),
     // so guard all shared state with s_pellet_hit_mutex and leave VarBag / UI ViewModel / System #46 notifications to the main thread (+0xCA7200).
-    if (WeaponHardpointDiag::s_dummy_damage_enabled && ret != 0 && hit_ent && hit_w34 != 0xFFFF && hit_f54 != 0xFFFFFFFF && c27_230 == 0) {
+    if (WeaponHardpointDiag::s_dummy_damage_enabled && ret != 0 && c27_230 == 0) {
         std::lock_guard<std::mutex> hit_lock(s_pellet_hit_mutex);
         uint32_t local_ctrl_id = ea ? ea->local_entid : 0;
         uint32_t local_mdl_id = 0;
+        uint64_t shooter_heroid = 0;
         if (ea && local_ctrl_id) {
             if (Entity* ctrl = ea->getEntById(local_ctrl_id)) {
                 if (auto* c20 = ctrl->getById<Component_20_ModelReference>(0x20)) {
                     local_mdl_id = c20->cam_attach_entid ? c20->cam_attach_entid : c20->aim_entid;
                 }
+                if (auto* c3f = ctrl->getById<Component_3F_PlayerInfo>(0x3F)) {
+                    shooter_heroid = (uint64_t)c3f->selected_heroid;
+                }
             }
         }
-        if (hit_entid != local_ctrl_id && hit_entid != local_mdl_id && hit_entid != s_last_shot_shooter_id) {
+        Entity* shooter_ent = (ea && s_last_shot_shooter_id) ? ea->getEntById(s_last_shot_shooter_id) : nullptr;
+        if (!shooter_ent && ea && local_mdl_id) shooter_ent = ea->getEntById(local_mdl_id);
+        Entity* proj_ent = pellet_c27 ? SafeReadVal<Entity*>(pellet_c27 + 0x08) : nullptr;
+        uintptr_t cb_vt_ptr = cb_vt ? SafeReadVal<uintptr_t>(cb_vt) : 0;
+        bool is_proj_vt = (cb_vt_ptr == globals::gameBase + 0x15C3048);
+        bool is_standalone_proj = is_proj_vt || (proj_ent != nullptr && proj_ent != shooter_ent);
+        bool is_pulse_bomb = IsPulseBombEntity(proj_ent);
+        // Explosive projectile types (Soldier: 76 Helix Rockets 0x6E, Pharah Rocket 0x08, Junkrat Frag 0x65, Zarya RMB 0x68)
+        bool is_explosive_proj = !is_pulse_bomb && is_standalone_proj && (
+            shooter_heroid == 0x02E000000000006EULL ||
+            shooter_heroid == 0x02E0000000000008ULL ||
+            shooter_heroid == 0x02E0000000000065ULL ||
+            shooter_heroid == 0x02E0000000000068ULL);
+
+        uint32_t direct_damaged_entid = 0;
+        if (hit_ent && hit_w34 != 0xFFFF && hit_f54 != 0xFFFFFFFF &&
+            hit_entid != local_ctrl_id && hit_entid != local_mdl_id && hit_entid != s_last_shot_shooter_id) {
             auto* c10 = hit_ent->getById<Component_10_FilterBits>(0x10);
             bool same_team = (s_last_shot_team && c10 && (c10->filter_bits & 0x3C0000ULL) == (s_last_shot_team & 0x3C0000ULL));
             auto* c28 = hit_ent->getById<Component_28_STUHealthComponent>(0x28);
             auto* c1 = hit_ent->getById<Component_1_SceneRendering>(1);
             if (!same_team && c28 && c28->CalcTotalCurrentHealth() > 0.0f) {
-                Entity* proj_ent = pellet_c27 ? SafeReadVal<Entity*>(pellet_c27 + 0x08) : nullptr;
-                bool is_pulse_bomb = IsPulseBombEntity(proj_ent);
-
                 if (is_pulse_bomb) {
                     uint32_t prev_stuck = s_pulse_bomb_stuck_entid.exchange(hit_entid);
                     if (prev_stuck == hit_entid) {
@@ -2460,12 +2470,13 @@ uint8_t __fastcall PerformPelletWorldAndHitboxRaycast_hook(
                     }
                 }
 
+                direct_damaged_entid = hit_entid;
                 // Ensure c28->base.is_mirrored (+0x14) is 1 so +0x1023E80 -> +0xCB05A0(c28) allows critical hit checks
                 *(uint32_t*)((uintptr_t)c28 + 0x14) = 1;
                 float base_y = c1 ? c1->position.Y : 0.0f;
                 float rel_y = hit_pos.Y - base_y;
-                // Native critical hit region tag 0x0DA000000000000D, skeletal head bone 0x11, or head capsule 0x2A
-                bool crit = !is_pulse_bomb && (hit_tag40 == 0x0DA000000000000DULL || hit_f54 == 0x11 || hit_w34 == 0x2A);
+                // Native critical hit region tag 0x0DA000000000000D, skeletal head bone 0x11, or head capsule 0x2A (explosive projectiles do not crit)
+                bool crit = !is_pulse_bomb && !is_explosive_proj && (hit_tag40 == 0x0DA000000000000DULL || hit_f54 == 0x11 || hit_w34 == 0x2A);
                 if (crit) {
                     if (out_hit) {
                         *(uint64_t*)(out_hit + 0x40) = 0x0DA000000000000DULL;
@@ -2478,7 +2489,8 @@ uint8_t __fastcall PerformPelletWorldAndHitboxRaycast_hook(
                     s_last_crit_c28 = nullptr;
                 }
                 // Pulse Bomb direct stick deals 5.0 damage (0x86000000000006C) and does NOT grant Ult charge
-                float dmg = is_pulse_bomb ? 5.0f : (WeaponHardpointDiag::s_dummy_damage_per_pellet * (crit ? WeaponHardpointDiag::s_dummy_crit_mult : 1.0f));
+                float base_pellet_dmg = ResolveShotBaseDamage(shooter_ent, proj_ent);
+                float dmg = is_pulse_bomb ? 5.0f : (base_pellet_dmg * (crit ? WeaponHardpointDiag::s_dummy_crit_mult : 1.0f));
                 float hp = ApplyDamageToHealthComponent(c28, dmg);
                 // Immediately clear Bit 16 (0x10000) when HP reaches 0 so remaining pellets / shots pass through the ragdoll corpse
                 if (hp <= 0.0f && c1) {
@@ -2507,6 +2519,67 @@ uint8_t __fastcall PerformPelletWorldAndHitboxRaycast_hook(
                     WeaponHardpointDiag::s_dummy_hits, hit_entid, hit_f54, hit_w34, (unsigned long long)hit_tag40, rel_y, dmg, crit ? " CRIT" : "", hp);
                 WeaponHardpointDiag::s_last_dummy_hit = hit_msg;
                 ShotDiagLogFmt("[DUMMY_HIT] %s", hit_msg.c_str());
+            }
+        }
+
+        // Explosive projectile AoE splash damage on geometry/wall/floor impact (or splash to other enemies near a direct hit)
+        static uintptr_t s_last_aoe_proj_c27 = 0;
+        if (is_explosive_proj && ea && pellet_c27 != 0 && pellet_c27 != s_last_aoe_proj_c27) {
+            s_last_aoe_proj_c27 = pellet_c27;
+            const float kAoeOuterRadius = 3.5f; // 3.5m splash radius around geometry impact point
+            const float kAoeInnerRadius = 0.35f; // Point-blank capsule contact reaches max damage cap
+            const float kMaxHelixDmgCap = ResolveShotBaseDamage(shooter_ent, proj_ent); // 120.0f for Helix Rockets
+            const float kMinSplashDmg = 15.0f; // Minimum splash damage at outer edge
+
+            for (Entity* ent : *ea) {
+                if (!ent) continue;
+                uint32_t tid = ent->entity_id;
+                if (tid == local_ctrl_id || tid == local_mdl_id || tid == s_last_shot_shooter_id || tid == direct_damaged_entid) continue;
+                if (!ent->hasComponent(0x15) || !ent->hasComponent(0x28)) continue;
+                auto* c10 = ent->getById<Component_10_FilterBits>(0x10);
+                bool same_team = (s_last_shot_team && c10 && (c10->filter_bits & 0x3C0000ULL) == (s_last_shot_team & 0x3C0000ULL));
+                if (same_team) continue;
+                auto* c28 = ent->getById<Component_28_STUHealthComponent>(0x28);
+                auto* c1 = ent->getById<Component_1_SceneRendering>(1);
+                if (!c28 || !c1 || c28->CalcTotalCurrentHealth() <= 0.0f) continue;
+
+                // Measure distance from impact point (hit_pos) to closest point on enemy vertical capsule [pos.Y .. pos.Y + 1.8m]
+                Vector4 ep = c1->position;
+                float closest_y = hit_pos.Y;
+                if (closest_y < ep.Y) closest_y = ep.Y;
+                else if (closest_y > ep.Y + 1.8f) closest_y = ep.Y + 1.8f;
+                float dx = ep.X - hit_pos.X;
+                float dy = closest_y - hit_pos.Y;
+                float dz = ep.Z - hit_pos.Z;
+                float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+                if (dist > kAoeOuterRadius) continue;
+
+                float eff_dist = (dist > kAoeInnerRadius) ? (dist - kAoeInnerRadius) : 0.0f;
+                float t_falloff = eff_dist / (kAoeOuterRadius - kAoeInnerRadius);
+                if (t_falloff > 1.0f) t_falloff = 1.0f;
+                float aoe_dmg = kMaxHelixDmgCap - t_falloff * (kMaxHelixDmgCap - kMinSplashDmg);
+                if (aoe_dmg > kMaxHelixDmgCap) aoe_dmg = kMaxHelixDmgCap;
+                if (aoe_dmg < kMinSplashDmg) aoe_dmg = kMinSplashDmg;
+
+                *(uint32_t*)((uintptr_t)c28 + 0x14) = 1;
+                float hp = ApplyDamageToHealthComponent(c28, aoe_dmg);
+                if (hp <= 0.0f) {
+                    *(uint32_t*)((uintptr_t)c1 + 0x1B8) &= ~0x10000u;
+                }
+                if (s_pending_dmg_pkt_count < 32) {
+                    int32_t dmg_int = (int32_t)(aoe_dmg + 0.5f);
+                    if (dmg_int < 1) dmg_int = 1;
+                    uint8_t pkt_flags = (uint8_t)(hp <= 0.0f ? 2 : 0);
+                    s_pending_dmg_pkts[s_pending_dmg_pkt_count++] = PendingDamagePacket{ tid, dmg_int, pkt_flags, true };
+                }
+                s_last_hit_dummy_entid = tid;
+                s_last_hit_dummy_ms = GetTickCount64();
+                WeaponHardpointDiag::s_dummy_hits++;
+                std::string aoe_msg = std::format(
+                    "AoE Splash #{} on 0x{:X} (dist={:.2f}m from impact ({:.1f},{:.1f},{:.1f})): -{:.1f} -> HP {:.1f}",
+                    WeaponHardpointDiag::s_dummy_hits, tid, dist, hit_pos.X, hit_pos.Y, hit_pos.Z, aoe_dmg, hp);
+                WeaponHardpointDiag::s_last_dummy_hit = aoe_msg;
+                ShotDiagLogFmt("[HELIX_AOE_HIT] %s", aoe_msg.c_str());
             }
         }
     }
@@ -2991,6 +3064,24 @@ void __fastcall UpdateHealthbarVisibility_hook(uintptr_t sys46) {
                 bool ent_show_hb = (ent_cur_hp > 0.0f && ent_max_hp > 0.0f && ent_cur_hp < ent_max_hp);
                 if (ent_show_hb) {
                     any_show_hb = true;
+                    bool in_ring = false;
+                    for (int32_t idx = 0; idx < cap; idx++) {
+                        uintptr_t entry = ring + (uintptr_t)idx * 0x10;
+                        if (*(uint32_t*)(entry + 0x00) == ent->entity_id) {
+                            in_ring = true;
+                            break;
+                        }
+                    }
+                    if (!in_ring) {
+                        auto on_net_dmg = (void(__fastcall*)(uintptr_t, uintptr_t, const uint8_t*))(globals::gameBase + 0xCA7860);
+                        uint8_t pkt[0x80] = {};
+                        *(uint32_t*)(pkt + 0x68) = ent->entity_id;
+                        *(int32_t*)(pkt + 0x6C) = 0;
+                        *(int32_t*)(pkt + 0x70) = 62500;
+                        *(uint8_t*)(pkt + 0x74) = 0;
+                        on_net_dmg(sys46, 0, pkt);
+                        *(uint8_t*)(sys46 + 0x99) = 1;
+                    }
                 } else {
                     for (int32_t idx = 0; idx < cap; idx++) {
                         uintptr_t entry = ring + (uintptr_t)idx * 0x10;
@@ -3036,6 +3127,10 @@ void __fastcall UpdateHealthbarVisibility_hook(uintptr_t sys46) {
             auto* c28 = ent->getById<Component_28_STUHealthComponent>(0x28);
             if (!c28) continue;
             float ent_cur_hp = c28->CalcTotalCurrentHealth();
+            float ent_max_hp = c28->CalcTotalMaxHealth();
+            if (ent_cur_hp > 0.0f && ent_max_hp > 0.0f && ent_cur_hp < ent_max_hp) {
+                *(uint8_t*)((uintptr_t)c28 + 0x485) = 1;
+            }
             NotifyTrackedHealthbarViewModels(ent->entity_id, c28, ent_cur_hp);
         }
     }
@@ -3119,41 +3214,13 @@ static Entity* GetLocalHeroModelEnt() {
 
 static void PatchHeroAbilityGraphsAndVars(EntityAdminBase* game_ea) {
     (void)game_ea;
-    Entity* hero_ent = GetLocalHeroModelEnt();
-    if (!hero_ent) return;
-    auto* c23 = hero_ent->getById<Component_23_Statescript>(0x23);
-    if (!c23 || !c23->ss_inner.g3_arrWithIds.ptr || c23->ss_inner.g3_arrWithIds.num <= 0 || c23->ss_inner.g3_arrWithIds.num > 64) return;
-
-    for (auto& entry : c23->ss_inner.g3_arrWithIds) {
-        StatescriptInstance* script = entry.instance;
-        if (!script || IsBadReadPtr(script, sizeof(StatescriptInstance)) || !script->graph) continue;
-        if (IsBadReadPtr(script->graph, sizeof(STUStatescriptGraph))) continue;
-
-        // Only clear m_serverOnly on Tracer's Recall (0x058000000000001A) and Pulse Bomb (0x0580000000000034)
-        if (script->script_id != 0x058000000000001AULL &&
-            script->script_id != 0x0580000000000034ULL) {
-            continue;
-        }
-
-        int cleared_cnt = 0;
-        int total_cnt = 0;
-        for (STUStatescriptBase* node : script->graph->m_nodes) {
-            total_cnt++;
-            if (node && !IsBadReadPtr(node, sizeof(STUStatescriptBase)) && node->m_serverOnly != 0) {
-                node->m_serverOnly = 0;
-                cleared_cnt++;
-            }
-        }
-        if (cleared_cnt > 0) {
-            ShotDiagLogFmt("[ABILITY_PATCH] hero=0x%X inst_id=%d script=0x%llX cleared m_serverOnly on %d/%d nodes",
-                hero_ent->entity_id, (int)script->instance_id, (unsigned long long)script->script_id, cleared_cnt, total_cnt);
-        }
-    }
 }
 
-// 1. +0xD67BF0: RecallPreRewindState_OnTimerTick (node[4], stu = 0xCD396790)
-// Offline, [stu + 0x108] is NULL so EvalConfigVarBool(+0xD16BF0) returns 0 and +0xD67C42 skips
-// ScheduleFinishState(state, 1, 0) (+0xF4A9C0), wedging node[4] (and weapon/ability locks node[12]/node[13]) forever.
+// 1. +0xD67BF0: Universal Server-Timed Wait State OnTimerTick (stu = 0xCD396790, vt = +0x15D4840, 28 nodes in 15 hero graphs)
+// Offline, [stu + 0x108] (0xB4FE98D8 condition CV) is NULL in almost all ability graphs (Recall 0x1A, Grapple 0x20,
+// Shadow Step 0x48, Charge 0x7D, Earthshatter 0xE2, Chain Hook 0xFE, Take a Breather 0x101, Combat Roll 0x17B, Deadeye 0x17E,
+// RIP-Tire 0x232, Cryo-Freeze 0x623, etc.), so EvalConfigVarBool(+0xD16BF0) returns 0 and +0xD67C42 skips
+// ScheduleFinishState(state, 1, 0) (+0xF4A9C0), wedging the state and its StateStack weapon/ability locks forever.
 typedef void(__fastcall* recall_pre_timer_fn)(uintptr_t state, int timerUserData);
 static recall_pre_timer_fn RecallPreRewindState_OnTimerTick_orig = nullptr;
 void __fastcall RecallPreRewindState_OnTimerTick_hook(uintptr_t state, int timerUserData) {
@@ -3162,9 +3229,9 @@ void __fastcall RecallPreRewindState_OnTimerTick_hook(uintptr_t state, int timer
         uintptr_t ss_inst = SafeReadVal<uintptr_t>(state + 0x78);
         uintptr_t ss_inner = ss_inst ? SafeReadVal<uintptr_t>(ss_inst + 0x10) : 0;
         auto* comp23 = ss_inner ? (Component_23_Statescript*)SafeReadVal<uintptr_t>(ss_inner + 0x450) : nullptr;
-        Entity* hero_ent = (comp23 && !IsBadReadPtr(comp23, sizeof(Component_23_Statescript))) ? comp23->base.entity_backref : nullptr;
-        if (!hero_ent || hero_ent != GetLocalHeroModelEnt()) return;
+        if (!comp23 || IsBadReadPtr(comp23, sizeof(Component_23_Statescript))) return;
 
+        uint64_t script_id = ss_inst ? SafeReadVal<uint64_t>(ss_inst + 0x150) : 0;
         uintptr_t graph = ss_inst ? SafeReadVal<uintptr_t>(ss_inst + 0x160) : 0;
         uintptr_t stu_state = 0;
         if (graph && !IsBadReadPtr((const void*)graph, sizeof(STUStatescriptGraph))) {
@@ -3174,10 +3241,11 @@ void __fastcall RecallPreRewindState_OnTimerTick_hook(uintptr_t state, int timer
             ? SafeReadVal<uintptr_t>(stu_state + 0x108) : 0;
         if (cv_108 == 0) {
             auto sched_finish = (schedule_finish_state_fn)(globals::gameBase + 0xF4A9C0);
-            // Schedule finish after remaining 280ms of the 380ms (0.38s) node[14] fade timer
-            sched_finish(state, 1, 280);
-            ShotDiagLogFmt("[RECALL_PRE (+0xD67BF0)] state=0x%llX timerUserData=1 stu+0x108=NULL -> scheduled FinishState(delay=280ms)",
-                (unsigned long long)state);
+            // Recall (0x058000000000001A) waits the remaining 280ms of its 380ms node[14] fade timer; all other 27 nodes finish immediately (0ms)
+            int delay_ms = (script_id == 0x058000000000001AULL) ? 280 : 0;
+            sched_finish(state, 1, delay_ms);
+            ShotDiagLogFmt("[WAIT_STATE_0xCD396790 (+0xD67BF0)] script=0x%llX state=0x%llX stu+0x108=NULL -> FinishState(delay=%dms)",
+                (unsigned long long)script_id, (unsigned long long)state, delay_ms);
         }
     }
 }
@@ -3306,9 +3374,9 @@ void __fastcall RecallRewindState_Update1Tick_hook(uintptr_t state, int64_t delt
     }
 }
 
-// 4. +0xD44D60: WeaponFiringState_Update1Tick (stu = 0xC2A01675, vt = +0x15D2450)
+// 4. +0xD44D60: WeaponFiringState_Update1Tick (stu = 0xC2A01675 / 0x860EE5FC, vt = +0x15D2450)
 // Ensures client firing authority gate at +0xD44E23..+0xD44E40 ([cfg+0x104]==3 || ([cfg+0x108]!=0 && (exec_flags & 0x400000)!=0))
-// passes for Tracer's Pulse Bomb node[21] in inst_id=-3 without permanently mutating execution_flags.
+// passes for all local hero weapon and ability firing states across all 21 heroes without permanently mutating execution_flags.
 typedef void(__fastcall* weapon_firing_tick_fn)(uintptr_t state);
 static weapon_firing_tick_fn WeaponFiringState_Update1Tick_orig = nullptr;
 void __fastcall WeaponFiringState_Update1Tick_hook(uintptr_t state) {
@@ -3318,19 +3386,12 @@ void __fastcall WeaponFiringState_Update1Tick_hook(uintptr_t state) {
     auto* comp23 = ss_inner ? (Component_23_Statescript*)SafeReadVal<uintptr_t>(ss_inner + 0x450) : nullptr;
     Entity* hero_ent = (comp23 && !IsBadReadPtr(comp23, sizeof(Component_23_Statescript))) ? comp23->base.entity_backref : nullptr;
 
-    bool is_local_ult = (hero_ent && hero_ent == GetLocalHeroModelEnt() && scope_id == -3);
+    bool is_local_hero = (hero_ent && hero_ent == GetLocalHeroModelEnt());
     uint32_t old_exec = 0;
 
-    if (is_local_ult && !IsBadReadPtr((const void*)ss_inst, 0x260)) {
+    if (is_local_hero && !IsBadReadPtr((const void*)ss_inst, 0x260)) {
         old_exec = *(uint32_t*)(ss_inst + 0x258);
         *(uint32_t*)(ss_inst + 0x258) = (old_exec | 0x400008u) & ~0x1000u;
-
-        StatescriptInstance* inst_obj = (StatescriptInstance*)ss_inst;
-        if (inst_obj->graph) {
-            for (auto* node : inst_obj->graph->m_nodes) {
-                if (node) node->m_serverOnly = 0;
-            }
-        }
 
         auto resolve_cfg = (void(__fastcall*)(uintptr_t))(globals::gameBase + 0x10798F0);
         resolve_cfg(state);
@@ -3339,40 +3400,571 @@ void __fastcall WeaponFiringState_Update1Tick_hook(uintptr_t state) {
             uint8_t b108 = SafeReadVal<uint8_t>(cfg + 0x108);
             uint32_t mode104 = SafeReadVal<uint32_t>(cfg + 0x104);
             uintptr_t sub_c0 = SafeReadVal<uintptr_t>(cfg + 0xC0);
+            uint64_t state_a8 = SafeReadVal<uint64_t>(state + 0xA8);
             uint64_t proj_resid = (sub_c0 && !IsBadReadPtr((const void*)sub_c0, 0x38)) ? SafeReadVal<uint64_t>(sub_c0 + 0x28) : 0;
-            if (sub_c0 && !IsBadReadPtr((const void*)sub_c0, 0x38) && proj_resid == 0) {
-                proj_resid = 0x09A00000000000F3ULL;
-                *(uint64_t*)(sub_c0 + 0x28) = proj_resid;
-            }
             if (b108 == 0) {
                 *(uint8_t*)(cfg + 0x108) = 1;
+                ShotDiagLogFmt("[WPN_FIRE_TICK (+0xD44D60)] inst=%d state=0x%llX A8=0x%llX cfg=0x%llX sub_c0=0x%llX proj_resid=0x%llX mode104=%u b108=%u->1",
+                    (int)scope_id, (unsigned long long)state,
+                    (unsigned long long)state_a8,
+                    (unsigned long long)cfg, (unsigned long long)sub_c0, (unsigned long long)proj_resid,
+                    mode104, b108);
             }
             if (mode104 == 0) {
                 *(uint32_t*)(cfg + 0x104) = 1;
             }
-            ShotDiagLogFmt("[WPN_FIRE_TICK (+0xD44D60)] inst=%d state=0x%llX A8=0x%llX cfg=0x%llX sub_c0=0x%llX proj_resid=0x%llX mode104=%u b108=%u->1",
-                (int)scope_id, (unsigned long long)state,
-                (unsigned long long)SafeReadVal<uint64_t>(state + 0xA8),
-                (unsigned long long)cfg, (unsigned long long)sub_c0, (unsigned long long)proj_resid,
-                mode104, b108);
         }
     }
 
     WeaponFiringState_Update1Tick_orig(state);
 
-    if (is_local_ult && !IsBadReadPtr((const void*)ss_inst, 0x260)) {
+    if (is_local_hero && !IsBadReadPtr((const void*)ss_inst, 0x260)) {
         *(uint32_t*)(ss_inst + 0x258) = old_exec;
     }
+}
+
+// ============================================================================
+// Horizon 1 Stage H1.2: Generalizing All 21 Launch Heroes & Stripped Server Nodes
+// - ResolveShotBaseDamage (per-weapon STU 0x04CC5359 & 21-hero 0.8.0 damage table)
+// - ApplyHealingToHealthComponent (Normal -> Armor -> Shield pool restoration)
+// - +0xF43450 FindStatescriptStateImpl_hook (4 Group-1 client stub vtable overrides)
+// - +0xF47740 StatescriptAction_ExecuteAndContinue_hook (0x4E83BC01 & 0x04CC5359)
+// - +0xF495C0 StatescriptState_StartState_hook (0x619D9E95 Melee/Sweep & 0xD78490D1 Impulse)
+// ============================================================================
+static uint32_t s_last_melee_hit_entid = 0;
+static uint64_t s_last_melee_hit_ms    = 0;
+static uint64_t s_last_melee_dmg_ms    = 0;
+
+static Vector4  s_active_impulse_vel{};
+static uint64_t s_active_impulse_end_ms    = 0;
+static float    s_active_impulse_min_y     = -10000.0f;
+
+static uint64_t s_active_dash_sweep_end_ms    = 0;
+static float    s_active_dash_sweep_dmg       = 0.0f;
+static float    s_active_dash_sweep_radius    = 3.5f;
+static uint64_t s_active_dash_sweep_script_id = 0;
+static uint32_t s_active_dash_sweep_hit_ents[16] = {};
+static int      s_active_dash_sweep_hit_count = 0;
+
+static void ArmDashSweepDamage(uint64_t script_id, float dmg, float radius, uint64_t dur_ms) {
+    uint64_t now_ms = GetTickCount64();
+    if (s_active_dash_sweep_end_ms <= now_ms || s_active_dash_sweep_script_id != script_id) {
+        s_active_dash_sweep_hit_count = 0;
+    }
+    s_active_dash_sweep_script_id = script_id;
+    s_active_dash_sweep_dmg = dmg;
+    s_active_dash_sweep_radius = radius;
+    s_active_dash_sweep_end_ms = now_ms + dur_ms;
+}
+
+// Stage H1.2 / Suite E: Enemy Knockback Impulse Tracker (D.Va Boosters, Reinhardt Charge, Winston Jump Pack / Primal Rage, Lucio Soundwave)
+struct EnemyKnockbackEntry {
+    uint32_t ent_id;
+    Vector4  vel;
+    float    ground_y;
+    uint64_t end_ms;
+};
+static EnemyKnockbackEntry s_enemy_knockbacks[16] = {};
+static int s_enemy_knockback_count = 0;
+
+static void ArmEnemyKnockback(Entity* ent, const Vector4& push_dir, float horiz_speed, float up_speed, uint64_t dur_ms) {
+    if (!ent || IsBadReadPtr(ent, sizeof(Entity)) || dur_ms == 0) return;
+    auto* c1 = ent->getById<Component_1_SceneRendering>(1);
+    if (!c1 || IsBadReadPtr(c1, sizeof(Component_1_SceneRendering))) return;
+
+    float dx = push_dir.X;
+    float dz = push_dir.Z;
+    float len = sqrtf(dx * dx + dz * dz);
+    if (len > 1e-4f) { dx /= len; dz /= len; }
+    else { dx = 0.0f; dz = 1.0f; }
+
+    uint64_t now_ms = GetTickCount64();
+    Vector4 vel{ dx * horiz_speed, up_speed, dz * horiz_speed, 0.0f };
+    float ground_y = c1->position.Y;
+    if (auto* slot = OriginClutterTracker::GetSlot(ent->entity_id, ent)) {
+        if (slot->has_nonzero_pos && slot->latest_nonzero_pos.Y < ground_y) {
+            ground_y = slot->latest_nonzero_pos.Y;
+        }
+    }
+
+    for (int i = 0; i < s_enemy_knockback_count; ++i) {
+        if (s_enemy_knockbacks[i].ent_id == ent->entity_id) {
+            s_enemy_knockbacks[i].vel = vel;
+            s_enemy_knockbacks[i].end_ms = now_ms + dur_ms;
+            return;
+        }
+    }
+    if (s_enemy_knockback_count < 16) {
+        s_enemy_knockbacks[s_enemy_knockback_count++] = EnemyKnockbackEntry{ ent->entity_id, vel, ground_y, now_ms + dur_ms };
+    }
+}
+
+// Stage H1.2 / Suite D: Smooth 100ms Heal-Over-Time (HoT) & Biotic Field / Bastion Self-Repair Trackers
+static uint64_t s_active_hot_end_ms       = 0;
+static uint64_t s_active_hot_last_tick_ms = 0;
+static float    s_active_hot_hp_per_100ms = 0.0f;
+static uint64_t s_active_hot_script_id    = 0;
+static bool     s_bastion_repair_active   = false;
+static uint64_t s_bastion_last_tick_ms    = 0;
+static uint64_t s_biotic_field_end_ms     = 0;
+static uint64_t s_biotic_field_last_ms    = 0;
+static uint32_t s_biotic_field_ent_id     = 0;
+static Vector4  s_biotic_field_pos{};
+
+static void ArmHeroHealOverTime(uint64_t script_id, float total_hp, uint64_t dur_ms, const char* tag = nullptr) {
+    if (dur_ms == 0 || total_hp <= 0.0f) return;
+    uint64_t now_ms = GetTickCount64();
+    s_active_hot_script_id = script_id;
+    s_active_hot_hp_per_100ms = total_hp / ((float)dur_ms / 100.0f);
+    s_active_hot_end_ms = now_ms + dur_ms;
+    s_active_hot_last_tick_ms = (now_ms >= 100) ? (now_ms - 100) : 0;
+    if (tag) {
+        ShotDiagLogFmt("[%s] script=0x%llX total_hp=+%.1f dur=%llums (+%.2f HP / 100ms)",
+            tag, (unsigned long long)script_id, total_hp, (unsigned long long)dur_ms, s_active_hot_hp_per_100ms);
+    }
+}
+
+// Stage H1.3: Created Sub-Entity Tracking (Turrets, Sentries, Teleporter, Ice Wall, Blizzard, Biotic Field, Barriers, Dragonstrike, RIP-Tire)
+struct CreatedSubEntityEntry {
+    uint32_t ent_id;
+    uint32_t owner_ent_id;
+    uint64_t res_id;
+    uint64_t script_id;
+    uint64_t spawn_ms;
+    uint64_t expire_ms;
+    uint64_t last_effect_ms;
+    Vector4  vel;
+    Vector4  spawn_pos;
+    float    ground_y;
+    bool     has_gravity;
+    bool     lock_stationary;
+};
+static CreatedSubEntityEntry s_created_sub_entities[64] = {};
+static int s_created_sub_entity_count = 0;
+
+// Stage H1.3: Junkrat RIP-Tire (0x0580000000000232) Possession State
+static uint32_t s_riptire_ent_id       = 0;
+static uint32_t s_riptire_saved_mdl_id = 0;
+static uint64_t s_riptire_end_ms       = 0;
+
+template <typename T>
+static T GetSTUFieldByHash(STUStatescriptBase* node, uint32_t field_hash, T default_val = T{}) {
+    if (!node || IsBadReadPtr(node, sizeof(STUStatescriptBase))) return default_val;
+    STUInfo* info = (node->graph_node.base.vfptr && !IsBadReadPtr(node->graph_node.base.vfptr, sizeof(STUBase_vt)))
+        ? node->graph_node.base.vfptr->GetSTUInfo() : nullptr;
+    if (!info || IsBadReadPtr(info, sizeof(STUInfo))) return default_val;
+    STUArgumentInfo* arg = info->argumentByHash(field_hash, true);
+    if (!arg || IsBadReadPtr(arg, sizeof(STUArgumentInfo))) return default_val;
+    return SafeReadVal<T>((uintptr_t)node + arg->offset, default_val);
+}
+
+static void SafeTraverseOutputPlug(
+    StatescriptSyncMgr* mgr,
+    StatescriptInstance* inst,
+    STUStatescriptBase* source_node,
+    STUStatescriptOutputPlug* out_plug,
+    uint64_t plug_offset)
+{
+    if (!mgr || !inst || !source_node || !out_plug) return;
+    if (IsBadReadPtr(mgr, sizeof(StatescriptSyncMgr)) || IsBadReadPtr(out_plug, sizeof(STUStatescriptOutputPlug))) return;
+    using TraversePlugFn = uint8_t(__fastcall*)(StatescriptSyncMgr*, StatescriptInstance*, STUStatescriptBase*, STUStatescriptOutputPlug*, uint64_t);
+    auto traverse_plug = (TraversePlugFn)(globals::gameBase + 0xF46F80);
+    __try {
+        traverse_plug(mgr, inst, source_node, out_plug, plug_offset);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+static void WriteDynamicVarPrim(StatescriptInstance* inst, STUConfigVarDynamic* out_var, const StatescriptPrimitive& val_prim) {
+    if (!inst || !out_var || IsBadReadPtr(out_var, sizeof(STUConfigVarDynamic))) return;
+    int loc_cnt = out_var->item_location.count();
+    STUResourceReference* loc_arr = out_var->item_location.list();
+    if (loc_cnt <= 0 || !loc_arr || IsBadReadPtr(loc_arr, sizeof(STUResourceReference) * loc_cnt)) return;
+    if (loc_cnt == 1) {
+        __int64 var_id = loc_arr[0].resource_id;
+        StatescriptVar_VarBag* inst_bags[3] = { inst->rid_instance_varbag, inst->second_inst_varbag, inst->third_inst_varbag };
+        for (StatescriptVar_VarBag* vb : inst_bags) {
+            if (vb && !IsBadReadPtr(vb, sizeof(StatescriptVar_VarBag))) {
+                vb->SetVar({ var_id }, val_prim);
+                NotifyVarInBag(inst->ss_inner, inst, vb, var_id, val_prim);
+            }
+        }
+        if (inst->ss_inner && inst->ss_inner->rid_entity_varbag && !IsBadReadPtr(inst->ss_inner->rid_entity_varbag, sizeof(StatescriptVar_VarBag))) {
+            inst->ss_inner->rid_entity_varbag->SetVar({ var_id }, val_prim);
+            inst->ss_inner->rid_entity_varbag->SetVar({ StatescriptVar_ENTITY_VARBAG, var_id }, val_prim);
+            NotifyVarInBag(inst->ss_inner, inst, inst->ss_inner->rid_entity_varbag, var_id, val_prim);
+            inst->ss_inner->needs_process_e = 1;
+        }
+    } else if (loc_cnt >= 2 && inst->ss_inner && inst->ss_inner->rid_entity_varbag &&
+               !IsBadReadPtr(inst->ss_inner->rid_entity_varbag, sizeof(StatescriptVar_VarBag))) {
+        __int64 bag_id = loc_arr[0].resource_id;
+        __int64 var_id = loc_arr[1].resource_id;
+        if ((uint64_t)bag_id == StatescriptVar_ENTITY_VARBAG) {
+            inst->ss_inner->rid_entity_varbag->SetVar({ var_id }, val_prim);
+            inst->ss_inner->rid_entity_varbag->SetVar({ StatescriptVar_ENTITY_VARBAG, var_id }, val_prim);
+            NotifyVarInBag(inst->ss_inner, inst, inst->ss_inner->rid_entity_varbag, var_id, val_prim);
+            inst->ss_inner->needs_process_e = 1;
+        }
+    }
+}
+
+static int32_t ReadVarBagInt32(StatescriptVar_VarBag* vb, __int64 target_rid) {
+    if (!vb || IsBadReadPtr(vb, sizeof(StatescriptVar_VarBag))) return 0;
+    for (int b = 0; b < 16; ++b) {
+        const auto& bucket = vb->sub_items[b];
+        if (!bucket.arr_ptr || bucket.item_count <= 0 || bucket.item_count > 256) continue;
+        if (IsBadReadPtr(bucket.arr_ptr, sizeof(StatescriptVar_VarBag::VarBag_Item) * bucket.item_count)) continue;
+        for (int i = 0; i < bucket.item_count; ++i) {
+            if (bucket.arr_ptr[i].rid_id == target_rid && bucket.arr_ptr[i].ptr &&
+                !IsBadReadPtr(bucket.arr_ptr[i].ptr, sizeof(StatescriptVar_Primitive))) {
+                auto* pvar = (StatescriptVar_Primitive*)bucket.arr_ptr[i].ptr;
+                return (int32_t)pvar->global_var.value;
+            }
+        }
+    }
+    return 0;
+}
+
+static void SafeSetConfigVarFromSTU(StatescriptVar_VarBag* vb, STUConfigVarDynamic* out_var, STUConfigVar* m_value) {
+    if (!vb || !out_var || !m_value || IsBadReadPtr(vb, sizeof(StatescriptVar_VarBag))) return;
+    if (!vb->base.stu_base.vfptr) return;
+    __try {
+        vb->base.stu_base.vfptr->SetConfigVarValueFromSTUConfigVar(vb, out_var, m_value, nullptr);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+static void RefillInstanceAmmoVarBags(StatescriptSyncMgr* mgr, StatescriptInstance* inst, int32_t fallback_max_ammo = 6) {
+    if (!inst || IsBadReadPtr(inst, sizeof(StatescriptInstance))) return;
+    // Verified weapon ammo VarBag variables from live dump (e.g. McCree Peacekeeper 0x05800000000001D2 inst=-23):
+    //   0x0D80000000000035ULL (INT): Current Ammo (e.g. 3/6 after firing 3 shots)
+    //   0x0D800000000000C6ULL (INT): Max Ammo (6 for McCree, 200 for Bastion/Mei)
+    //   0x0D800000000000E6ULL (INT): UI Max Ammo (6 for McCree)
+    //   0x0D80000000000033ULL (INT): Empty/Reload flag (0 when loaded)
+    //   0x0D80000000000105ULL (INT): Secondary ammo var
+    constexpr __int64 kVarCurAmmo35  = (__int64)0x0D80000000000035ULL;
+    constexpr __int64 kVarMaxAmmoC6  = (__int64)0x0D800000000000C6ULL;
+    constexpr __int64 kVarMaxAmmoE6  = (__int64)0x0D800000000000E6ULL;
+    constexpr __int64 kVarReload33   = (__int64)0x0D80000000000033ULL;
+    constexpr __int64 kVarCurAmmo105 = (__int64)0x0D80000000000105ULL;
+
+    StatescriptVar_VarBag* bags[3] = { inst->rid_instance_varbag, inst->second_inst_varbag, inst->third_inst_varbag };
+    int32_t max_ammo = 0;
+    for (StatescriptVar_VarBag* vb : bags) {
+        if (!vb || IsBadReadPtr(vb, sizeof(StatescriptVar_VarBag))) continue;
+        int32_t val = ReadVarBagInt32(vb, kVarMaxAmmoC6);
+        if (val > 0 && val <= 400) { max_ammo = val; break; }
+        val = ReadVarBagInt32(vb, kVarMaxAmmoE6);
+        if (val > 0 && val <= 400) { max_ammo = val; break; }
+    }
+    if (max_ammo <= 0) max_ammo = fallback_max_ammo;
+
+    StatescriptPrimitive prim_max(StatescriptPrimitive_INT, (__int64)max_ammo);
+    StatescriptPrimitive prim_zero(StatescriptPrimitive_INT, 0);
+    for (StatescriptVar_VarBag* vb : bags) {
+        if (vb && !IsBadReadPtr(vb, sizeof(StatescriptVar_VarBag))) {
+            vb->SetVar({ kVarCurAmmo35 }, prim_max);
+            vb->SetVar({ StatescriptVar_ENTITY_VARBAG, kVarCurAmmo35 }, prim_max);
+            NotifyVarInBag(mgr, inst, vb, kVarCurAmmo35, prim_max);
+
+            vb->SetVar({ kVarReload33 }, prim_zero);
+            NotifyVarInBag(mgr, inst, vb, kVarReload33, prim_zero);
+
+            vb->SetVar({ kVarCurAmmo105 }, prim_max);
+            NotifyVarInBag(mgr, inst, vb, kVarCurAmmo105, prim_max);
+            if (mgr) mgr->needs_process_e = 1;
+        }
+    }
+    // Also invoke McCree Peacekeeper's native reload assignment node (0x05800000000001D2 node[22] 0x4698E4B6: 0x35 = 0xC6) if present
+    if (inst->script_id == 0x05800000000001D2ULL && inst->graph && !IsBadReadPtr(inst->graph, sizeof(STUStatescriptGraph)) &&
+        inst->graph->m_nodes.count() > 22 && inst->rid_instance_varbag) {
+        STUStatescriptBase* node22 = inst->graph->m_nodes.list()[22];
+        if (node22 && !IsBadReadPtr(node22, 0xA8)) {
+            auto* cvd35 = (STUConfigVarDynamic*)SafeReadVal<uintptr_t>((uintptr_t)node22 + 0x90);
+            auto* cvC6  = (STUConfigVar*)SafeReadVal<uintptr_t>((uintptr_t)node22 + 0xA0);
+            if (cvd35 && cvC6) {
+                SafeSetConfigVarFromSTU(inst->rid_instance_varbag, cvd35, cvC6);
+            }
+        }
+    }
+}
+
+static void RefillEntityAmmoVarBags(Entity* ent, int32_t default_max_ammo = 6) {
+    if (!ent || IsBadReadPtr(ent, sizeof(Entity))) return;
+    auto* c23 = ent->getById<Component_23_Statescript>(0x23);
+    if (!c23 || IsBadReadPtr(c23, sizeof(Component_23_Statescript))) return;
+
+    constexpr __int64 kVarCurAmmo35  = (__int64)0x0D80000000000035ULL;
+    constexpr __int64 kVarMaxAmmoC6  = (__int64)0x0D800000000000C6ULL;
+    constexpr __int64 kVarCurAmmo105 = (__int64)0x0D80000000000105ULL;
+    constexpr __int64 kVarMaxAmmo106 = (__int64)0x0D80000000000106ULL;
+
+    int32_t max_ammo = GetEntityVarBagInt32(c23, (uint64_t)kVarMaxAmmoC6);
+    if (max_ammo <= 0 || max_ammo > 400) max_ammo = GetEntityVarBagInt32(c23, (uint64_t)kVarMaxAmmo106);
+    if (max_ammo <= 0 || max_ammo > 400) max_ammo = default_max_ammo;
+
+    StatescriptPrimitive prim(StatescriptPrimitive_INT, (__int64)max_ammo);
+    if (c23->ss_inner.rid_entity_varbag && !IsBadReadPtr(c23->ss_inner.rid_entity_varbag, sizeof(StatescriptVar_VarBag))) {
+        c23->ss_inner.rid_entity_varbag->SetVar({ kVarCurAmmo35 }, prim);
+        c23->ss_inner.rid_entity_varbag->SetVar({ StatescriptVar_ENTITY_VARBAG, kVarCurAmmo35 }, prim);
+        NotifyVarInBag(&c23->ss_inner, nullptr, c23->ss_inner.rid_entity_varbag, kVarCurAmmo35, prim);
+
+        c23->ss_inner.rid_entity_varbag->SetVar({ kVarCurAmmo105 }, prim);
+        c23->ss_inner.rid_entity_varbag->SetVar({ StatescriptVar_ENTITY_VARBAG, kVarCurAmmo105 }, prim);
+        NotifyVarInBag(&c23->ss_inner, nullptr, c23->ss_inner.rid_entity_varbag, kVarCurAmmo105, prim);
+        c23->ss_inner.needs_process_e = 1;
+    }
+    if (c23->ss_inner.g3_arrWithIds.ptr && c23->ss_inner.g3_arrWithIds.num > 0 && c23->ss_inner.g3_arrWithIds.num <= 64) {
+        for (int i = 0; i < c23->ss_inner.g3_arrWithIds.num; ++i) {
+            RefillInstanceAmmoVarBags(&c23->ss_inner, c23->ss_inner.g3_arrWithIds.ptr[i].instance, max_ammo);
+        }
+    }
+    if (c23->ss_inner.g1_instanceArr.ptr && c23->ss_inner.g1_instanceArr.num > 0 && c23->ss_inner.g1_instanceArr.num <= 64) {
+        for (int i = 0; i < c23->ss_inner.g1_instanceArr.num; ++i) {
+            RefillInstanceAmmoVarBags(&c23->ss_inner, c23->ss_inner.g1_instanceArr.ptr[i], max_ammo);
+        }
+    }
+}
+
+static void SafeTickSyncMgr(StatescriptSyncMgr* mgr) {
+    if (!mgr || IsBadReadPtr(mgr, sizeof(StatescriptSyncMgr))) return;
+    using TickSyncMgrFn = void(__fastcall*)(StatescriptSyncMgr* mgr, int frame, int a3);
+    auto tick_sync_mgr = (TickSyncMgrFn)(globals::gameBase + 0xD13C20);
+    __try {
+        tick_sync_mgr(mgr, ++mgr->increasing_counter1, 1);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+static void RefillHeroWeaponAmmo(Entity* hero_ent) {
+    if (!hero_ent || IsBadReadPtr(hero_ent, sizeof(Entity))) return;
+    RefillEntityAmmoVarBags(hero_ent, 6);
+    EntityAdminBase* ea = GameEntityAdmin();
+    auto* c23 = hero_ent->getById<Component_23_Statescript>(0x23);
+    if (ea && c23 && !IsBadReadPtr(c23, sizeof(Component_23_Statescript))) {
+        uintptr_t slot_arr = SafeReadVal<uintptr_t>((uintptr_t)c23 + 0x1458);
+        int32_t slot_cnt   = SafeReadVal<int32_t>((uintptr_t)c23 + 0x1460);
+        if (slot_arr && slot_cnt > 0 && slot_cnt <= 16) {
+            for (int i = 0; i < slot_cnt; ++i) {
+                uint32_t wep0 = SafeReadVal<uint32_t>(slot_arr + (uintptr_t)i * 0x18 + 0x00);
+                uint32_t wep1 = SafeReadVal<uint32_t>(slot_arr + (uintptr_t)i * 0x18 + 0x04);
+                if (wep0 && wep0 != 0xFFFFFFFFu) RefillEntityAmmoVarBags(ea->getEntById(wep0), 6);
+                if (wep1 && wep1 != 0xFFFFFFFFu) RefillEntityAmmoVarBags(ea->getEntById(wep1), 6);
+            }
+        }
+    }
+    ShotDiagLogFmt("[AMMO_REFILL] hero=0x%X refilled weapon (0x35=0xC6) & entity ammo VarBags", hero_ent->entity_id);
+}
+
+static float ApplyHealingToHealthComponent(Component_28_STUHealthComponent* c28, float heal_amt) {
+    if (!c28 || heal_amt <= 0.0f) return c28 ? c28->CalcTotalCurrentHealth() : 0.0f;
+    // Restore Normal -> Armor -> Shield up to each part's max_health
+    HealthPart* pools[3] = { c28->normal_health, c28->armour_health, c28->shield_health };
+    for (int p_idx = 0; p_idx < 3 && heal_amt > 0.0f; p_idx++) {
+        HealthPart* pool = pools[p_idx];
+        for (int i = 0; i < 0x10 && heal_amt > 0.0f; i++) {
+            if (!pool[i].part_enabled || pool[i].max_health <= 0.0f) continue;
+            float missing = pool[i].max_health - pool[i].curr_health;
+            if (missing <= 0.0f) continue;
+            if (heal_amt >= missing) {
+                pool[i].curr_health = pool[i].max_health;
+                heal_amt -= missing;
+            } else {
+                pool[i].curr_health += heal_amt;
+                heal_amt = 0.0f;
+            }
+        }
+    }
+    return c28->CalcTotalCurrentHealth();
+}
+
+static float ApplyHeroSelfHeal(Entity* target_ent, float heal_amt, uint64_t script_id, const char* tag) {
+    if (!target_ent || IsBadReadPtr(target_ent, sizeof(Entity)) || !target_ent->hasComponent(0x28)) return 0.0f;
+    auto* c28 = target_ent->getById<Component_28_STUHealthComponent>(0x28);
+    if (!c28 || IsBadReadPtr(c28, sizeof(Component_28_STUHealthComponent))) return 0.0f;
+    float new_hp = ApplyHealingToHealthComponent(c28, heal_amt);
+    SyncEntityHealthVarBag(target_ent);
+    ShotDiagLogFmt("[%s] script=0x%llX target=0x%X +%.1f -> HP %.1f",
+        tag ? tag : "SELF_HEAL", (unsigned long long)script_id, target_ent->entity_id, heal_amt, new_hp);
+    return new_hp;
+}
+
+static float ResolveShotBaseDamage(Entity* shooter, Entity* proj_ent) {
+    if (!shooter) shooter = GetLocalHeroModelEnt();
+    if (!shooter) return WeaponHardpointDiag::s_dummy_damage_per_pellet;
+
+    // 1. Check projectile entity resource ID first for known projectile types
+    uint64_t proj_res = (proj_ent && proj_ent->resload_entry) ? (uint64_t)proj_ent->resload_entry->resource_id : 0;
+    if (proj_res == 0x0400000000000045ULL) return 5.0f; // Tracer Pulse Bomb stick
+
+    // 2. Determine shooter's STUHero ID (via Component_1F controller -> Component_3F or model_res_id)
+    EntityAdminBase* ea = GameEntityAdmin();
+    uint64_t heroid = 0;
+    uint64_t model_res_id = shooter->resload_entry ? (uint64_t)shooter->resload_entry->resource_id : 0;
+    if (auto* c1f = shooter->getById<Component_1F_Backref>(0x1F)) {
+        if (c1f->backref_entid && ea) {
+            if (Entity* ctrl_ent = ea->getEntById(c1f->backref_entid)) {
+                if (auto* c3f = ctrl_ent->getById<Component_3F_PlayerInfo>(0x3F)) {
+                    heroid = (uint64_t)c3f->selected_heroid;
+                }
+            }
+        }
+    }
+    if (heroid == 0 && ea && ea->local_entid) {
+        if (Entity* local_ctrl = ea->getEntById(ea->local_entid)) {
+            if (auto* c3f = local_ctrl->getById<Component_3F_PlayerInfo>(0x3F)) {
+                heroid = (uint64_t)c3f->selected_heroid;
+            }
+        }
+    }
+
+    // Overwatch 0.8.0 (Build 24919) Per-Pellet / Per-Projectile Base Damage Table for All 21 Launch Heroes
+    switch (heroid) {
+    case 0x02E0000000000002ULL: return 7.0f;   // Reaper: Hellfire Shotguns (7.0 x 20 pellets = 140)
+    case 0x02E0000000000003ULL: return 6.0f;   // Tracer: Pulse Pistols (6.0 x 2 pellets = 12)
+    case 0x02E0000000000004ULL: return 20.0f;  // Mercy: Caduceus Blaster
+    case 0x02E0000000000005ULL: return 125.0f; // Hanzo: Storm Bow arrow
+    case 0x02E0000000000006ULL: return 70.0f;  // Torbjorn: Rivet Gun
+    case 0x02E0000000000007ULL: return 100.0f; // Reinhardt: Fire Strike projectile
+    case 0x02E0000000000008ULL: return 120.0f; // Pharah: Rocket Launcher
+    case 0x02E0000000000009ULL: return 3.0f;   // Winston: Tesla Cannon tick
+    case 0x02E000000000000AULL: return 13.0f;  // Widowmaker: Widow's Kiss (SMG / unscoped)
+    case 0x02E0000000000015ULL: return 20.0f;  // Bastion: Configuration Recon / Sentry
+    case 0x02E0000000000016ULL: return 25.0f;  // Symmetra: Photon Projector
+    case 0x02E0000000000020ULL: return 45.0f;  // Zenyatta: Orb of Destruction
+    case 0x02E0000000000029ULL: return 28.0f;  // Genji: Shuriken
+    case 0x02E0000000000040ULL: return 9.0f;   // Roadhog: Scrap Gun (9.0 x 25 pellets = 225)
+    case 0x02E0000000000042ULL: return 70.0f;  // McCree: Peacekeeper
+    case 0x02E0000000000065ULL: return 120.0f; // Junkrat: Frag Launcher
+    case 0x02E0000000000068ULL: return (proj_ent && proj_ent != shooter) ? 95.0f : 45.0f;  // Zarya: Particle Cannon (RMB grenade 95 / LMB beam 45)
+    case 0x02E000000000006EULL: return (proj_ent && proj_ent != shooter) ? 120.0f : 17.0f; // Soldier: 76: Helix Rockets (120) / Heavy Pulse Rifle (17)
+    case 0x02E0000000000079ULL: return 16.0f;  // Lucio: Sonic Amplifier
+    case 0x02E000000000007AULL: return (model_res_id == 0x040000000000040AULL) ? 14.0f : 3.0f; // D.Va: Light Gun (14) / Fusion Cannons (3 x 8)
+    case 0x02E00000000000DDULL: return 75.0f;  // Mei: Endothermic Blaster Icicle
+    default: break;
+    }
+    return WeaponHardpointDiag::s_dummy_damage_per_pellet;
 }
 
 // 5. +0xD423C0: TickProjectileManager (EntityAdmin + 0xA80)
 // Fixes Gate 3: At +0xD42595..+0xD425AD, +0xD423C0 unpacks the 13-bit unsigned inst_id ((handle >> 19) & 0x1FFF = 0x1FFD
 // for inst_id = -3 = 0xFFFD) into [entry + 0x14] without sign-extending bit 12 (0x1000).
-// Transiently masking g3_arrWithIds[i].instance_id &= 0x1FFF on the Local Hero Model around +0xD423C0
-// ensures projectile lifecycle / stick / detonate lookups match inst_id = -3.
-using TickProjectileManagerFn = void(__fastcall*)(EntityAdminBase* game_ea);
+// Also integrates active 0xD78490D1 Impulse/Knockback velocity, 100ms Heal-Over-Time (HoT), and dash sweeps smoothly on the local Hero Model.
+static void HideSingleEntity(Entity* ent) {
+    if (!ent) return;
+    const Vector4 hidden_pos(0.0f, -5000.0f, 0.0f, 0.0f);
+    const Vector4 hidden_rot(0.0f, 0.0f, 0.0f, 1.0f);
+    if (auto* slot = OriginClutterTracker::GetSlot(ent->entity_id, ent)) {
+        slot->has_nonzero_pos = true;
+        slot->latest_nonzero_pos = hidden_pos;
+        slot->latest_nonzero_rot = hidden_rot;
+    }
+    if (ComponentBase* c12 = ent->getById(0x12)) {
+        if (!IsBadReadPtr(c12, 0x40)) {
+            *(Vector4*)((uintptr_t)c12 + 0x20) = hidden_pos;
+        }
+    }
+    if (auto* c15 = ent->getById<Component_15_STUCharacterMoverComponent>(0x15)) {
+        if (!IsBadReadPtr(c15, sizeof(Component_15_STUCharacterMoverComponent))) {
+            c15->movement_state_1.absolute_position = hidden_pos;
+            c15->movement_state_2.absolute_position = hidden_pos;
+        }
+    }
+    if (auto* c1 = ent->getById<Component_1_SceneRendering>(1)) {
+        if (!IsBadReadPtr(c1, sizeof(Component_1_SceneRendering))) {
+            *(uint32_t*)((uintptr_t)c1 + 0x1B8) &= ~0x10000u;
+            // Only queue scene dirty updates if [c1 + 0x148] is valid (otherwise +0x9F4720 -> +0xA453DB crashes on null [c1 + 0x148])
+            if (SafeReadVal<uintptr_t>((uintptr_t)c1 + 0x148) != 0) {
+                c1->SetScale(Vector4(0.0f, 0.0f, 0.0f, 0.0f));
+                c1->SetInvisible();
+                c1->SetPosRotation(hidden_pos, hidden_rot);
+            } else {
+                c1->scaling = Vector4(0.0f, 0.0f, 0.0f, 0.0f);
+                c1->position = hidden_pos;
+            }
+        }
+    }
+}
+
+static void HideAndExpireSubEntity(EntityAdminBase* ea, Entity* sub_ent, Entity* local_hero) {
+    if (!sub_ent || sub_ent == local_hero || (ea && sub_ent->entity_id == ea->local_entid)) return;
+    Vector4 sub_pos{};
+    if (auto* sc1 = sub_ent->getById<Component_1_SceneRendering>(1)) {
+        if (!IsBadReadPtr(sc1, sizeof(Component_1_SceneRendering))) sub_pos = sc1->position;
+    }
+
+    // Clean up any 0x6E81F6D4 (STUStatescriptStateEffect) child entities & particle rings stored in sub_ent's Component_23 + 0x1458
+    // (+0xD86F30 -> +0xD55AA0: slot_mgr = comp23 + 0x1458, recs = *(slot_mgr + 0x08), cnt = *(slot_mgr + 0x10), stride = 0x250, key = *(rec + 0x168))
+    // IMPORTANT: In +0xD55AA0:
+    //   - +0xD55B1C calls +0xD578C0 -> +0x9E3E20 (stops the yellow healing ring particle effect on Component_0D via [rec + 0x190]).
+    //   - +0xD55B21..+0xD55B34 reads e0=[rec+0x00], e1=[rec+0x04] and calls +0xD576D0 -> +0x80FF50 (delEnt), which queues ce0's Component_1
+    //     into the scene deletion queue ([scene_mgr + 0x2D0]) and crashes +0x9F4720 -> +0xA453C0 at +0xA453DB ([c1 + 0x148] == 0).
+    // Masking [rec+0x00] = 0xFFFFFFFF and [rec+0x04] = 0xFFFFFFFF before calling +0xD55AA0 lets +0xD578C0 stop the particle effect
+    // while skipping +0xD576D0 (delEnt), and we hide ce0/ce1 via HideSingleEntity instead.
+    if (auto* sub_c23 = sub_ent->getById<Component_23_Statescript>(0x23)) {
+        if (!IsBadReadPtr(sub_c23, sizeof(Component_23_Statescript))) {
+            uintptr_t slot_mgr = (uintptr_t)sub_c23 + 0x1458;
+            auto cleanup_slot_fn = (void(__fastcall*)(uintptr_t, uint64_t))(globals::gameBase + 0xD55AA0);
+            for (int iter = 0; iter < 8; ++iter) {
+                int32_t rec_cnt = SafeReadVal<int32_t>(slot_mgr + 0x10);
+                uintptr_t recs  = SafeReadVal<uintptr_t>(slot_mgr + 0x08);
+                if (rec_cnt <= 0 || !recs || IsBadReadPtr((const void*)recs, 0x250)) break;
+                uint32_t e0  = SafeReadVal<uint32_t>(recs + 0x00);
+                uint32_t e1  = SafeReadVal<uint32_t>(recs + 0x04);
+                uint64_t key = SafeReadVal<uint64_t>(recs + 0x168);
+                *(uint32_t*)(recs + 0x00) = 0xFFFFFFFFu;
+                *(uint32_t*)(recs + 0x04) = 0xFFFFFFFFu;
+                if (key != 0) {
+                    cleanup_slot_fn(slot_mgr, key);
+                }
+                if (ea && e0 && e0 != 0xFFFFFFFFu) {
+                    if (Entity* ce0 = ea->getEntById(e0)) HideSingleEntity(ce0);
+                }
+                if (ea && e1 && e1 != 0xFFFFFFFFu) {
+                    if (Entity* ce1 = ea->getEntById(e1)) HideSingleEntity(ce1);
+                }
+                if (key == 0) break;
+            }
+        }
+    }
+
+    HideSingleEntity(sub_ent);
+
+    if (!ea) return;
+    for (Entity* child : *ea) {
+        if (!child || child == sub_ent || child == local_hero || child->entity_id == ea->local_entid) continue;
+        if (child->hasComponent(0x15) || child->hasComponent(0x28)) continue; // never hide heroes/dummies
+
+        bool is_attached_child = (child->parent == sub_ent);
+        if (!is_attached_child) {
+            if (auto* c1f = child->getById<Component_1F_Backref>(0x1F)) {
+                if (!IsBadReadPtr(c1f, sizeof(Component_1F_Backref)) && c1f->backref_entid == sub_ent->entity_id) {
+                    is_attached_child = true;
+                }
+            }
+        }
+        uint64_t child_res_id = (child->resload_entry && !IsBadReadPtr(child->resload_entry, 0x38))
+            ? SafeReadVal<uint64_t>((uintptr_t)child->resload_entry + 0x30) : 0ULL;
+        if (child_res_id == 0x040000000000068AULL || child_res_id == 0x04000000000003DCULL) {
+            is_attached_child = true;
+        }
+        if (!is_attached_child && child->entity_id > sub_ent->entity_id && child->entity_id <= sub_ent->entity_id + 16) {
+            if (auto* cc1 = child->getById<Component_1_SceneRendering>(1)) {
+                if (!IsBadReadPtr(cc1, sizeof(Component_1_SceneRendering))) {
+                    Vector4 d = Sub3(cc1->position, sub_pos);
+                    if (Dot3(d, d) <= 4.0f) {
+                        is_attached_child = true;
+                    }
+                }
+            }
+        }
+        if (is_attached_child) {
+            HideSingleEntity(child);
+        }
+    }
+}
+
+using TickProjectileManagerFn = void(__fastcall*)(void* proj_sys);
 static TickProjectileManagerFn TickProjectileManager_orig = nullptr;
-static void __fastcall TickProjectileManager_hook(EntityAdminBase* game_ea) {
+static void __fastcall TickProjectileManager_hook(void* proj_sys) {
+    EntityAdminBase* game_ea = GameEntityAdmin();
     struct SavedInstId {
         uint16_t* slot_ptr;
         uint16_t  orig_id;
@@ -3380,10 +3972,209 @@ static void __fastcall TickProjectileManager_hook(EntityAdminBase* game_ea) {
     SavedInstId saved[64];
     int saved_count = 0;
 
-    // Mask negative 16-bit instance_ids (e.g. -3 = 0xFFFD -> 0x1FFD) in local Hero Model's g3_arrWithIds
-    // so +0xD425A5 ((handle >> 19) & 0x1FFF) matches inst_id = -3 in +0xD42660!
+    uint64_t now_ms = GetTickCount64();
     Entity* local_hero = GetLocalHeroModelEnt();
     if (local_hero) {
+        static uint32_t s_last_local_hero_entid = 0;
+        if (local_hero->entity_id != s_last_local_hero_entid) {
+            s_last_local_hero_entid = local_hero->entity_id;
+            s_active_hot_end_ms = 0;
+            s_active_hot_hp_per_100ms = 0.0f;
+            s_bastion_repair_active = false;
+            s_biotic_field_end_ms = 0;
+            s_biotic_field_ent_id = 0;
+            s_active_impulse_end_ms = 0;
+            s_active_dash_sweep_end_ms = 0;
+            s_riptire_ent_id = 0;
+            s_riptire_end_ms = 0;
+        }
+        auto* comp15 = local_hero->getById<Component_15_STUCharacterMoverComponent>(0x15);
+        auto* comp01 = local_hero->getById<Component_1_SceneRendering>(1);
+        auto* owner_c10 = local_hero->getById<Component_10_FilterBits>(0x10);
+        Vector4 hero_pos = (comp15 && !IsBadReadPtr(comp15, sizeof(Component_15_STUCharacterMoverComponent)))
+            ? comp15->movement_state_1.absolute_position : (comp01 ? comp01->position : Vector4{});
+
+        // 1a. Integrate active 0xD78490D1 impulse velocity if within active window
+        if (s_active_impulse_end_ms > now_ms && comp15 && !IsBadReadPtr(comp15, sizeof(Component_15_STUCharacterMoverComponent))) {
+            constexpr float kDt = 0.016f;
+            Vector4 pos = comp15->movement_state_1.absolute_position;
+            Vector4 rot = comp15->movement_state_1.rotation_quaternion;
+            pos.X += s_active_impulse_vel.X * kDt;
+            pos.Y += s_active_impulse_vel.Y * kDt;
+            pos.Z += s_active_impulse_vel.Z * kDt;
+            if (pos.Y < s_active_impulse_min_y) pos.Y = s_active_impulse_min_y;
+            comp15->movement_state_1.absolute_position = pos;
+            comp15->movement_state_2.absolute_position = pos;
+            if (s_active_impulse_vel.Y > 0.0f) {
+                comp15->movement_state_1.gravity_delta.Y = 0.0f;
+                comp15->movement_state_2.gravity_delta.Y = 0.0f;
+            }
+            if (comp01 && !IsBadReadPtr(comp01, sizeof(Component_1_SceneRendering))) {
+                comp01->SetPosRotation(pos, rot);
+            }
+            hero_pos = pos;
+        }
+
+        // 1b. Smooth 100ms Heal-Over-Time (Roadhog Breather 300 HP / 1.0s, Mei Cryo-Freeze 150 HP / 4.0s)
+        if (s_active_hot_end_ms > now_ms && s_active_hot_hp_per_100ms > 0.0f && (now_ms - s_active_hot_last_tick_ms) >= 100) {
+            s_active_hot_last_tick_ms = now_ms;
+            ApplyHeroSelfHeal(local_hero, s_active_hot_hp_per_100ms, s_active_hot_script_id, "HOT_TICK");
+        }
+
+        // 1c. Bastion Self-Repair (0x0580000000000153): continuous +7.5 HP per 100ms (75 HP/s) while 'E' is held (node=47 active)
+        if (s_bastion_repair_active && (now_ms - s_bastion_last_tick_ms) >= 100) {
+            s_bastion_last_tick_ms = now_ms;
+            ApplyHeroSelfHeal(local_hero, 7.5f, 0x0580000000000153ULL, "BASTION_REPAIR_HOT");
+        }
+
+        // 1d. Soldier: 76 Biotic Field (0x0580000000000257 / 0x0580000000000258): +4.0 HP per 100ms (40 HP/s) for 5s within 5.5m
+        if (s_biotic_field_end_ms > 0) {
+            if (now_ms < s_biotic_field_end_ms) {
+                if ((now_ms - s_biotic_field_last_ms) >= 100) {
+                    s_biotic_field_last_ms = now_ms;
+                    Vector4 d = Sub3(hero_pos, s_biotic_field_pos);
+                    if (sqrtf(Dot3(d, d)) <= 5.5f) {
+                        ApplyHeroSelfHeal(local_hero, 4.0f, 0x0580000000000258ULL, "BIOTIC_FIELD_HOT");
+                    }
+                }
+            } else {
+                if (game_ea && s_biotic_field_ent_id != 0) {
+                    if (Entity* bf_ent = game_ea->getEntById(s_biotic_field_ent_id)) {
+                        if (bf_ent != local_hero) {
+                            HideAndExpireSubEntity(game_ea, bf_ent, local_hero);
+                        }
+                    }
+                }
+                s_biotic_field_ent_id = 0;
+                s_biotic_field_end_ms = 0;
+            }
+        }
+
+        // 1e. Moving dash/leap damage sweep (Swift Strike 0x1DB = 50, Jump Pack 0x109 = 50, D.Va Boosters 0x26A = 25, Reinhardt Charge 0x07D = 75)
+        // Works whether hero movement is driven by 0xD78490D1 or native movement states (0xC17B255D / 0x2A0FB7E6).
+        if (s_active_dash_sweep_end_ms > now_ms && s_active_dash_sweep_dmg > 0.0f && game_ea && (comp15 || comp01)) {
+            for (Entity* ent : *game_ea) {
+                if (!ent || ent == local_hero || !ent->hasComponent(0x15) || !ent->hasComponent(0x28)) continue;
+                auto* c10 = ent->getById<Component_10_FilterBits>(0x10);
+                if (owner_c10 && c10 && (owner_c10->filter_bits & 0x3C0000ULL) == (c10->filter_bits & 0x3C0000ULL)) continue;
+                bool already_hit = false;
+                for (int h = 0; h < s_active_dash_sweep_hit_count; ++h) {
+                    if (s_active_dash_sweep_hit_ents[h] == ent->entity_id) { already_hit = true; break; }
+                }
+                if (already_hit) continue;
+
+                auto* c1 = ent->getById<Component_1_SceneRendering>(1);
+                auto* c28 = ent->getById<Component_28_STUHealthComponent>(0x28);
+                if (!c1 || IsBadReadPtr(c1, sizeof(Component_1_SceneRendering)) || !c28 || c28->CalcTotalCurrentHealth() <= 0.0f) continue;
+                // Only hit active skeletal hitbox candidates (bit 16 = 0x10000), never hidden pilot models or non-hitbox entities
+                if ((*(uint32_t*)((uintptr_t)c1 + 0x1B8) & 0x10000u) == 0) continue;
+
+                Vector4 d = Sub3(c1->position, hero_pos);
+                float dist = sqrtf(Dot3(d, d));
+                if (dist <= s_active_dash_sweep_radius) {
+                    if (s_active_dash_sweep_hit_count < 16) {
+                        s_active_dash_sweep_hit_ents[s_active_dash_sweep_hit_count++] = ent->entity_id;
+                    }
+                    float new_hp = ApplyDamageToHealthComponent(c28, s_active_dash_sweep_dmg);
+                    if (new_hp <= 0.0f) {
+                        *(uint32_t*)((uintptr_t)c1 + 0x1B8) &= ~0x10000u;
+                    }
+                    *(uint32_t*)((uintptr_t)c28 + 0x14) = 1;
+                    s_last_hit_dummy_entid = ent->entity_id;
+                    s_last_hit_dummy_ms = GetTickCount64();
+                    SyncEntityHealthVarBag(ent);
+                    {
+                        std::lock_guard<std::mutex> hit_lock(s_pellet_hit_mutex);
+                        if (s_pending_dmg_pkt_count < 32) {
+                            int32_t dmg_int = (int32_t)(s_active_dash_sweep_dmg + 0.5f);
+                            if (dmg_int < 1) dmg_int = 1;
+                            uint8_t pkt_flags = (uint8_t)(new_hp <= 0.0f ? 2 : 0);
+                            s_pending_dmg_pkts[s_pending_dmg_pkt_count++] = PendingDamagePacket{ ent->entity_id, dmg_int, pkt_flags, true };
+                        }
+                    }
+                    // Apply knockback impulse to hit enemy for D.Va Boosters (0x47E / 0x26A / 0xB2F), Reinhardt Charge (0x07D / 0x0BE), and Winston Jump Pack (0x109)
+                    Vector4 hero_fwd{ 0.0f, 0.0f, 1.0f, 0.0f };
+                    if (comp15 && !IsBadReadPtr(comp15, sizeof(Component_15_STUCharacterMoverComponent))) {
+                        const Vector4& q = comp15->movement_state_1.rotation_quaternion;
+                        hero_fwd.X = 2.0f * (q.X * q.Z + q.W * q.Y);
+                        hero_fwd.Z = 1.0f - 2.0f * (q.X * q.X + q.Y * q.Y);
+                    }
+                    Vector4 push_dir{ d.X + hero_fwd.X * 1.5f, 0.0f, d.Z + hero_fwd.Z * 1.5f, 0.0f };
+                    if (s_active_dash_sweep_script_id == 0x058000000000047EULL ||
+                        s_active_dash_sweep_script_id == 0x058000000000026AULL ||
+                        s_active_dash_sweep_script_id == 0x0580000000000B2FULL) {
+                        ArmEnemyKnockback(ent, push_dir, 12.0f, 4.5f, 450);
+                    } else if (s_active_dash_sweep_script_id == 0x058000000000007DULL || s_active_dash_sweep_script_id == 0x05800000000000BEULL) {
+                        ArmEnemyKnockback(ent, push_dir, 16.0f, 5.5f, 550);
+                    } else if (s_active_dash_sweep_script_id == 0x0580000000000109ULL || s_active_dash_sweep_script_id == 0x058000000000010AULL ||
+                               s_active_dash_sweep_script_id == 0x0580000000000038ULL || s_active_dash_sweep_script_id == 0x05800000000000FEULL) {
+                        ArmEnemyKnockback(ent, d, 8.0f, 3.5f, 350);
+                    }
+                    ShotDiagLogFmt("[DASH_SWEEP_DMG] script=0x%llX hit=0x%X dist=%.2fm -%.1f -> HP %.1f",
+                        (unsigned long long)s_active_dash_sweep_script_id, ent->entity_id, dist, s_active_dash_sweep_dmg, new_hp);
+                }
+            }
+        }
+
+        // 1f. Integrate active enemy knockback velocities (D.Va Boosters, Reinhardt Charge, Winston Jump Pack / Primal Rage, Lucio Soundwave)
+        if (game_ea && s_enemy_knockback_count > 0) {
+            constexpr float kDt = 0.016f;
+            for (int i = 0; i < s_enemy_knockback_count; ) {
+                EnemyKnockbackEntry& kb = s_enemy_knockbacks[i];
+                Entity* kb_ent = kb.ent_id ? game_ea->getEntById(kb.ent_id) : nullptr;
+                if (!kb_ent || kb_ent == local_hero || now_ms >= kb.end_ms) {
+                    if (kb_ent && kb_ent != local_hero) {
+                        if (auto* c1 = kb_ent->getById<Component_1_SceneRendering>(1)) {
+                            if (!IsBadReadPtr(c1, sizeof(Component_1_SceneRendering)) && c1->position.Y < kb.ground_y) {
+                                Vector4 p = c1->position;
+                                p.Y = kb.ground_y;
+                                if (auto* slot = OriginClutterTracker::GetSlot(kb_ent->entity_id, kb_ent)) {
+                                    slot->has_nonzero_pos = true;
+                                    slot->latest_nonzero_pos = p;
+                                }
+                                c1->SetPosRotation(p, c1->rotation);
+                                if (auto* c15 = kb_ent->getById<Component_15_STUCharacterMoverComponent>(0x15)) {
+                                    if (!IsBadReadPtr(c15, sizeof(Component_15_STUCharacterMoverComponent))) {
+                                        c15->movement_state_1.absolute_position = p;
+                                        c15->movement_state_2.absolute_position = p;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    s_enemy_knockbacks[i] = s_enemy_knockbacks[--s_enemy_knockback_count];
+                    continue;
+                }
+                auto* c1 = kb_ent->getById<Component_1_SceneRendering>(1);
+                auto* c15 = kb_ent->getById<Component_15_STUCharacterMoverComponent>(0x15);
+                if (c1 && !IsBadReadPtr(c1, sizeof(Component_1_SceneRendering))) {
+                    Vector4 p = c1->position;
+                    Vector4 r = c1->rotation;
+                    p.X += kb.vel.X * kDt;
+                    p.Y += kb.vel.Y * kDt;
+                    p.Z += kb.vel.Z * kDt;
+                    kb.vel.Y -= 19.6f * kDt;
+                    kb.vel.X *= 0.96f;
+                    kb.vel.Z *= 0.96f;
+                    if (p.Y <= kb.ground_y) {
+                        p.Y = kb.ground_y;
+                        if (kb.vel.Y < 0.0f) kb.vel.Y = 0.0f;
+                    }
+                    if (auto* slot = OriginClutterTracker::GetSlot(kb_ent->entity_id, kb_ent)) {
+                        slot->has_nonzero_pos = true;
+                        slot->latest_nonzero_pos = p;
+                        slot->latest_nonzero_rot = r;
+                    }
+                    c1->SetPosRotation(p, r);
+                    if (c15 && !IsBadReadPtr(c15, sizeof(Component_15_STUCharacterMoverComponent))) {
+                        c15->movement_state_1.absolute_position = p;
+                        c15->movement_state_2.absolute_position = p;
+                    }
+                }
+                ++i;
+            }
+        }
+
         if (auto* c23 = local_hero->getById<Component_23_Statescript>(0x23)) {
             int num = c23->ss_inner.g3_arrWithIds.num;
             uintptr_t arr = (uintptr_t)c23->ss_inner.g3_arrWithIds.ptr;
@@ -3400,7 +4191,176 @@ static void __fastcall TickProjectileManager_hook(EntityAdminBase* game_ea) {
         }
     }
 
-    TickProjectileManager_orig(game_ea);
+    // 2. Stage H1.3: Tick created sub-entities (Turrets, Sentries, Ice Wall, Biotic Field, Blizzard, Dragonstrike, Barriers)
+    if (game_ea && s_created_sub_entity_count > 0) {
+        constexpr float kDt = 0.016f;
+
+        for (int i = 0; i < s_created_sub_entity_count; ) {
+            CreatedSubEntityEntry& sub = s_created_sub_entities[i];
+            Entity* sub_ent = sub.ent_id ? game_ea->getEntById(sub.ent_id) : nullptr;
+            if (!sub_ent || (sub.expire_ms > 0 && now_ms >= sub.expire_ms)) {
+                if (sub_ent && sub.expire_ms > 0 && now_ms >= sub.expire_ms && sub_ent != local_hero) {
+                    HideAndExpireSubEntity(game_ea, sub_ent, local_hero);
+                }
+                s_created_sub_entities[i] = s_created_sub_entities[--s_created_sub_entity_count];
+                continue;
+            }
+
+            // Integrate velocity / ground clamp for moving or stationary sub-entities
+            auto* sub_c1 = sub_ent->getById<Component_1_SceneRendering>(1);
+            auto* sub_c15 = sub_ent->getById<Component_15_STUCharacterMoverComponent>(0x15);
+            if (sub_c1 && !IsBadReadPtr(sub_c1, sizeof(Component_1_SceneRendering))) {
+                Vector4 p = sub_c1->position;
+                Vector4 r = sub_c1->rotation;
+                bool moved = false;
+                if (sub.vel.X != 0.0f || sub.vel.Y != 0.0f || sub.vel.Z != 0.0f) {
+                    p.X += sub.vel.X * kDt;
+                    p.Y += sub.vel.Y * kDt;
+                    p.Z += sub.vel.Z * kDt;
+                    if (sub.has_gravity) {
+                        sub.vel.Y -= 19.6f * kDt;
+                        if (p.Y <= sub.ground_y) {
+                            p.Y = sub.ground_y;
+                            sub.vel = Vector4{};
+                            sub.has_gravity = false;
+                            sub.lock_stationary = true;
+                            sub.spawn_pos = p;
+                        }
+                    }
+                    moved = true;
+                } else if (sub.lock_stationary) {
+                    if (fabsf(p.X - sub.spawn_pos.X) > 0.01f || p.Y < sub.ground_y || fabsf(p.Z - sub.spawn_pos.Z) > 0.01f) {
+                        p.X = sub.spawn_pos.X;
+                        if (p.Y < sub.ground_y) p.Y = sub.ground_y;
+                        p.Z = sub.spawn_pos.Z;
+                        moved = true;
+                    }
+                    if (sub_c15 && !IsBadReadPtr(sub_c15, sizeof(Component_15_STUCharacterMoverComponent))) {
+                        sub_c15->movement_state_1.gravity_delta = Vector4{};
+                        sub_c15->movement_state_2.gravity_delta = Vector4{};
+                        sub_c15->movement_state_1.absolute_position = p;
+                        sub_c15->movement_state_2.absolute_position = p;
+                    }
+                } else if (sub.has_gravity && p.Y < sub.ground_y) {
+                    p.Y = sub.ground_y;
+                    moved = true;
+                }
+                if (moved) {
+                    if (auto* slot = OriginClutterTracker::GetSlot(sub_ent->entity_id, sub_ent)) {
+                        slot->has_nonzero_pos = true;
+                        slot->latest_nonzero_pos = p;
+                        slot->latest_nonzero_rot = r;
+                    }
+                    sub_c1->SetPosRotation(p, r);
+                    if (sub_c15 && !IsBadReadPtr(sub_c15, sizeof(Component_15_STUCharacterMoverComponent))) {
+                        sub_c15->movement_state_1.absolute_position = p;
+                        sub_c15->movement_state_2.absolute_position = p;
+                    }
+                }
+            }
+
+            // Tick the sub-entity's StatescriptSyncMgr (+0xD13C20 with 3 arguments) for manually spawned sub-entities
+            if (sub.script_id != 0x0580000000000258ULL) {
+                if (auto* sub_c23 = sub_ent->getById<Component_23_Statescript>(0x23)) {
+                    if (!IsBadReadPtr(sub_c23, sizeof(Component_23_Statescript))) {
+                        SafeTickSyncMgr(&sub_c23->ss_inner);
+                    }
+                }
+            }
+
+            // Periodic 250ms combat tick for active deployables (Turret, Sentry, Blizzard, Dragonstrike)
+            if (sub_c1 && (now_ms - sub.last_effect_ms) >= 250) {
+                sub.last_effect_ms = now_ms;
+                Entity* owner_ent = sub.owner_ent_id ? game_ea->getEntById(sub.owner_ent_id) : local_hero;
+                auto* owner_c10 = owner_ent ? owner_ent->getById<Component_10_FilterBits>(0x10) : nullptr;
+                Vector4 sp = sub_c1->position;
+
+                // Note: Soldier: 76 Biotic Field healing (+4.0 HP per 100ms = 40 HP/s) is handled in section 1d above via s_biotic_field_end_ms.
+                // Hanzo Dragonstrike (0x0580000000000101 / 0x04000000000002BA / 0x04000000000007C0), Mei Blizzard (0x058000000000064A),
+                // Torbjorn Turret (0x05800000000000F4 / 0x0400000000000143 / 0x040000000000005E),
+                // Symmetra Sentry (0x058000000000017E / 0x0400000000000251 / 0x0400000000000849)
+                bool is_dragon = (sub.script_id == 0x0580000000000101ULL || sub.res_id == 0x04000000000002BAULL || sub.res_id == 0x04000000000007C0ULL);
+                bool is_blizz  = (sub.script_id == 0x058000000000064AULL);
+                bool is_torb_t = (sub.script_id == 0x05800000000000F4ULL || sub.res_id == 0x0400000000000143ULL || sub.res_id == 0x040000000000005EULL);
+                bool is_sym_t  = (sub.script_id == 0x058000000000017EULL || sub.res_id == 0x0400000000000251ULL || sub.res_id == 0x0400000000000849ULL);
+                if (is_dragon || is_blizz || is_torb_t || is_sym_t) {
+                    float radius = is_torb_t ? 40.0f : (is_sym_t ? 10.0f : (is_blizz ? 10.0f : 4.5f));
+                    float tick_dmg = is_dragon ? 50.0f : (is_blizz ? 20.0f : (is_torb_t ? 14.0f : 12.5f));
+                    bool single_target = (is_torb_t || is_sym_t);
+                    for (Entity* ent : *game_ea) {
+                        if (!ent || ent == owner_ent || ent == sub_ent || !ent->hasComponent(0x15) || !ent->hasComponent(0x28)) continue;
+                        auto* c10 = ent->getById<Component_10_FilterBits>(0x10);
+                        if (owner_c10 && c10 && (owner_c10->filter_bits & 0x3C0000ULL) == (c10->filter_bits & 0x3C0000ULL)) continue;
+                        auto* c1 = ent->getById<Component_1_SceneRendering>(1);
+                        auto* c28 = ent->getById<Component_28_STUHealthComponent>(0x28);
+                        if (!c1 || !c28 || c28->CalcTotalCurrentHealth() <= 0.0f) continue;
+
+                        Vector4 d = Sub3(c1->position, sp);
+                        float dist = sqrtf(Dot3(d, d));
+                        if (dist <= radius) {
+                            float new_hp = ApplyDamageToHealthComponent(c28, tick_dmg);
+                            if (new_hp <= 0.0f) {
+                                *(uint32_t*)((uintptr_t)c1 + 0x1B8) &= ~0x10000u;
+                            }
+                            SyncEntityHealthVarBag(ent);
+                            {
+                                std::lock_guard<std::mutex> hit_lock(s_pellet_hit_mutex);
+                                if (s_pending_dmg_pkt_count < 32) {
+                                    int32_t dmg_int = (int32_t)(tick_dmg + 0.5f);
+                                    if (dmg_int < 1) dmg_int = 1;
+                                    uint8_t pkt_flags = (uint8_t)(new_hp <= 0.0f ? 2 : 0);
+                                    s_pending_dmg_pkts[s_pending_dmg_pkt_count++] = PendingDamagePacket{ ent->entity_id, dmg_int, pkt_flags, true };
+                                }
+                            }
+                            if (single_target) break;
+                        }
+                    }
+                }
+            }
+            ++i;
+        }
+    }
+
+    // 3. Stage H1.3: Junkrat RIP-Tire (0x0580000000000232) expiration / detonation check
+    if (s_riptire_ent_id != 0 && s_riptire_end_ms > 0 && now_ms >= s_riptire_end_ms && game_ea) {
+        Entity* tire_ent = game_ea->getEntById(s_riptire_ent_id);
+        if (tire_ent) {
+            if (auto* tc1 = tire_ent->getById<Component_1_SceneRendering>(1)) {
+                Vector4 tp = tc1->position;
+                Entity* junk_ent = s_riptire_saved_mdl_id ? game_ea->getEntById(s_riptire_saved_mdl_id) : nullptr;
+                auto* jc10 = junk_ent ? junk_ent->getById<Component_10_FilterBits>(0x10) : nullptr;
+                for (Entity* ent : *game_ea) {
+                    if (!ent || ent == tire_ent || ent == junk_ent || !ent->hasComponent(0x15) || !ent->hasComponent(0x28)) continue;
+                    auto* c10 = ent->getById<Component_10_FilterBits>(0x10);
+                    if (jc10 && c10 && (jc10->filter_bits & 0x3C0000ULL) == (c10->filter_bits & 0x3C0000ULL)) continue;
+                    auto* c1 = ent->getById<Component_1_SceneRendering>(1);
+                    auto* c28 = ent->getById<Component_28_STUHealthComponent>(0x28);
+                    if (!c1 || !c28 || c28->CalcTotalCurrentHealth() <= 0.0f) continue;
+                    Vector4 d = Sub3(c1->position, tp);
+                    if (sqrtf(Dot3(d, d)) <= 10.0f) {
+                        float new_hp = ApplyDamageToHealthComponent(c28, 600.0f);
+                        if (new_hp <= 0.0f) *(uint32_t*)((uintptr_t)c1 + 0x1B8) &= ~0x10000u;
+                        SyncEntityHealthVarBag(ent);
+                    }
+                }
+            }
+            game_ea->delEnt(tire_ent);
+        }
+        if (Entity* local_ctrl = game_ea->getLocalEnt()) {
+            if (auto* c20 = local_ctrl->getById<Component_20_ModelReference>(0x20)) {
+                if (s_riptire_saved_mdl_id != 0) {
+                    c20->cam_attach_entid = s_riptire_saved_mdl_id;
+                    c20->aim_entid = s_riptire_saved_mdl_id;
+                    c20->movement_attach_entid = s_riptire_saved_mdl_id;
+                }
+            }
+        }
+        s_riptire_ent_id = 0;
+        s_riptire_saved_mdl_id = 0;
+        s_riptire_end_ms = 0;
+    }
+
+    TickProjectileManager_orig(proj_sys);
 
     for (int i = 0; i < saved_count; ++i) {
         *saved[i].slot_ptr = saved[i].orig_id;
@@ -3488,6 +4448,1381 @@ uint64_t __fastcall ProjectileSpawnImpactEffect_hook(uintptr_t sys, uintptr_t c2
     }
 
     return ProjectileSpawnImpactEffect_orig(sys, c27, hit_rec_a0, effect_ent, a5);
+}
+
+// 6c. +0xD3DC50: ShouldDeferProjectileImpactForServerSync(uintptr_t sys, uintptr_t hit_ctx, uint32_t hit_type, uintptr_t effect_stu)
+// On a skeletal hitbox hit (+0xD381F0 -> +0xD3B200 with r8b=0), +0xD3B290 skips +0xD3DC50 and immediately spawns the
+// explosion VFX via +0xC56380 -> +0xD35450.
+// On a world geometry hit (+0xD37E70 -> +0xD3B200 with r8b=1), +0xD3B200 calls +0xD3DC50 at +0xD3B2A0 (also called from
+// +0xD3AAF0 at +0xD3AB83 and +0xD3BE60 at +0xD3BEC3). When [effect_stu + 0xE9] != 0 or [effect_stu + 0xEC] != 0 (as on
+// Soldier: 76's Helix Rockets), +0xD3DC50 pushes the hit into [c27 + 0xB00] to wait for server snapshot replication
+// (+0xD39A80 -> +0xD3DE00) and returns 1, causing +0xD3B200 to exit early without spawning the wall explosion!
+// Returning 0 in offline mode lets +0xD3B200, +0xD3AAF0, and +0xD3BE60 immediately spawn the explosion VFX & decal.
+typedef uint8_t(__fastcall* should_defer_proj_impact_fn)(uintptr_t sys, uintptr_t hit_ctx, uint32_t hit_type, uintptr_t effect_stu);
+should_defer_proj_impact_fn ShouldDeferProjectileImpact_orig = nullptr;
+uint8_t __fastcall ShouldDeferProjectileImpact_hook(uintptr_t sys, uintptr_t hit_ctx, uint32_t hit_type, uintptr_t effect_stu) {
+    uint8_t e9 = effect_stu ? SafeReadVal<uint8_t>(effect_stu + 0xE9) : 0;
+    uint8_t ec = effect_stu ? SafeReadVal<uint8_t>(effect_stu + 0xEC) : 0;
+    ShotDiagLogFmt("[PROJ_WALL_IMPACT (+0xD3DC50)] hit_ctx=0x%llX hit_type=%u effect_stu=0x%llX (e9=%u,ec=%u) -> forcing immediate explosion (ret=0)",
+        (unsigned long long)hit_ctx, hit_type, (unsigned long long)effect_stu, e9, ec);
+    return 0;
+}
+
+// 7. +0xF43450: FindStatescriptStateImpl(uintptr_t rcx, STUStatescriptBase* stu_node) -> StatescriptState*
+// Replaces the 4 Group-1 client stub vtables in +0x18F8E88 with their real Group-2 factory implementations
+// still compiled in GameClientApp.exe:
+//   - 0x160C4F1D (Placement State): stub vt +0x15D6F40 -> real factory +0xD64380 (real vt +0x15D5E68)
+//   - 0x72509D3B (FindGround):      stub vt +0x15D6598 -> real factory +0xD64110 (real vt +0x15D60D8)
+//   - 0x12AA4F0F (Ice Wall Start):  stub vt +0x15D6CC8 -> real factory +0xD645D0
+//   - 0x614C3A0A (Ice Wall Pillar): stub vt +0x15D6A70 -> real factory +0xD647D0
+typedef StatescriptState*(__fastcall* find_ss_state_impl_fn)(uintptr_t rcx, STUStatescriptBase* stu_node);
+static find_ss_state_impl_fn FindStatescriptStateImpl_orig = nullptr;
+static StatescriptState* __fastcall FindStatescriptStateImpl_hook(uintptr_t rcx, STUStatescriptBase* stu_node) {
+    StatescriptState* state = FindStatescriptStateImpl_orig(rcx, stu_node);
+    if (state && !IsBadReadPtr(state, sizeof(uintptr_t))) {
+        uintptr_t vt = SafeReadVal<uintptr_t>((uintptr_t)state);
+        uintptr_t vt_rva = (vt >= globals::gameBase && vt < globals::gameBase + globals::gameSize)
+            ? (vt - globals::gameBase) : 0;
+        using StateFactoryFn = StatescriptState*(__fastcall*)();
+        if (vt_rva == 0x15D6F40) {
+            state = ((StateFactoryFn)(globals::gameBase + 0xD64380))();
+            ShotDiagLogFmt("[STUB_OVERRIDE (+0xF43450)] 0x160C4F1D PlacementState stub +0x15D6F40 -> +0xD64380 (state=0x%llX)", (unsigned long long)state);
+        } else if (vt_rva == 0x15D6598) {
+            state = ((StateFactoryFn)(globals::gameBase + 0xD64110))();
+            ShotDiagLogFmt("[STUB_OVERRIDE (+0xF43450)] 0x72509D3B FindGround stub +0x15D6598 -> +0xD64110 (state=0x%llX)", (unsigned long long)state);
+        } else if (vt_rva == 0x15D6CC8) {
+            state = ((StateFactoryFn)(globals::gameBase + 0xD645D0))();
+            ShotDiagLogFmt("[STUB_OVERRIDE (+0xF43450)] 0x12AA4F0F MeiIceWallStart stub +0x15D6CC8 -> +0xD645D0 (state=0x%llX)", (unsigned long long)state);
+        } else if (vt_rva == 0x15D6A70) {
+            state = ((StateFactoryFn)(globals::gameBase + 0xD647D0))();
+            ShotDiagLogFmt("[STUB_OVERRIDE (+0xF43450)] 0x614C3A0A MeiIceWallPillar stub +0x15D6A70 -> +0xD647D0 (state=0x%llX)", (unsigned long long)state);
+        }
+    }
+    return state;
+}
+
+static void SafeCallSetConfigVarValueFromSTU(StatescriptVar_VarBag* vb, STUConfigVarDynamic* out_var, STUConfigVar* m_value) {
+    if (!vb || !out_var || !m_value) return;
+    __try {
+        vb->base.stu_base.vfptr->SetConfigVarValueFromSTUConfigVar(vb, out_var, m_value, nullptr);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+static bool IsHeroOrSubEntScript(StatescriptInstance* inst) {
+    if (!inst || IsBadReadPtr(inst, sizeof(StatescriptInstance))) return false;
+    Entity* local_hero = GetLocalHeroModelEnt();
+    if (!local_hero) return false;
+    Entity* owner_ent = (inst->ss_inner && !IsBadReadPtr(inst->ss_inner, sizeof(StatescriptSyncMgr)) && inst->ss_inner->component_ref)
+        ? inst->ss_inner->component_ref->base.entity_backref : nullptr;
+    if (!owner_ent || IsBadReadPtr(owner_ent, sizeof(Entity))) return false;
+    if (owner_ent == local_hero) return true;
+    uint64_t script_id = SafeReadVal<uint64_t>((uintptr_t)inst + 0x150);
+    if (script_id == 0x0580000000000258ULL || script_id == 0x0580000000000636ULL) return true;
+
+    for (int i = 0; i < s_created_sub_entity_count; ++i) {
+        if (s_created_sub_entities[i].ent_id == owner_ent->entity_id) return true;
+    }
+    if (auto* hc23 = local_hero->getById<Component_23_Statescript>(0x23)) {
+        uintptr_t slot_arr = SafeReadVal<uintptr_t>((uintptr_t)hc23 + 0x1458);
+        int32_t slot_cnt   = SafeReadVal<int32_t>((uintptr_t)hc23 + 0x1460);
+        if (slot_arr && slot_cnt > 0 && slot_cnt <= 16) {
+            for (int i = 0; i < slot_cnt; ++i) {
+                uint32_t wep0 = SafeReadVal<uint32_t>(slot_arr + (uintptr_t)i * 0x18 + 0x00);
+                uint32_t wep1 = SafeReadVal<uint32_t>(slot_arr + (uintptr_t)i * 0x18 + 0x04);
+                if (owner_ent->entity_id == wep0 || owner_ent->entity_id == wep1) return true;
+            }
+        }
+    }
+    return false;
+}
+
+static Entity* SpawnStandaloneSubEntity(EntityAdminBase* ea, uint64_t res_id, const Vector4& pos, const Vector4& rot) {
+    if (!ea || (res_id & 0xFFFF000000000000ULL) != 0x0400000000000000ULL) return nullptr;
+    auto res_ptr = try_load_resource((__int64)res_id);
+    if (!res_ptr) return nullptr;
+
+    auto spawner = EntityLoader::Create((__int64)res_id, res_ptr, false, false);
+    if (!spawner) return nullptr;
+
+    Component_1_SceneRendering::InitData init_data{};
+    Vector4 valid_rot = rot;
+    if (valid_rot.X == 0.0f && valid_rot.Y == 0.0f && valid_rot.Z == 0.0f && valid_rot.W == 0.0f) {
+        valid_rot.W = 1.0f;
+    }
+    init_data.position = pos;
+    init_data.scale = Vector4(1.0f, 1.0f, 1.0f, 1.0f);
+    init_data.rotation = valid_rot;
+    spawner->loader_entries[1].init_data = (__int64)&init_data;
+
+    Entity* ent = spawner->Spawn(ea);
+    if (!ent) return nullptr;
+
+    if (auto* slot = OriginClutterTracker::GetSlot(ent->entity_id, ent)) {
+        slot->has_nonzero_pos = true;
+        slot->latest_nonzero_pos = pos;
+        slot->latest_nonzero_rot = valid_rot;
+    }
+    if (auto* c1 = ent->getById<Component_1_SceneRendering>(1)) {
+        c1->SetPosRotation(pos, valid_rot);
+        c1->SetVisible();
+        *(uint32_t*)((uintptr_t)c1 + 0x1B8) |= 0x10000u;
+    }
+    if (auto* c15 = ent->getById<Component_15_STUCharacterMoverComponent>(0x15)) {
+        c15->movement_state_1.absolute_position = pos;
+        c15->movement_state_2.absolute_position = pos;
+        c15->movement_state_1.rotation_quaternion = valid_rot;
+        c15->movement_state_2.rotation_quaternion = valid_rot;
+    }
+    return ent;
+}
+
+// Stage H1.3 Helper: SpawnStatescriptSubEntity (0x1BB99C36 Action, 0x4CCED352 Barrier/Deployable State, 0x0E3689F3 Dragonstrike Action/State)
+static Entity* SpawnStatescriptSubEntity(StatescriptInstance* inst, STUStatescriptBase* stu_node, uint32_t stu_hash) {
+    if (!inst || !stu_node || IsBadReadPtr(stu_node, sizeof(STUStatescriptBase))) return nullptr;
+    EntityAdminBase* ea = GameEntityAdmin();
+    Entity* owner_ent = (inst->ss_inner && !IsBadReadPtr(inst->ss_inner, sizeof(StatescriptSyncMgr)) && inst->ss_inner->component_ref)
+        ? inst->ss_inner->component_ref->base.entity_backref : nullptr;
+    if (!ea || !owner_ent) return nullptr;
+
+    uint64_t script_id = SafeReadVal<uint64_t>((uintptr_t)inst + 0x150);
+    // In Mei's Ice Wall (0x0580000000000622), node=52 spawns all 5 pillars (k = -2, -1, 0, +1, +2); skip duplicate CreateEntity nodes 54..57
+    if (script_id == 0x0580000000000622ULL && stu_node->idx_in_nodes != 52) return nullptr;
+    bool is_state_4cc = (stu_hash == 0x4CCED352u);
+    bool is_node_0e3  = (stu_hash == 0x0E3689F3u);
+    bool is_create_node = (stu_hash == 0x1BB99C36u || is_state_4cc || is_node_0e3);
+
+    // Verified STU field offsets from horizon1_stu_audit.log:
+    //   0x1BB99C36 (sz=0xD8):  +0x88 def_cv, +0x98 m_position, +0xA0 m_up, +0xA8 m_facing, +0xD0 out_cvd
+    //   0x4CCED352 (sz=0x150): +0x100 def_cv, +0x110 m_position, +0x118 m_up, +0x120 m_facing, +0x148 out_cvd
+    //   0x0E3689F3 (sz=0xD0):  +0x88 def_cv, +0x90 m_position, +0x98 m_up, +0xA0 m_facing, +0xB0 out_cvd
+    auto* def_cv    = is_create_node ? (STUConfigVar*)SafeReadVal<uintptr_t>((uintptr_t)stu_node + (is_state_4cc ? 0x100 : 0x88)) : nullptr;
+    auto* pos_cv    = is_create_node ? (STUConfigVar*)SafeReadVal<uintptr_t>((uintptr_t)stu_node + (is_state_4cc ? 0x110 : (is_node_0e3 ? 0x90 : 0x98))) : nullptr;
+    auto* facing_cv = is_create_node ? (STUConfigVar*)SafeReadVal<uintptr_t>((uintptr_t)stu_node + (is_state_4cc ? 0x120 : (is_node_0e3 ? 0xA0 : 0xA8))) : nullptr;
+    auto* out_cvd   = is_create_node ? (STUConfigVarDynamic*)SafeReadVal<uintptr_t>((uintptr_t)stu_node + (is_state_4cc ? 0x148 : (is_node_0e3 ? 0xB0 : 0xD0))) : nullptr;
+
+    uint64_t res_id = 0;
+    if (def_cv && !IsBadReadPtr(def_cv, 0x28)) {
+        // STU 0xE53C2921 (STUConfigVarEntityDef) has stripped impl (+0x08 == 0); its STUResourceReference is at +0x10 (resource_id at +0x18 or +0x10)
+        auto* ref = (STUResourceReference*)((uintptr_t)def_cv + 0x10);
+        if (ref->has_resource() && ((ref->resource_id & 0xFFFF000000000000ULL) == 0x0400000000000000ULL)) {
+            res_id = (uint64_t)ref->resource_id;
+        } else {
+            uint64_t r18 = SafeReadVal<uint64_t>((uintptr_t)def_cv + 0x18);
+            uint64_t r10 = SafeReadVal<uint64_t>((uintptr_t)def_cv + 0x10);
+            if ((r18 & 0xFFFF000000000000ULL) == 0x0400000000000000ULL) res_id = r18;
+            else if ((r10 & 0xFFFF000000000000ULL) == 0x0400000000000000ULL) res_id = r10;
+        }
+        if (res_id == 0) {
+            StatescriptPrimitive dprim{};
+            def_cv->get_value(inst, &dprim);
+            res_id = (uint64_t)dprim.value;
+        }
+    }
+    if ((res_id & 0xFFFF000000000000ULL) != 0x0400000000000000ULL) {
+        if (is_node_0e3 || script_id == 0x0580000000000101ULL) res_id = 0x04000000000002BAULL; // Hanzo Dragonstrike
+        else if (script_id == 0x05800000000000F4ULL) res_id = 0x0400000000000143ULL; // Torbjorn Turret
+        else if (script_id == 0x058000000000017EULL) res_id = 0x0400000000000251ULL; // Symmetra Sentry Turret
+        else if (script_id == 0x0580000000000169ULL) res_id = 0x0400000000000233ULL; // Symmetra Teleporter
+        else if (script_id == 0x0580000000000257ULL || script_id == 0x0580000000000148ULL) res_id = 0x04000000000003DCULL; // Soldier: 76 Biotic Field
+        else if (script_id == 0x0580000000000622ULL) res_id = 0x0400000000000932ULL; // Mei Ice Wall Pillar
+        else if (script_id == 0x05800000000005FEULL) res_id = 0x040000000000090BULL; // Mei Cryo-Freeze Block
+        else if (script_id == 0x0580000000000232ULL) res_id = 0x040000000000039CULL; // Junkrat RIP-Tire
+    }
+    if ((res_id & 0xFFFF000000000000ULL) != 0x0400000000000000ULL) return nullptr;
+
+    auto* owner_c1  = owner_ent->getById<Component_1_SceneRendering>(1);
+    auto* owner_c10 = owner_ent->getById<Component_10_FilterBits>(0x10);
+    auto* owner_c15 = owner_ent->getById<Component_15_STUCharacterMoverComponent>(0x15);
+
+    Vector4 hero_pos = owner_c1 ? owner_c1->position : Vector4{};
+    Vector4 hero_rot = owner_c1 ? owner_c1->rotation : Vector4{ 0.0f, 0.0f, 0.0f, 1.0f };
+    Vector4 fwd{ 0.0f, 0.0f, 1.0f, 0.0f };
+    float pitch = 0.0f;
+    if (owner_c15 && !IsBadReadPtr(owner_c15, sizeof(Component_15_STUCharacterMoverComponent))) {
+        hero_pos = owner_c15->movement_state_1.absolute_position;
+        hero_rot = owner_c15->movement_state_1.rotation_quaternion;
+        pitch = -owner_c15->movement_state_1.y_lookdir;
+        fwd.X = 2.0f * (hero_rot.X * hero_rot.Z + hero_rot.W * hero_rot.Y);
+        fwd.Y = 0.0f;
+        fwd.Z = 1.0f - 2.0f * (hero_rot.X * hero_rot.X + hero_rot.Y * hero_rot.Y);
+        float flen = sqrtf(fwd.X * fwd.X + fwd.Z * fwd.Z);
+        if (flen > 1e-4f) { fwd.X /= flen; fwd.Z /= flen; }
+    }
+
+    Vector4 spawn_pos = hero_pos;
+    bool got_pos = false;
+    if (pos_cv && !IsBadReadPtr(pos_cv, sizeof(STUConfigVar))) {
+        StatescriptPrimitive pprim{};
+        pos_cv->get_value(inst, &pprim);
+        if (pprim.type == StatescriptPrimitive_VEC3 && pprim.value != 0 && !IsBadReadPtr((const void*)pprim.value, 12)) {
+            const float* v = (const float*)pprim.value;
+            if (v[0] != 0.0f || v[1] != 0.0f || v[2] != 0.0f) {
+                spawn_pos = Vector4{ v[0], v[1], v[2], 0.0f };
+                got_pos = true;
+            }
+        }
+    }
+    if (!got_pos) {
+        float dist = (script_id == 0x0580000000000257ULL || script_id == 0x0580000000000148ULL || script_id == 0x05800000000005FEULL) ? 0.3f : 2.8f;
+        spawn_pos = Vector4{ hero_pos.X + fwd.X * dist, hero_pos.Y, hero_pos.Z + fwd.Z * dist, 0.0f };
+    }
+    if (spawn_pos.Y < hero_pos.Y - 1.5f) {
+        spawn_pos.Y = hero_pos.Y;
+    }
+
+    Vector4 spawn_rot = hero_rot;
+    if (facing_cv && !IsBadReadPtr(facing_cv, sizeof(STUConfigVar))) {
+        StatescriptPrimitive rprim{};
+        facing_cv->get_value(inst, &rprim);
+        if (rprim.value != 0 && !IsBadReadPtr((const void*)rprim.value, 12)) {
+            const float* v = (const float*)rprim.value;
+            if (v[0] != 0.0f || v[1] != 0.0f || v[2] != 0.0f) {
+                float fl = sqrtf(v[0] * v[0] + v[2] * v[2]);
+                if (fl > 1e-4f) {
+                    float yaw = atan2f(v[0] / fl, v[2] / fl);
+                    spawn_rot = Vector4{ 0.0f, sinf(yaw * 0.5f), 0.0f, cosf(yaw * 0.5f) };
+                }
+            }
+        }
+    }
+
+    Entity* new_ent = SpawnStandaloneSubEntity(ea, res_id, spawn_pos, spawn_rot);
+    if (!new_ent) return nullptr;
+
+    if (owner_c10) {
+        if (auto* nc10 = new_ent->getById<Component_10_FilterBits>(0x10)) {
+            nc10->pre_filter_bits = owner_c10->pre_filter_bits;
+            nc10->filter_bits = ~nc10->pre_filter_bits;
+            nc10->FilterBitsMakeFinal();
+        }
+    }
+    if (auto* nc1f = new_ent->getById<Component_1F_Backref>(0x1F)) {
+        nc1f->backref_entid = owner_ent->entity_id;
+    }
+    if (auto* nc23 = new_ent->getById<Component_23_Statescript>(0x23)) {
+        if (res_id == 0x0400000000000932ULL) {
+            nc23->loadScript(0x0580000000000636ULL);
+        }
+        if (nc23->ss_inner.g3_arrWithIds.ptr && nc23->ss_inner.g3_arrWithIds.num > 0 && nc23->ss_inner.g3_arrWithIds.num <= 64) {
+            for (int i = 0; i < nc23->ss_inner.g3_arrWithIds.num; ++i) {
+                StatescriptInstance* sub_ss = nc23->ss_inner.g3_arrWithIds.ptr[i].instance;
+                if (sub_ss && !IsBadReadPtr(sub_ss, sizeof(StatescriptInstance))) {
+                    sub_ss->execution_flags = (sub_ss->execution_flags | 0x400000u) & ~0x1000u;
+                }
+            }
+        }
+    }
+
+    if (out_cvd && !IsBadReadPtr(out_cvd, sizeof(STUConfigVarDynamic))) {
+        StatescriptPrimitive eprim(StatescriptPrimitive_ENTITY, (__int64)new_ent->entity_id);
+        WriteDynamicVarPrim(inst, out_cvd, eprim);
+    }
+
+    if (s_created_sub_entity_count < 64) {
+        uint64_t now_ms = GetTickCount64();
+        CreatedSubEntityEntry entry{};
+        entry.ent_id = new_ent->entity_id;
+        entry.owner_ent_id = owner_ent->entity_id;
+        entry.res_id = res_id;
+        entry.script_id = script_id;
+        entry.spawn_ms = now_ms;
+        entry.last_effect_ms = now_ms;
+        entry.spawn_pos = spawn_pos;
+        entry.ground_y = (spawn_pos.Y >= hero_pos.Y - 0.5f) ? spawn_pos.Y : hero_pos.Y;
+        entry.has_gravity = false;
+        entry.lock_stationary = false;
+
+        if (is_node_0e3 || script_id == 0x0580000000000101ULL || res_id == 0x04000000000002BAULL || res_id == 0x04000000000007C0ULL) {
+            // Hanzo Dragonstrike: travels along aim direction at 20 m/s for 6s
+            entry.vel = Vector4{ fwd.X * 20.0f, sinf(pitch) * 20.0f, fwd.Z * 20.0f, 0.0f };
+            entry.expire_ms = now_ms + 6000;
+        } else if (script_id == 0x0580000000000257ULL || script_id == 0x0580000000000148ULL ||
+                   res_id == 0x04000000000003DCULL || res_id == 0x040000000000072DULL || res_id == 0x0400000000000A5EULL) {
+            // Soldier: 76 Biotic Field: 5s stationary on ground
+            entry.lock_stationary = true;
+            entry.expire_ms = now_ms + 5000;
+        } else if (script_id == 0x0580000000000622ULL || res_id == 0x0400000000000932ULL || res_id == 0x040000000000138EULL) {
+            // Mei Ice Wall Pillar: 4.5s stationary on ground
+            entry.lock_stationary = true;
+            entry.expire_ms = now_ms + 4500;
+        } else if (script_id == 0x05800000000005FEULL || res_id == 0x040000000000090BULL) {
+            // Mei Cryo-Freeze Block: 4s stationary on ground
+            entry.lock_stationary = true;
+            entry.expire_ms = now_ms + 4000;
+        } else if (script_id == 0x058000000000064AULL) {
+            // Mei Blizzard Drone: 5s duration, lands on ground_y
+            entry.has_gravity = true;
+            entry.expire_ms = now_ms + 5000;
+        } else if (script_id == 0x05800000000000F4ULL || res_id == 0x0400000000000143ULL || res_id == 0x040000000000005EULL) {
+            // Torbjorn Turret: lock stationary on ground_y so native gravity never pulls it through floor
+            entry.lock_stationary = true;
+            entry.expire_ms = 0;
+        } else if (script_id == 0x058000000000017EULL || script_id == 0x0580000000000169ULL ||
+                   res_id == 0x0400000000000251ULL || res_id == 0x0400000000000232ULL || res_id == 0x0400000000000233ULL) {
+            // Symmetra Sentry / Teleporter: lock stationary at placement coordinates
+            entry.lock_stationary = true;
+            entry.expire_ms = 0;
+        }
+        s_created_sub_entities[s_created_sub_entity_count++] = entry;
+    }
+
+    // Mei Ice Wall (0x0580000000000622 node=52): also spawn the other 4 pillars (k = -2, -1, +1, +2) along the wall's horizontal right vector
+    if (script_id == 0x0580000000000622ULL && res_id == 0x0400000000000932ULL && stu_node->idx_in_nodes == 52) {
+        Vector4 right{ fwd.Z, 0.0f, -fwd.X, 0.0f };
+        uint64_t now_ms = GetTickCount64();
+        const int kOffsets[4] = { -2, -1, 1, 2 };
+        for (int k : kOffsets) {
+            Vector4 p_pos = spawn_pos;
+            p_pos.X += right.X * ((float)k * 1.45f);
+            p_pos.Z += right.Z * ((float)k * 1.45f);
+            Entity* pillar_ent = SpawnStandaloneSubEntity(ea, res_id, p_pos, spawn_rot);
+            if (!pillar_ent) continue;
+            if (owner_c10) {
+                if (auto* nc10 = pillar_ent->getById<Component_10_FilterBits>(0x10)) {
+                    nc10->pre_filter_bits = owner_c10->pre_filter_bits;
+                    nc10->filter_bits = ~nc10->pre_filter_bits;
+                    nc10->FilterBitsMakeFinal();
+                }
+            }
+            if (auto* nc1f = pillar_ent->getById<Component_1F_Backref>(0x1F)) {
+                nc1f->backref_entid = owner_ent->entity_id;
+            }
+            if (auto* nc23 = pillar_ent->getById<Component_23_Statescript>(0x23)) {
+                nc23->loadScript(0x0580000000000636ULL);
+                if (nc23->ss_inner.g3_arrWithIds.ptr && nc23->ss_inner.g3_arrWithIds.num > 0 && nc23->ss_inner.g3_arrWithIds.num <= 64) {
+                    for (int i = 0; i < nc23->ss_inner.g3_arrWithIds.num; ++i) {
+                        StatescriptInstance* sub_ss = nc23->ss_inner.g3_arrWithIds.ptr[i].instance;
+                        if (sub_ss && !IsBadReadPtr(sub_ss, sizeof(StatescriptInstance))) {
+                            sub_ss->execution_flags = (sub_ss->execution_flags | 0x400000u) & ~0x1000u;
+                        }
+                    }
+                }
+            }
+            if (s_created_sub_entity_count < 64) {
+                CreatedSubEntityEntry p_entry{};
+                p_entry.ent_id = pillar_ent->entity_id;
+                p_entry.owner_ent_id = owner_ent->entity_id;
+                p_entry.res_id = res_id;
+                p_entry.script_id = script_id;
+                p_entry.spawn_ms = now_ms;
+                p_entry.last_effect_ms = now_ms;
+                p_entry.spawn_pos = p_pos;
+                p_entry.ground_y = (p_pos.Y >= hero_pos.Y - 0.5f) ? p_pos.Y : hero_pos.Y;
+                p_entry.lock_stationary = true;
+                p_entry.expire_ms = now_ms + 4500;
+                s_created_sub_entities[s_created_sub_entity_count++] = p_entry;
+            }
+        }
+    }
+
+    ShotDiagLogFmt("[CREATE_SUB_ENT (0x%08X)] script=0x%llX res=0x%llX -> ent=0x%X pos=(%.1f,%.1f,%.1f)",
+        stu_hash, (unsigned long long)script_id, (unsigned long long)res_id, new_ent->entity_id,
+        spawn_pos.X, spawn_pos.Y, spawn_pos.Z);
+    return new_ent;
+}
+
+// 8. +0xF47740: StatescriptAction_ExecuteAndContinue(StatescriptAction* action_impl, uintptr_t sync_mgr, StatescriptInstance* inst, STUStatescriptBase* stu_node)
+// Executes stripped server actions before +0xF47740 traverses stu_node->out_plug (+0x80):
+//   - 0x4E83BC01 (Server VarBag Mutation Action — 377 nodes in 119 graphs)
+//   - 0x04CC5359 (Server Apply Damage / Heal / Health Modifier Action — 83 nodes in 64 graphs)
+//   - 0x1BB99C36 (Server Create Entity Action — Turrets, Sentries, Teleporter, Ice Wall, Biotic Field, RIP-Tire)
+//   - 0x0E3689F3 (Server Create Dragonstrike Entity Action)
+//   - 0x5C46D801 (Server Destroy Entity Action)
+//   - 0xF9EF59A6 (PlayScript Action on created sub-entities)
+typedef uint8_t(__fastcall* ss_action_exec_fn)(StatescriptAction* action_impl, uintptr_t sync_mgr, StatescriptInstance* inst, STUStatescriptBase* stu_node);
+static ss_action_exec_fn StatescriptAction_ExecuteAndContinue_orig = nullptr;
+static uint8_t __fastcall StatescriptAction_ExecuteAndContinue_hook(
+    StatescriptAction* action_impl,
+    uintptr_t sync_mgr,
+    StatescriptInstance* inst,
+    STUStatescriptBase* stu_node)
+{
+    if (IsHeroOrSubEntScript(inst) && stu_node && !IsBadReadPtr(stu_node, sizeof(STUStatescriptAction))) {
+        STUInfo* info = (stu_node->graph_node.base.vfptr && !IsBadReadPtr(stu_node->graph_node.base.vfptr, sizeof(STUBase_vt)))
+            ? stu_node->graph_node.base.vfptr->GetSTUInfo() : nullptr;
+        uint32_t stu_hash = (info && !IsBadReadPtr(info, sizeof(STUInfo))) ? info->name_hash : 0;
+        uint64_t script_id = SafeReadVal<uint64_t>((uintptr_t)inst + 0x150);
+        Entity* owner_ent = (inst->ss_inner && !IsBadReadPtr(inst->ss_inner, sizeof(StatescriptSyncMgr)) && inst->ss_inner->component_ref)
+            ? inst->ss_inner->component_ref->base.entity_backref : nullptr;
+
+        if (stu_hash == 0x4E83BC01u) {
+            // 0x4E83BC01: Server VarBag Mutation Action (sz = 0xA8)
+            // +0x88: STUConfigVarDynamic* m_outVar, +0x98: STUConfigVar* m_value
+            auto* out_var = (STUConfigVarDynamic*)SafeReadVal<uintptr_t>((uintptr_t)stu_node + 0x88);
+            auto* m_value = (STUConfigVar*)SafeReadVal<uintptr_t>((uintptr_t)stu_node + 0x98);
+            if (out_var && m_value && !IsBadReadPtr(out_var, sizeof(STUConfigVarDynamic)) && !IsBadReadPtr(m_value, sizeof(STUConfigVar))) {
+                if (inst->rid_instance_varbag && !IsBadReadPtr(inst->rid_instance_varbag, sizeof(StatescriptVar_VarBag))) {
+                    SafeCallSetConfigVarValueFromSTU(inst->rid_instance_varbag, out_var, m_value);
+                }
+                StatescriptPrimitive val_prim{};
+                m_value->get_value(inst, &val_prim);
+                WriteDynamicVarPrim(inst, out_var, val_prim);
+
+                int loc_cnt = out_var->item_location.count();
+                STUResourceReference* loc_arr = out_var->item_location.list();
+                if (loc_cnt > 0 && loc_arr && !IsBadReadPtr(loc_arr, sizeof(STUResourceReference) * loc_cnt)) {
+                    uint64_t last_var = (uint64_t)loc_arr[loc_cnt - 1].resource_id;
+                    if ((last_var == 0x0D80000000000035ULL || last_var == 0x0D80000000000105ULL) && owner_ent) {
+                        RefillHeroWeaponAmmo(owner_ent);
+                    }
+                }
+            }
+            if ((script_id == 0x05800000000001E9ULL || script_id == 0x058000000000017BULL ||
+                 script_id == 0x05800000000001F0ULL || script_id == 0x058000000000022FULL) && owner_ent) {
+                RefillHeroWeaponAmmo(owner_ent);
+            }
+        } else if (stu_hash == 0x1BB99C36u || stu_hash == 0x0E3689F3u) {
+            SpawnStatescriptSubEntity(inst, stu_node, stu_hash);
+        } else if (stu_hash == 0x5C46D801u) {
+            // 0x5C46D801: Server Destroy Entity Action (+0x90: STUConfigVar* entity_cv)
+            if (script_id == 0x05800000000005FEULL || script_id == 0x0580000000000623ULL) {
+                // Mei Cryo-Freeze ice block destroyed -> stop HoT immediately if cancelled early
+                s_active_hot_end_ms = 0;
+            }
+            EntityAdminBase* ea = GameEntityAdmin();
+            uint64_t destroy_now_ms = GetTickCount64();
+            if (script_id == 0x0580000000000622ULL && ea) {
+                for (int i = s_created_sub_entity_count - 1; i >= 0; --i) {
+                    if (s_created_sub_entities[i].script_id == 0x0580000000000622ULL &&
+                        destroy_now_ms > s_created_sub_entities[i].spawn_ms + 250) {
+                        uint32_t pid = s_created_sub_entities[i].ent_id;
+                        s_created_sub_entities[i] = s_created_sub_entities[--s_created_sub_entity_count];
+                        Entity* p_ent = ea->getEntById(pid);
+                        if (p_ent && p_ent != GetLocalHeroModelEnt() && pid != ea->local_entid) {
+                            HideAndExpireSubEntity(ea, p_ent, GetLocalHeroModelEnt());
+                        }
+                    }
+                }
+            }
+            auto* ent_cv = (STUConfigVar*)SafeReadVal<uintptr_t>((uintptr_t)stu_node + 0x90);
+            uint32_t del_id = 0;
+            if (ent_cv && !IsBadReadPtr(ent_cv, sizeof(STUConfigVar))) {
+                StatescriptPrimitive eprim{};
+                ent_cv->get_value(inst, &eprim);
+                if (eprim.type == StatescriptPrimitive_ENTITY) del_id = (uint32_t)eprim.value;
+            }
+            if (del_id == 0 && owner_ent && owner_ent != GetLocalHeroModelEnt()) {
+                del_id = owner_ent->entity_id;
+            }
+            if (del_id != 0 && ea) {
+                bool allow_destroy = true;
+                if (script_id == 0x0580000000000258ULL && destroy_now_ms + 500 < s_biotic_field_end_ms) {
+                    allow_destroy = false;
+                }
+                for (int i = 0; i < s_created_sub_entity_count; ++i) {
+                    if (s_created_sub_entities[i].ent_id == del_id) {
+                        if (s_created_sub_entities[i].script_id == 0x0580000000000622ULL &&
+                            destroy_now_ms <= s_created_sub_entities[i].spawn_ms + 250) {
+                            allow_destroy = false;
+                            break;
+                        }
+                        if (s_created_sub_entities[i].script_id == 0x0580000000000258ULL &&
+                            s_created_sub_entities[i].expire_ms > 0 &&
+                            destroy_now_ms + 500 < s_created_sub_entities[i].expire_ms) {
+                            allow_destroy = false;
+                            break;
+                        }
+                        if (allow_destroy) {
+                            s_created_sub_entities[i] = s_created_sub_entities[--s_created_sub_entity_count];
+                        }
+                        break;
+                    }
+                }
+                if (allow_destroy) {
+                    Entity* del_ent = ea->getEntById(del_id);
+                    if (del_ent && del_ent != GetLocalHeroModelEnt() && del_id != ea->local_entid && !del_ent->hasComponent(0x28)) {
+                        // Hide Component_1 and any attached child visuals instead of calling ea->delEnt(del_ent) mid-tick so SceneRendering (+0x9F29A5) never faults
+                        HideAndExpireSubEntity(ea, del_ent, GetLocalHeroModelEnt());
+                    }
+                }
+            }
+        } else if (stu_hash == 0xF9EF59A6u) {
+            // 0xF9EF59A6: STUStatescriptActionPlayScript (+0xA0: target_ent_cv, +0xB0: script_cv)
+            EntityAdminBase* ea = GameEntityAdmin();
+            auto* ent_cv = (STUConfigVar*)SafeReadVal<uintptr_t>((uintptr_t)stu_node + 0xA0);
+            auto* scr_cv = (STUConfigVar*)SafeReadVal<uintptr_t>((uintptr_t)stu_node + 0xB0);
+            Entity* target_ent = owner_ent;
+            if (ent_cv && !IsBadReadPtr(ent_cv, sizeof(STUConfigVar)) && ea) {
+                StatescriptPrimitive eprim{};
+                ent_cv->get_value(inst, &eprim);
+                if (eprim.type == StatescriptPrimitive_ENTITY && (uint32_t)eprim.value != 0) {
+                    if (Entity* e = ea->getEntById((uint32_t)eprim.value)) target_ent = e;
+                }
+            }
+            uint64_t target_script = 0;
+            if (scr_cv && !IsBadReadPtr(scr_cv, sizeof(STUConfigVar))) {
+                StatescriptPrimitive sprim{};
+                scr_cv->get_value(inst, &sprim);
+                target_script = (uint64_t)sprim.value;
+            }
+            if (target_ent && (target_script & 0xFFFF000000000000ULL) == 0x0580000000000000ULL &&
+                target_script != 0x0580000000000636ULL) {
+                if (auto* tc23 = target_ent->getById<Component_23_Statescript>(0x23)) {
+                    tc23->loadScript(target_script);
+                }
+            }
+        } else if (stu_hash == 0x04CC5359u) {
+            // 0x04CC5359: Server Apply Damage / Heal / Health Modifier Action (sz = 0xB8)
+            uintptr_t dmg_obj = SafeReadVal<uintptr_t>((uintptr_t)stu_node + 0xA8);
+            auto* target_cv = (STUConfigVar*)SafeReadVal<uintptr_t>((uintptr_t)stu_node + 0xB0);
+
+            float amt = 0.0f;
+            if (dmg_obj && !IsBadReadPtr((const void*)dmg_obj, 0x20)) {
+                auto* amt_cv = (STUConfigVar*)SafeReadVal<uintptr_t>(dmg_obj + 0x18);
+                if (amt_cv && !IsBadReadPtr(amt_cv, sizeof(STUConfigVar))) {
+                    StatescriptPrimitive aprim{};
+                    amt_cv->get_value(inst, &aprim);
+                    amt = aprim.get_convert_float(0.0f);
+                }
+            }
+
+            EntityAdminBase* ea = GameEntityAdmin();
+            Entity* target_ent = nullptr;
+            if (target_cv && !IsBadReadPtr(target_cv, sizeof(STUConfigVar)) && ea) {
+                StatescriptPrimitive tprim{};
+                target_cv->get_value(inst, &tprim);
+                if (tprim.type == StatescriptPrimitive_ENTITY && (uint32_t)tprim.value != 0) {
+                    target_ent = ea->getEntById((uint32_t)tprim.value);
+                }
+            }
+            if (!target_ent) {
+                if (s_last_melee_hit_entid != 0 && (GetTickCount64() - s_last_melee_hit_ms) < 250 && ea) {
+                    target_ent = ea->getEntById(s_last_melee_hit_entid);
+                }
+                if (!target_ent) target_ent = owner_ent;
+            }
+
+            if (target_ent && target_ent->hasComponent(0x28)) {
+                auto* c28 = target_ent->getById<Component_28_STUHealthComponent>(0x28);
+                auto* owner_c10 = owner_ent ? owner_ent->getById<Component_10_FilterBits>(0x10) : nullptr;
+                auto* target_c10 = target_ent->getById<Component_10_FilterBits>(0x10);
+                bool same_team = (target_ent == owner_ent) ||
+                    (owner_c10 && target_c10 && (owner_c10->filter_bits & 0x3C0000ULL) == (target_c10->filter_bits & 0x3C0000ULL));
+
+                if (same_team) {
+                    // Self/Ally Heal: route Roadhog (0x240), Mei (0x5FE/0x623), and Bastion (0x153/0x02B) to smooth 100ms HoT!
+                    if (script_id == 0x0580000000000240ULL) {
+                        ArmHeroHealOverTime(script_id, 300.0f, 1000);
+                    } else if (script_id == 0x05800000000005FEULL || script_id == 0x0580000000000623ULL) {
+                        ArmHeroHealOverTime(script_id, 150.0f, 4000);
+                    } else if (script_id == 0x0580000000000153ULL || script_id == 0x058000000000002BULL) {
+                        s_bastion_repair_active = true;
+                    } else {
+                        if (amt <= 0.0f) amt = 40.0f;
+                        ApplyHeroSelfHeal(target_ent, amt, script_id, "ACTION_HEAL (0x04CC5359)");
+                    }
+                } else if ((GetTickCount64() - s_last_melee_dmg_ms) >= 50) {
+                    // Enemy Damage
+                    if (amt <= 0.0f) amt = 30.0f;
+                    if (c28->CalcTotalCurrentHealth() > 0.0f) {
+                        float new_hp = ApplyDamageToHealthComponent(c28, amt);
+                        if (new_hp <= 0.0f) {
+                            if (auto* c1 = target_ent->getById<Component_1_SceneRendering>(1)) {
+                                *(uint32_t*)((uintptr_t)c1 + 0x1B8) &= ~0x10000u;
+                            }
+                        }
+                        SyncEntityHealthVarBag(target_ent);
+                        {
+                            std::lock_guard<std::mutex> hit_lock(s_pellet_hit_mutex);
+                            if (s_pending_dmg_pkt_count < 32) {
+                                int32_t dmg_int = (int32_t)(amt + 0.5f);
+                                if (dmg_int < 1) dmg_int = 1;
+                                uint8_t pkt_flags = (uint8_t)(new_hp <= 0.0f ? 2 : 0);
+                                s_pending_dmg_pkts[s_pending_dmg_pkt_count++] = PendingDamagePacket{ target_ent->entity_id, dmg_int, pkt_flags, true };
+                            }
+                        }
+                        ShotDiagLogFmt("[ACTION_DMG (0x04CC5359)] script=0x%llX target=0x%X -%.1f -> HP %.1f",
+                            (unsigned long long)script_id, target_ent->entity_id, amt, new_hp);
+                    }
+                }
+            }
+        }
+    }
+
+    return StatescriptAction_ExecuteAndContinue_orig(action_impl, sync_mgr, inst, stu_node);
+}
+
+// 9. +0xF495C0: StatescriptState_StartState(StatescriptState* state, uint64_t a2)
+// - Transiently lends client authority ((exec_flags | 0x400008u) & ~0x1000u) across StartState for local hero scripts
+//   (fixes 0x860EE5FC WeaponVolley at +0x1077C47 and all local ability states).
+// - Implements stripped server states:
+//   * 0x619D9E95 (Quick Melee / AoE Hit Sweep State — 81 nodes in 52 graphs)
+//   * 0xD78490D1 (Impulse / Knockback State — 34 nodes in 25 graphs)
+//   * 0x4CCED352 (STUStatescriptStateCreateEntity — Reinhardt/Winston/Zarya Barriers & Deployables)
+//   * 0x0E3689F3 (Hanzo Dragonstrike Entity Spawn State)
+//   * 0x3A846155 & 0x74CB0002 (Junkrat RIP-Tire 0x0580000000000232 Possession & Detonation)
+typedef uint32_t(__fastcall* ss_state_start_fn)(StatescriptState* state, uint64_t a2);
+static ss_state_start_fn StatescriptState_StartState_orig = nullptr;
+static uint32_t __fastcall StatescriptState_StartState_hook(StatescriptState* state, uint64_t a2) {
+    StatescriptInstance* inst = (state && !IsBadReadPtr(state, 0x80))
+        ? (StatescriptInstance*)SafeReadVal<uintptr_t>((uintptr_t)state + 0x78) : nullptr;
+    if (!IsHeroOrSubEntScript(inst)) {
+        return StatescriptState_StartState_orig(state, a2);
+    }
+    Entity* owner_ent = (inst->ss_inner && !IsBadReadPtr(inst->ss_inner, sizeof(StatescriptSyncMgr)) && inst->ss_inner->component_ref)
+        ? inst->ss_inner->component_ref->base.entity_backref : nullptr;
+
+    uint32_t saved_exec_flags = inst->execution_flags;
+    inst->execution_flags = (inst->execution_flags | 0x400008u) & ~0x1000u;
+
+    uint32_t ret = StatescriptState_StartState_orig(state, a2);
+    inst->execution_flags = saved_exec_flags;
+
+    if (inst && inst->graph && !IsBadReadPtr(inst->graph, sizeof(STUStatescriptGraph))) {
+        STUStatescriptState* stu_state = inst->graph->STUFromState(state);
+        if (stu_state && !IsBadReadPtr(stu_state, sizeof(STUStatescriptBase))) {
+            auto* stu_base = (STUStatescriptBase*)stu_state;
+            STUInfo* info = (stu_base->graph_node.base.vfptr &&
+                !IsBadReadPtr(stu_base->graph_node.base.vfptr, sizeof(STUBase_vt)))
+                ? stu_base->graph_node.base.vfptr->GetSTUInfo() : nullptr;
+            uint32_t stu_hash = (info && !IsBadReadPtr(info, sizeof(STUInfo))) ? info->name_hash : 0;
+            uint64_t script_id = SafeReadVal<uint64_t>((uintptr_t)inst + 0x150);
+            bool is_local = (owner_ent && owner_ent == GetLocalHeroModelEnt());
+
+            // 1. Arm moving dash/leap damage sweep & McCree Roll ammo refill on ability state entry
+            if (is_local && owner_ent) {
+                if (script_id == 0x05800000000001DBULL || script_id == 0x05800000000001DCULL ||
+                    script_id == 0x0580000000000045ULL || script_id == 0x0580000000000157ULL || script_id == 0x0580000000000317ULL) {
+                    // Genji Swift Strike (0x05800000000001DB): 50 damage sweep along dash trajectory
+                    ArmDashSweepDamage(script_id, 50.0f, 4.0f, 600);
+                } else if (script_id == 0x0580000000000109ULL || script_id == 0x058000000000010AULL ||
+                           script_id == 0x0580000000000038ULL || script_id == 0x05800000000000FEULL) {
+                    // Winston Jump Pack (0x0580000000000109): 50 AoE leap/land damage within 5.5m
+                    ArmDashSweepDamage(script_id, 50.0f, 5.5f, 950);
+                } else if (script_id == 0x058000000000047EULL || script_id == 0x058000000000026AULL || script_id == 0x0580000000000B2FULL) {
+                    // D.Va Mech Boosters (0x058000000000047E / 0x058000000000026A / 0x0580000000000B2F): 25 impact damage + knockback during flight
+                    if (s_active_dash_sweep_script_id != script_id || GetTickCount64() >= s_active_dash_sweep_end_ms) {
+                        ArmDashSweepDamage(script_id, 25.0f, 3.8f, 2200);
+                    }
+                } else if (script_id == 0x058000000000007DULL || script_id == 0x05800000000000BEULL) {
+                    // Reinhardt Charge (0x058000000000007D / 0x05800000000000BE): 75 impact damage + knockback
+                    ArmDashSweepDamage(script_id, 75.0f, 3.5f, 1500);
+                } else if (script_id == 0x05800000000001E9ULL || script_id == 0x05800000000001F0ULL ||
+                           script_id == 0x058000000000017BULL || script_id == 0x058000000000022FULL) {
+                    // McCree Combat Roll (0x05800000000001E9 / 0x05800000000001F0): immediate 6/6 Peacekeeper ammo refill
+                    RefillHeroWeaponAmmo(owner_ent);
+                }
+            }
+
+            if (stu_hash == 0x619D9E95u && owner_ent) {
+                // 0x619D9E95: Quick Melee / AoE Hit Sweep / Self-Heal Trigger State (sz = 0x150)
+                // +0x118: range_cv (0x9B0385B4), +0x138: on_hit_plug (0x41BA609A), +0x140: dmg_obj (0x59EF45AA), +0x148: out_hit_ent_cvd (0x2D2057F1)
+                auto* on_hit_plug = (STUStatescriptOutputPlug*)SafeReadVal<uintptr_t>((uintptr_t)stu_state + 0x138);
+                auto* out_hit_cvd = (STUConfigVarDynamic*)SafeReadVal<uintptr_t>((uintptr_t)stu_state + 0x148);
+
+                // Check if this 0x619D9E95 node is a Self-Heal ability state:
+                //   - Roadhog Take a Breather: 0x0580000000000240 (node[9] -> node[10] 0x04CC5359 +300 HP over 1.0s)
+                //   - Mei Cryo-Freeze:         0x05800000000005FE / 0x0580000000000623 (+150 HP over 4.0s)
+                //   - Bastion Self-Repair:     0x0580000000000153 / 0x058000000000002B (75 HP/s while held)
+                bool is_self_heal_script = (script_id == 0x0580000000000240ULL ||
+                                            script_id == 0x05800000000005FEULL || script_id == 0x0580000000000623ULL ||
+                                            script_id == 0x0580000000000153ULL || script_id == 0x058000000000002BULL);
+                if (is_self_heal_script) {
+                    if (script_id == 0x0580000000000240ULL) {
+                        ArmHeroHealOverTime(script_id, 300.0f, 1000, "ROADHOG_BREATHER_HOT");
+                    } else if (script_id == 0x05800000000005FEULL || script_id == 0x0580000000000623ULL) {
+                        ArmHeroHealOverTime(0x05800000000005FEULL, 150.0f, 4000, "MEI_CRYOFREEZE_HOT");
+                    } else if (script_id == 0x0580000000000153ULL || script_id == 0x058000000000002BULL) {
+                        s_bastion_repair_active = true;
+                    }
+                    if (out_hit_cvd && !IsBadReadPtr(out_hit_cvd, sizeof(STUConfigVarDynamic))) {
+                        StatescriptPrimitive eprim(StatescriptPrimitive_ENTITY, (__int64)owner_ent->entity_id);
+                        WriteDynamicVarPrim(inst, out_hit_cvd, eprim);
+                    }
+                    SafeTraverseOutputPlug(inst->ss_inner, inst, (STUStatescriptBase*)stu_state, on_hit_plug, 0x138);
+                } else {
+                    float range = 0.0f;
+                    auto* range_cv = (STUConfigVar*)SafeReadVal<uintptr_t>((uintptr_t)stu_state + 0x118);
+                    if (range_cv && !IsBadReadPtr(range_cv, sizeof(STUConfigVar))) {
+                        StatescriptPrimitive rprim{};
+                        range_cv->get_value(inst, &rprim);
+                        range = rprim.get_convert_float(0.0f);
+                    }
+                    if (range <= 0.2f || range > 25.0f) {
+                        if (script_id == 0x0580000000000776ULL) range = 8.0f; // Lucio Soundwave
+                        else if (script_id == 0x0580000000000052ULL || script_id == 0x0580000000000044ULL ||
+                                 script_id == 0x0580000000000109ULL || script_id == 0x058000000000003BULL) range = 5.0f;
+                        else range = 3.5f;
+                    }
+
+                    float dmg = 0.0f;
+                    uintptr_t dmg_obj = SafeReadVal<uintptr_t>((uintptr_t)stu_state + 0x140);
+                    if (dmg_obj && !IsBadReadPtr((const void*)dmg_obj, 0x20)) {
+                        auto* amt_cv = (STUConfigVar*)SafeReadVal<uintptr_t>(dmg_obj + 0x18);
+                        if (amt_cv && !IsBadReadPtr(amt_cv, sizeof(STUConfigVar))) {
+                            StatescriptPrimitive dprim{};
+                            amt_cv->get_value(inst, &dprim);
+                            dmg = dprim.get_convert_float(0.0f);
+                        }
+                    }
+                    if (dmg <= 0.0f) {
+                        if (script_id == 0x0580000000000052ULL || script_id == 0x0580000000000041ULL ||
+                            script_id == 0x058000000000007DULL || script_id == 0x05800000000000BEULL) dmg = 75.0f; // Reinhardt / Torb Hammer / Charge
+                        else if (script_id == 0x0580000000000044ULL) dmg = 120.0f; // Genji Dragonblade
+                        else if (script_id == 0x05800000000001DBULL || script_id == 0x05800000000001DCULL ||
+                                 script_id == 0x0580000000000045ULL || script_id == 0x0580000000000157ULL ||
+                                 script_id == 0x0580000000000317ULL || script_id == 0x0580000000000038ULL ||
+                                 script_id == 0x05800000000000FEULL || script_id == 0x0580000000000109ULL ||
+                                 script_id == 0x058000000000010AULL) dmg = 50.0f; // Swift Strike / Jump Pack
+                        else if (script_id == 0x058000000000003BULL) dmg = 40.0f; // Winston Primal Rage
+                        else if (script_id == 0x058000000000017AULL || script_id == 0x058000000000047EULL ||
+                                 script_id == 0x058000000000026AULL || script_id == 0x0580000000000B2FULL ||
+                                 script_id == 0x0580000000000776ULL) dmg = 25.0f; // Flashbang / D.Va Boosters / Lucio Soundwave
+                        else dmg = 30.0f; // Quick Melee (0x0580000000000043)
+                    }
+
+                    auto* owner_c1 = owner_ent->getById<Component_1_SceneRendering>(1);
+                    auto* owner_c10 = owner_ent->getById<Component_10_FilterBits>(0x10);
+                    auto* owner_c15 = owner_ent->getById<Component_15_STUCharacterMoverComponent>(0x15);
+                    Vector4 my_pos = owner_c1 ? owner_c1->position : Vector4{};
+                    Vector4 fwd{ 0.0f, 0.0f, 1.0f, 0.0f };
+                    if (owner_c15 && !IsBadReadPtr(owner_c15, sizeof(Component_15_STUCharacterMoverComponent))) {
+                        const Vector4& q = owner_c15->movement_state_1.rotation_quaternion;
+                        fwd.X = 2.0f * (q.X * q.Z + q.W * q.Y);
+                        fwd.Y = 0.0f;
+                        fwd.Z = 1.0f - 2.0f * (q.X * q.X + q.Y * q.Y);
+                        float flen = sqrtf(fwd.X * fwd.X + fwd.Z * fwd.Z);
+                        if (flen > 1e-4f) { fwd.X /= flen; fwd.Z /= flen; }
+                    }
+
+                    EntityAdminBase* ea = GameEntityAdmin();
+                    if (ea && owner_c1) {
+                        for (Entity* ent : *ea) {
+                            if (!ent || ent == owner_ent || !ent->hasComponent(0x15) || !ent->hasComponent(0x28)) continue;
+                            auto* c10 = ent->getById<Component_10_FilterBits>(0x10);
+                            if (owner_c10 && c10 && (owner_c10->filter_bits & 0x3C0000ULL) == (c10->filter_bits & 0x3C0000ULL)) continue;
+                            auto* c1 = ent->getById<Component_1_SceneRendering>(1);
+                            auto* c28 = ent->getById<Component_28_STUHealthComponent>(0x28);
+                            if (!c1 || !c28 || c28->CalcTotalCurrentHealth() <= 0.0f) continue;
+                            if ((*(uint32_t*)((uintptr_t)c1 + 0x1B8) & 0x10000u) == 0) continue;
+
+                            Vector4 d = Sub3(c1->position, my_pos);
+                            float dist = sqrtf(Dot3(d, d));
+                            if (dist > range) continue;
+                            float horiz_len = sqrtf(d.X * d.X + d.Z * d.Z);
+                            float cos_ang = (horiz_len > 0.1f) ? ((d.X * fwd.X + d.Z * fwd.Z) / horiz_len) : 1.0f;
+                            if (dist > 2.2f && cos_ang < -0.15f) continue; // must be in front arc unless point-blank
+
+                            if (s_active_dash_sweep_end_ms > GetTickCount64() && s_active_dash_sweep_script_id == script_id) {
+                                bool already_swept = false;
+                                for (int h = 0; h < s_active_dash_sweep_hit_count; ++h) {
+                                    if (s_active_dash_sweep_hit_ents[h] == ent->entity_id) { already_swept = true; break; }
+                                }
+                                if (already_swept) continue;
+                                if (s_active_dash_sweep_hit_count < 16) {
+                                    s_active_dash_sweep_hit_ents[s_active_dash_sweep_hit_count++] = ent->entity_id;
+                                }
+                            }
+
+                            s_last_melee_hit_entid = ent->entity_id;
+                            s_last_melee_hit_ms = GetTickCount64();
+                            s_last_melee_dmg_ms = GetTickCount64();
+
+                            if (out_hit_cvd && !IsBadReadPtr(out_hit_cvd, sizeof(STUConfigVarDynamic))) {
+                                StatescriptPrimitive eprim(StatescriptPrimitive_ENTITY, (__int64)ent->entity_id);
+                                WriteDynamicVarPrim(inst, out_hit_cvd, eprim);
+                            }
+
+                            float new_hp = ApplyDamageToHealthComponent(c28, dmg);
+                            if (new_hp <= 0.0f) {
+                                *(uint32_t*)((uintptr_t)c1 + 0x1B8) &= ~0x10000u;
+                            }
+                            *(uint32_t*)((uintptr_t)c28 + 0x14) = 1;
+                            s_last_hit_dummy_entid = ent->entity_id;
+                            s_last_hit_dummy_ms = GetTickCount64();
+                            SyncEntityHealthVarBag(ent);
+                            {
+                                std::lock_guard<std::mutex> hit_lock(s_pellet_hit_mutex);
+                                if (s_pending_dmg_pkt_count < 32) {
+                                    int32_t dmg_int = (int32_t)(dmg + 0.5f);
+                                    if (dmg_int < 1) dmg_int = 1;
+                                    uint8_t pkt_flags = (uint8_t)(new_hp <= 0.0f ? 2 : 0);
+                                    s_pending_dmg_pkts[s_pending_dmg_pkt_count++] = PendingDamagePacket{ ent->entity_id, dmg_int, pkt_flags, true };
+                                }
+                            }
+                            Vector4 push_dir{ d.X + fwd.X * 1.5f, 0.0f, d.Z + fwd.Z * 1.5f, 0.0f };
+                            if (script_id == 0x0580000000000776ULL) {
+                                ArmEnemyKnockback(ent, push_dir, 15.0f, 5.0f, 500); // Lucio Soundwave
+                            } else if (script_id == 0x058000000000003BULL) {
+                                ArmEnemyKnockback(ent, push_dir, 14.0f, 5.5f, 500); // Winston Primal Rage
+                            } else if (script_id == 0x058000000000047EULL || script_id == 0x058000000000026AULL || script_id == 0x0580000000000B2FULL) {
+                                ArmEnemyKnockback(ent, push_dir, 12.0f, 4.5f, 450); // D.Va Boosters
+                            } else if (script_id == 0x0580000000000052ULL || script_id == 0x0580000000000041ULL) {
+                                ArmEnemyKnockback(ent, push_dir, 5.5f, 2.0f, 250); // Reinhardt / Torb Hammer
+                            }
+                            ShotDiagLogFmt("[MELEE_SWEEP (0x619D9E95)] script=0x%llX hit=0x%X dist=%.2fm -%.1f -> HP %.1f",
+                                (unsigned long long)script_id, ent->entity_id, dist, dmg, new_hp);
+
+                            SafeTraverseOutputPlug(inst->ss_inner, inst, (STUStatescriptBase*)stu_state, on_hit_plug, 0x138);
+                        }
+                    }
+                }
+                auto sched_finish = (schedule_finish_state_fn)(globals::gameBase + 0xF4A9C0);
+                sched_finish((uintptr_t)state, 1, 120);
+            } else if (stu_hash == 0xD78490D1u && is_local && owner_ent) {
+                // 0xD78490D1: Impulse / Knockback State (sz = 0x128)
+                auto* comp15 = owner_ent->getById<Component_15_STUCharacterMoverComponent>(0x15);
+                if (comp15 && !IsBadReadPtr(comp15, sizeof(Component_15_STUCharacterMoverComponent))) {
+                    const Vector4& q = comp15->movement_state_1.rotation_quaternion;
+                    float pitch = -comp15->movement_state_1.y_lookdir; // y_lookdir: -1.5 is UP, +1.5 is DOWN
+                    Vector4 fwd{
+                        2.0f * (q.X * q.Z + q.W * q.Y),
+                        sinf(pitch),
+                        1.0f - 2.0f * (q.X * q.X + q.Y * q.Y),
+                        0.0f
+                    };
+                    float flen = sqrtf(fwd.X * fwd.X + fwd.Z * fwd.Z);
+                    if (flen > 1e-4f) { fwd.X /= flen; fwd.Z /= flen; }
+
+                    float fwd_speed = 16.0f;
+                    float up_speed  = 0.0f;
+                    uint64_t dur_ms = 350;
+                    float dash_dmg  = 0.0f;
+                    float dash_rad  = 3.5f;
+
+                    if (script_id == 0x0580000000000024ULL || script_id == 0x0580000000000025ULL || script_id == 0x0580000000000074ULL) {
+                        // Pharah Jump Jet
+                        fwd_speed = 2.0f; up_speed = 22.0f; dur_ms = 450;
+                    } else if (script_id == 0x0580000000000038ULL || script_id == 0x05800000000000FEULL ||
+                               script_id == 0x0580000000000109ULL || script_id == 0x058000000000010AULL) {
+                        // Winston Jump Pack (50 AoE leap/land damage within 5.5m)
+                        fwd_speed = 20.0f; up_speed = 12.0f; dur_ms = 500; dash_dmg = 50.0f; dash_rad = 5.5f;
+                    } else if (script_id == 0x05800000000001DBULL || script_id == 0x05800000000001DCULL ||
+                               script_id == 0x0580000000000045ULL || script_id == 0x0580000000000157ULL || script_id == 0x0580000000000317ULL) {
+                        // Genji Swift Strike (50 dash sweep damage)
+                        fwd_speed = 35.0f; up_speed = 35.0f * fwd.Y; dur_ms = 400; dash_dmg = 50.0f; dash_rad = 4.0f;
+                    } else if (script_id == 0x05800000000001E9ULL || script_id == 0x058000000000017BULL ||
+                               script_id == 0x05800000000001F0ULL || script_id == 0x058000000000022FULL) {
+                        // McCree Combat Roll (+ immediate 6/6 Peacekeeper ammo refill)
+                        fwd_speed = 15.0f; up_speed = 0.0f; dur_ms = 400;
+                        RefillHeroWeaponAmmo(owner_ent);
+                    } else if (script_id == 0x058000000000007DULL || script_id == 0x05800000000000BEULL) {
+                        // Reinhardt Charge (75 dash impact damage)
+                        fwd_speed = 16.5f; up_speed = 0.0f; dur_ms = 1200; dash_dmg = 75.0f; dash_rad = 3.5f;
+                    } else if (script_id == 0x058000000000026AULL || script_id == 0x0580000000000B2FULL) {
+                        // D.Va Boosters (25 impact damage)
+                        fwd_speed = 12.5f; up_speed = 12.5f * fwd.Y; dur_ms = 1500; dash_dmg = 25.0f; dash_rad = 3.8f;
+                    } else if (script_id == 0x0580000000000020ULL || script_id == 0x0580000000000067ULL) {
+                        // Widowmaker Grappling Hook
+                        fwd_speed = 20.0f; up_speed = (fwd.Y > 0.1f ? 20.0f * fwd.Y : 6.0f); dur_ms = 550;
+                    }
+
+                    s_active_impulse_vel = Vector4{ fwd.X * fwd_speed, up_speed, fwd.Z * fwd_speed, 0.0f };
+                    s_active_impulse_min_y = comp15->movement_state_1.absolute_position.Y;
+                    s_active_impulse_end_ms = GetTickCount64() + dur_ms;
+                    if (dash_dmg > 0.0f) {
+                        ArmDashSweepDamage(script_id, dash_dmg, dash_rad, dur_ms + 150);
+                    }
+
+                    ShotDiagLogFmt("[IMPULSE_STATE (0xD78490D1)] script=0x%llX vel=(%.1f,%.1f,%.1f) dur=%llums dmg=%.1f",
+                        (unsigned long long)script_id, s_active_impulse_vel.X, s_active_impulse_vel.Y, s_active_impulse_vel.Z,
+                        (unsigned long long)dur_ms, dash_dmg);
+                }
+                auto sched_finish = (schedule_finish_state_fn)(globals::gameBase + 0xF4A9C0);
+                sched_finish((uintptr_t)state, 1, 200);
+            } else if (stu_hash == 0x4CCED352u || stu_hash == 0x0E3689F3u) {
+                // 0x4CCED352 (Barrier / Deployable CreateEntity State) & 0x0E3689F3 (Hanzo Dragonstrike State)
+                SpawnStatescriptSubEntity(inst, (STUStatescriptBase*)stu_state, stu_hash);
+                if (script_id == 0x05800000000005FEULL && owner_ent) {
+                    // Mei Cryo-Freeze (0x05800000000005FE node[0]): heal +150 HP smoothly over 4.0s
+                    ArmHeroHealOverTime(0x05800000000005FEULL, 150.0f, 4000, "MEI_CRYOFREEZE_HOT");
+                }
+                if (stu_hash == 0x0E3689F3u) {
+                    auto sched_finish = (schedule_finish_state_fn)(globals::gameBase + 0xF4A9C0);
+                    sched_finish((uintptr_t)state, 1, 250);
+                }
+            } else if (stu_hash == 0x860EE5FCu && script_id == 0x0580000000000257ULL && owner_ent) {
+                // Soldier: 76 Biotic Field (0x0580000000000257 node[6] WeaponVolley):
+                // Spawn physical Biotic Field Emitter (0x04000000000003DC -> 0x0580000000000258 -> 0x040000000000068A)
+                // on the ground AND arm the 5s 40 HP/s radius HoT.
+                Entity* emitter_ent = SpawnStatescriptSubEntity(inst, (STUStatescriptBase*)stu_state, stu_hash);
+                auto* oc1  = owner_ent->getById<Component_1_SceneRendering>(1);
+                auto* oc15 = owner_ent->getById<Component_15_STUCharacterMoverComponent>(0x15);
+                Vector4 pos = (oc15 && !IsBadReadPtr(oc15, sizeof(Component_15_STUCharacterMoverComponent)))
+                    ? oc15->movement_state_1.absolute_position : (oc1 ? oc1->position : Vector4{});
+                if (emitter_ent) {
+                    if (auto* ec1 = emitter_ent->getById<Component_1_SceneRendering>(1)) {
+                        pos = ec1->position;
+                    }
+                }
+                s_biotic_field_pos = pos;
+                s_biotic_field_end_ms = GetTickCount64() + 5000;
+            } else if (stu_hash == 0x3A846155u && script_id == 0x0580000000000232ULL && owner_ent) {
+                // Junkrat RIP-Tire (0x0580000000000232) Possession Start (0x3A846155)
+                EntityAdminBase* ea = GameEntityAdmin();
+                if (ea) {
+                    auto* oc1 = owner_ent->getById<Component_1_SceneRendering>(1);
+                    Vector4 pos = oc1 ? oc1->position : Vector4{};
+                    Vector4 rot = oc1 ? oc1->rotation : Vector4{ 0.0f, 0.0f, 0.0f, 1.0f };
+                    Entity* tire_ent = SpawnStandaloneSubEntity(ea, 0x040000000000039CULL, pos, rot);
+                    if (!tire_ent) tire_ent = SpawnStandaloneSubEntity(ea, 0x040000000000083CULL, pos, rot);
+                    if (tire_ent) {
+                        s_riptire_ent_id = tire_ent->entity_id;
+                        s_riptire_saved_mdl_id = owner_ent->entity_id;
+                        s_riptire_end_ms = GetTickCount64() + 10000;
+                        if (Entity* local_ctrl = ea->getLocalEnt()) {
+                            if (auto* c20 = local_ctrl->getById<Component_20_ModelReference>(0x20)) {
+                                c20->cam_attach_entid = tire_ent->entity_id;
+                                c20->aim_entid = tire_ent->entity_id;
+                                c20->movement_attach_entid = tire_ent->entity_id;
+                            }
+                        }
+                        ShotDiagLogFmt("[RIPTIRE_START (0x3A846155)] junkrat=0x%X -> tire=0x%X", owner_ent->entity_id, tire_ent->entity_id);
+                    }
+                }
+            } else if (stu_hash == 0x74CB0002u && script_id == 0x0580000000000232ULL) {
+                // Junkrat RIP-Tire Detonation / End State (0x74CB0002)
+                if (s_riptire_ent_id != 0) {
+                    s_riptire_end_ms = GetTickCount64();
+                }
+            }
+        }
+    }
+
+    return ret;
+}
+
+// Universal State Entry & Exit Callbacks invoked from +0xD146A0 (OnNodeStateEntry) and +0xD14850 (OnNodeStateFinished).
+// This catches ALL state entries/exits regardless of whether the state uses the base vtable (+0xF495C0) or a subclass vtable.
+static void OnUniversalStateEntry(StatescriptSyncMgr* ss, StatescriptInstance* inst, StatescriptState* state) {
+    if (!IsHeroOrSubEntScript(inst) || !state || IsBadReadPtr(state, sizeof(StatescriptState))) return;
+    if (!inst->graph || IsBadReadPtr(inst->graph, sizeof(STUStatescriptGraph))) return;
+
+    Entity* owner_ent = (ss && !IsBadReadPtr(ss, sizeof(StatescriptSyncMgr)) && ss->component_ref)
+        ? ss->component_ref->base.entity_backref : nullptr;
+    Entity* hero_ent = GetLocalHeroModelEnt();
+    bool is_local = (owner_ent && owner_ent == hero_ent);
+
+    STUStatescriptState* stu_state = inst->graph->STUFromState(state);
+    if (!stu_state || IsBadReadPtr(stu_state, sizeof(STUStatescriptBase))) return;
+    auto* stu_base = (STUStatescriptBase*)stu_state;
+    STUInfo* info = (stu_base->graph_node.base.vfptr && !IsBadReadPtr(stu_base->graph_node.base.vfptr, sizeof(STUBase_vt)))
+        ? stu_base->graph_node.base.vfptr->GetSTUInfo() : nullptr;
+    uint32_t stu_hash = (info && !IsBadReadPtr(info, sizeof(STUInfo))) ? info->name_hash : 0;
+    uint64_t script_id = SafeReadVal<uint64_t>((uintptr_t)inst + 0x150);
+    int node_idx = stu_base->idx_in_nodes;
+
+    // 1. Sub-entity scripts: Soldier: 76 Biotic Emitter (0x0580000000000258)
+    if (script_id == 0x0580000000000258ULL && owner_ent) {
+        auto* oc1 = owner_ent->getById<Component_1_SceneRendering>(1);
+        if (oc1 && (fabsf(oc1->position.X) > 0.01f || fabsf(oc1->position.Z) > 0.01f)) {
+            s_biotic_field_pos = oc1->position;
+        } else if (hero_ent) {
+            if (auto* hc1 = hero_ent->getById<Component_1_SceneRendering>(1)) {
+                s_biotic_field_pos = hc1->position;
+            }
+        }
+        uint64_t now_ms = GetTickCount64();
+        bool already_tracked = false;
+        for (int i = 0; i < s_created_sub_entity_count; ++i) {
+            if (s_created_sub_entities[i].ent_id == owner_ent->entity_id) {
+                already_tracked = true;
+                break;
+            }
+        }
+        if (!already_tracked && s_created_sub_entity_count < 64 && owner_ent != hero_ent) {
+            CreatedSubEntityEntry entry{};
+            entry.ent_id = owner_ent->entity_id;
+            entry.owner_ent_id = hero_ent ? hero_ent->entity_id : 0;
+            entry.res_id = 0x04000000000003DCULL;
+            entry.script_id = script_id;
+            entry.spawn_ms = now_ms;
+            entry.last_effect_ms = now_ms;
+            entry.spawn_pos = s_biotic_field_pos;
+            entry.ground_y = s_biotic_field_pos.Y;
+            entry.lock_stationary = false;
+            entry.expire_ms = now_ms + 5000;
+            s_created_sub_entities[s_created_sub_entity_count++] = entry;
+        }
+        if (s_biotic_field_ent_id != owner_ent->entity_id) {
+            if (s_biotic_field_ent_id != 0) {
+                if (EntityAdminBase* ea = GameEntityAdmin()) {
+                    if (Entity* old_bf = ea->getEntById(s_biotic_field_ent_id)) {
+                        if (old_bf != hero_ent) {
+                            HideAndExpireSubEntity(ea, old_bf, hero_ent);
+                        }
+                    }
+                }
+            }
+            s_biotic_field_ent_id = owner_ent->entity_id;
+            s_biotic_field_end_ms = now_ms + 5000;
+            ShotDiagLogFmt("[BIOTIC_FIELD_ACTIVE] emitter_ent=0x%X pos=(%.1f,%.1f,%.1f) dur=5000ms (40 HP/s)",
+                owner_ent->entity_id, s_biotic_field_pos.X, s_biotic_field_pos.Y, s_biotic_field_pos.Z);
+        }
+        return;
+    }
+
+    if (!is_local || !owner_ent) return;
+
+    // 2. McCree Combat Roll (0x05800000000001E9 / 0x05800000000001F0): immediate 6/6 Peacekeeper ammo refill
+    if (script_id == 0x05800000000001E9ULL || script_id == 0x05800000000001F0ULL) {
+        if (node_idx == 22 || stu_hash == 0x2A0FB7E6u || stu_hash == 0xD78490D1u) {
+            RefillHeroWeaponAmmo(owner_ent);
+        }
+    }
+
+    // 3. Dash / Leap Sweep Damage (catches 0x2A0FB7E6 / 0xC17B255D / 0x970EC198 / 0x498B421A / 0x7FB4BF64 subclass movement states that bypass +0xF495C0)
+    if (stu_hash == 0x2A0FB7E6u || stu_hash == 0xC17B255Du || stu_hash == 0xD78490D1u ||
+        stu_hash == 0x970EC198u || stu_hash == 0x498B421Au || stu_hash == 0x7FB4BF64u) {
+        if (script_id == 0x05800000000001DBULL || script_id == 0x05800000000001DCULL ||
+            script_id == 0x0580000000000045ULL || script_id == 0x0580000000000157ULL || script_id == 0x0580000000000317ULL) {
+            ArmDashSweepDamage(script_id, 50.0f, 4.0f, 650);
+        } else if (script_id == 0x0580000000000109ULL || script_id == 0x058000000000010AULL ||
+                   script_id == 0x0580000000000038ULL || script_id == 0x05800000000000FEULL) {
+            ArmDashSweepDamage(script_id, 50.0f, 5.5f, 950);
+        } else if (script_id == 0x058000000000047EULL || script_id == 0x058000000000026AULL || script_id == 0x0580000000000B2FULL) {
+            if (node_idx == 15 || s_active_dash_sweep_script_id != script_id || GetTickCount64() >= s_active_dash_sweep_end_ms) {
+                ArmDashSweepDamage(script_id, 25.0f, 3.8f, 2200);
+            }
+        } else if (script_id == 0x058000000000007DULL || script_id == 0x05800000000000BEULL) {
+            ArmDashSweepDamage(script_id, 75.0f, 3.5f, 1500);
+        }
+    }
+
+    // 4. Bastion Self-Repair (0x0580000000000153): node=47 (m_st=28 channel state) heals 75 HP/s while active
+    if (script_id == 0x0580000000000153ULL && (node_idx == 47 || stu_hash == 0x619D9E95u)) {
+        if (!s_bastion_repair_active) {
+            s_bastion_repair_active = true;
+            ShotDiagLogFmt("[BASTION_REPAIR_START] script=0x%llX node=%d (75 HP/s while held)",
+                (unsigned long long)script_id, node_idx);
+        }
+    }
+
+    // 5. Soldier: 76 Biotic Field (0x0580000000000257 node=6 WeaponVolley 0x860EE5FC)
+    if (script_id == 0x0580000000000257ULL && (node_idx == 6 || stu_hash == 0x860EE5FCu)) {
+        auto* oc1  = owner_ent->getById<Component_1_SceneRendering>(1);
+        auto* oc15 = owner_ent->getById<Component_15_STUCharacterMoverComponent>(0x15);
+        s_biotic_field_pos = (oc15 && !IsBadReadPtr(oc15, sizeof(Component_15_STUCharacterMoverComponent)))
+            ? oc15->movement_state_1.absolute_position : (oc1 ? oc1->position : Vector4{});
+        uint64_t now_ms = GetTickCount64();
+        if (now_ms >= s_biotic_field_end_ms) {
+            s_biotic_field_end_ms = now_ms + 5000;
+            ShotDiagLogFmt("[BIOTIC_FIELD_DEPLOY] hero=0x%X pos=(%.1f,%.1f,%.1f) dur=5000ms (40 HP/s)",
+                owner_ent->entity_id, s_biotic_field_pos.X, s_biotic_field_pos.Y, s_biotic_field_pos.Z);
+        }
+    }
+
+    // 6. Torbjorn Armor Pack (0x05800000000000F1 / 0x05800000000000F5): grant +75 HP/Armor on throw
+    if ((script_id == 0x05800000000000F1ULL || script_id == 0x05800000000000F5ULL) && stu_hash == 0x860EE5FCu) {
+        ApplyHeroSelfHeal(owner_ent, 75.0f, script_id, "TORB_ARMOR_PACK_SELF");
+    }
+
+    // 7. Soldier: 76 Passive Status Subgraph (0x05800000000001C7):
+    // In offline mode, node[49] / node[120] (0xF7D6498C STUStatescriptStateStack) push onto comp23's ability mutex table
+    // (0xD80000000000021 / 0xD80000000000EBC) with a blocking priority float at [state + 0xB8], causing +0xF4D1D0 to reject
+    // Biotic Field (0x0580000000000257 node[3] 0xF53C5DA8) and play the "cannot use ability yet" buzzer sound (+0xD65BE0).
+    if (script_id == 0x05800000000001C7ULL && stu_hash == 0xF7D6498Cu && !IsBadReadPtr(state, 0xD0)) {
+        float old_prio = *(float*)((uintptr_t)state + 0xB8);
+        if (old_prio > -999.0f) {
+            *(float*)((uintptr_t)state + 0xB8) = -1000.0f;
+            ShotDiagLogFmt("[STATE_STACK_PRIO_LOWER] script=0x%llX node=%d state=0x%llX old_prio=%.2f -> -1000.0",
+                (unsigned long long)script_id, node_idx, (unsigned long long)state, old_prio);
+        }
+    }
+}
+
+static void OnUniversalStateExit(StatescriptSyncMgr* ss, StatescriptInstance* inst, StatescriptState* state) {
+    if (!IsHeroOrSubEntScript(inst) || !state || IsBadReadPtr(state, sizeof(StatescriptState))) return;
+    if (!inst->graph || IsBadReadPtr(inst->graph, sizeof(STUStatescriptGraph))) return;
+
+    STUStatescriptState* stu_state = inst->graph->STUFromState(state);
+    if (!stu_state || IsBadReadPtr(stu_state, sizeof(STUStatescriptBase))) return;
+    auto* stu_base = (STUStatescriptBase*)stu_state;
+    uint64_t script_id = SafeReadVal<uint64_t>((uintptr_t)inst + 0x150);
+    int node_idx = stu_base->idx_in_nodes;
+
+    // Stop Bastion Self-Repair HoT when channel state node=47 exits (key released or full HP)
+    if (script_id == 0x0580000000000153ULL && node_idx == 47) {
+        if (s_bastion_repair_active) {
+            s_bastion_repair_active = false;
+            ShotDiagLogFmt("[BASTION_REPAIR_END] script=0x%llX node=%d", (unsigned long long)script_id, node_idx);
+        }
+    }
+
+    // Stop D.Va Boosters sweep when flight state node=15 or node=19 exits early (cancelled by player)
+    if (script_id == 0x058000000000047EULL && (node_idx == 15 || node_idx == 19)) {
+        if (s_active_dash_sweep_script_id == script_id) {
+            s_active_dash_sweep_end_ms = 0;
+        }
+    }
+
+    // Stop Mei Cryo-Freeze HoT if ice block state exits early (cancelled by player)
+    if (script_id == 0x05800000000005FEULL && (node_idx == 0 || node_idx == 15)) {
+        if (s_active_hot_script_id == 0x05800000000005FEULL) {
+            s_active_hot_end_ms = 0;
+            s_active_hot_script_id = 0;
+        }
+    }
+}
+
+// 10. +0xD739A0 (IsGraphNodeClientOnly):
+// Strictly gated by IsHeroOrSubEntScript(inst) so main menu, map scripts, loading screens, and doors are 100% untouched.
+// For the LocalPlayer Hero Model (and its weapons/deployables), allows server-tagged ability nodes (0x4E83BC01, 0x04CC5359,
+// 0x1BB99C36, 0x4CCED352, 0x0E3689F3) to be entered without mutating shared CASC STUStatescriptGraph memory.
+typedef uint8_t(__fastcall* is_node_client_only_fn)(StatescriptInstance* inst, STUStatescriptBase* node);
+static is_node_client_only_fn IsGraphNodeClientOnly_orig = nullptr;
+static uint8_t __fastcall IsGraphNodeClientOnly_hook(StatescriptInstance* inst, STUStatescriptBase* node) {
+    uint8_t res = IsGraphNodeClientOnly_orig(inst, node);
+    if (res == 0 && IsHeroOrSubEntScript(inst)) {
+        return 1;
+    }
+    return res;
+}
+
+// 10b. +0xF4D1D0 (CanAcquireAbilityMutex):
+// Called by +0x1088810 (gate #5 at +0x1088BD7 and gate #6 at +0x1088C0B for 0xF53C5DA8 ability input states).
+// In offline mode, passive status subgraphs (such as Soldier: 76's 0x05800000000001C7 node[49] 0xF7D6498C holding 0xD80000000000021)
+// remain on comp23's 8-bucket ability mutex table ([comp23 + 0x10 + bucket*24]) with a higher priority float at [holder_state + 0xB8].
+// That causes +0xF4D1D0 to return 0, making +0x1088810 set *out_play_cannot_use_sound = 1 (+0xD65BE0 buzzer sound) and block
+// +0x1088460 -> +0xF55FD0 -> +0xF596E0 from placing the ability state at the tail [entry + 0x18] to fire vt+0x260 (+0xD65AC0).
+typedef uint8_t(__fastcall* can_acquire_ability_mutex_fn)(
+    StatescriptInstance* inst,
+    STUConfigVar* mutex_var,
+    STUConfigVar* priority_var,
+    uintptr_t state_impl);
+static can_acquire_ability_mutex_fn CanAcquireAbilityMutex_orig = nullptr;
+static uint8_t __fastcall CanAcquireAbilityMutex_hook(
+    StatescriptInstance* inst,
+    STUConfigVar* mutex_var,
+    STUConfigVar* priority_var,
+    uintptr_t state_impl)
+{
+    uint8_t res = CanAcquireAbilityMutex_orig(inst, mutex_var, priority_var, state_impl);
+    if (res == 0 && IsHeroOrSubEntScript(inst) && state_impl != 0 && !IsBadReadPtr((const void*)state_impl, 0xD0)) {
+        uintptr_t comp23 = SafeReadVal<uintptr_t>((uintptr_t)inst + 0x10);
+        uint64_t req_script = SafeReadVal<uint64_t>((uintptr_t)inst + 0x150);
+        int32_t req_node = SafeReadVal<int32_t>(state_impl + 0x70);
+        float req_prio = *(float*)(state_impl + 0xB8);
+
+        if (comp23 && !IsBadReadPtr((const void*)comp23, 0x100)) {
+            for (int b = 0; b < 8; ++b) {
+                int32_t cnt = SafeReadVal<int32_t>(comp23 + 0x10 + (uintptr_t)b * 24);
+                uintptr_t arr = SafeReadVal<uintptr_t>(comp23 + 0x18 + (uintptr_t)b * 24);
+                if (cnt <= 0 || cnt > 64 || !arr || IsBadReadPtr((const void*)arr, (size_t)cnt * 48)) continue;
+                for (int i = 0; i < cnt; ++i) {
+                    uintptr_t entry = arr + (uintptr_t)i * 48;
+                    uint32_t key = SafeReadVal<uint32_t>(entry + 0x28);
+                    uintptr_t holders[2] = {
+                        SafeReadVal<uintptr_t>(entry + 0x10),
+                        SafeReadVal<uintptr_t>(entry + 0x18)
+                    };
+                    for (int h = 0; h < 2; ++h) {
+                        uintptr_t hs = holders[h];
+                        if (!hs || hs == state_impl || IsBadReadPtr((const void*)hs, 0xD0)) continue;
+                        float h_prio = *(float*)(hs + 0xB8);
+                        if (h_prio > -999.0f && h_prio >= req_prio) {
+                            StatescriptInstance* h_inst = (StatescriptInstance*)SafeReadVal<uintptr_t>(hs + 0x78);
+                            uint64_t h_script = (h_inst && !IsBadReadPtr(h_inst, 0x160))
+                                ? SafeReadVal<uint64_t>((uintptr_t)h_inst + 0x150) : 0;
+                            int32_t h_node = SafeReadVal<int32_t>(hs + 0x70);
+                            *(float*)(hs + 0xB8) = -1000.0f;
+                            ShotDiagLogFmt("[ABILITY_MUTEX_UNLOCK] key=0x%X req=(0x%llX n=%d prio=%.2f) holder=(0x%llX n=%d prio=%.2f->-1000.0)",
+                                key,
+                                (unsigned long long)req_script, req_node, req_prio,
+                                (unsigned long long)h_script, h_node, h_prio);
+                        }
+                    }
+                }
+            }
+        }
+        res = CanAcquireAbilityMutex_orig(inst, mutex_var, priority_var, state_impl);
+        if (res == 0) {
+            res = 1;
+            ShotDiagLogFmt("[ABILITY_MUTEX_FORCE_ALLOW] req=(0x%llX n=%d prio=%.2f)",
+                (unsigned long long)req_script, req_node, req_prio);
+        }
+    }
+    return res;
+}
+
+// 11. +0x1096500 (PlacementState_TickRay for 0x160C4F1D) & +0xD6D270 (FindGround_Begin for 0x72509D3B):
+// Ensures Symmetra Sentry/Teleporter, Torbjorn Turret, and Mei Ice Wall previews always compute valid placement coordinates
+// and mark their placement state valid (turning Symmetra's red sentry preview blue and allowing LMB confirmation).
+typedef void(__fastcall* placement_tick_ray_fn)(StatescriptState* state);
+static placement_tick_ray_fn PlacementState_TickRay_orig = nullptr;
+static void __fastcall PlacementState_TickRay_hook(StatescriptState* state) {
+    PlacementState_TickRay_orig(state);
+    if (!state || IsBadReadPtr(state, 0x100)) return;
+    if (*((uint8_t*)state + 0xB0) == 0) {
+        StatescriptInstance* inst = (StatescriptInstance*)SafeReadVal<uintptr_t>((uintptr_t)state + 0x78);
+        Entity* owner_ent = (inst && !IsBadReadPtr(inst, sizeof(StatescriptInstance)) && inst->ss_inner &&
+            !IsBadReadPtr(inst->ss_inner, sizeof(StatescriptSyncMgr)) && inst->ss_inner->component_ref)
+            ? inst->ss_inner->component_ref->base.entity_backref : GetLocalHeroModelEnt();
+        if (owner_ent) {
+            auto* c1 = owner_ent->getById<Component_1_SceneRendering>(1);
+            auto* c15 = owner_ent->getById<Component_15_STUCharacterMoverComponent>(0x15);
+            Vector4 pos = c1 ? c1->position : Vector4{};
+            Vector4 fwd{ 0.0f, 0.0f, 1.0f, 0.0f };
+            if (c15 && !IsBadReadPtr(c15, sizeof(Component_15_STUCharacterMoverComponent))) {
+                pos = c15->movement_state_1.absolute_position;
+                const Vector4& q = c15->movement_state_1.rotation_quaternion;
+                fwd.X = 2.0f * (q.X * q.Z + q.W * q.Y);
+                fwd.Z = 1.0f - 2.0f * (q.X * q.X + q.Y * q.Y);
+                float fl = sqrtf(fwd.X * fwd.X + fwd.Z * fwd.Z);
+                if (fl > 1e-4f) { fwd.X /= fl; fwd.Z /= fl; }
+            }
+            float* hit_pos = (float*)((uintptr_t)state + 0xC0);
+            float* hit_nrm = (float*)((uintptr_t)state + 0xD0);
+            float* hit_fwd = (float*)((uintptr_t)state + 0xE0);
+            if (hit_pos[0] == 0.0f && hit_pos[1] == 0.0f && hit_pos[2] == 0.0f) {
+                hit_pos[0] = pos.X + fwd.X * 2.8f;
+                hit_pos[1] = pos.Y;
+                hit_pos[2] = pos.Z + fwd.Z * 2.8f;
+            }
+            if (hit_nrm[0] == 0.0f && hit_nrm[1] == 0.0f && hit_nrm[2] == 0.0f) {
+                hit_nrm[0] = 0.0f; hit_nrm[1] = 1.0f; hit_nrm[2] = 0.0f;
+            }
+            if (hit_fwd[0] == 0.0f && hit_fwd[1] == 0.0f && hit_fwd[2] == 0.0f) {
+                hit_fwd[0] = fwd.X; hit_fwd[1] = 0.0f; hit_fwd[2] = fwd.Z;
+            }
+            *((uint8_t*)state + 0xB0) = 1;
+            *((uint8_t*)state + 0xB1) = 1;
+        }
+    }
+}
+
+typedef void(__fastcall* find_ground_begin_fn)(StatescriptState* state, uint64_t a2);
+static find_ground_begin_fn FindGround_Begin_orig = nullptr;
+static void __fastcall FindGround_Begin_hook(StatescriptState* state, uint64_t a2) {
+    FindGround_Begin_orig(state, a2);
+    if (state && !IsBadReadPtr(state, 0xD8)) {
+        *((uint8_t*)state + 0xC8) = 1;
+    }
+}
+
+// 12. +0xF471F0: TraverseLink(StatescriptSyncMgr* mgr, StatescriptInstance* inst, STUStatescriptBase* source_node,
+//                             STUStatescriptOutputPlug* output_plug, STUStatescriptInputPlug* input_plug, uint32_t a6)
+// Intercepts custom "place now" input plugs on the 4 Group-2 placement / Mei Ice Wall states:
+//   - 0x160C4F1D (Placement State — Symmetra Sentry/Teleporter, Torbjorn Turret, Junkrat RIP-Tire): input plug 0xC63FD388 -> output plug 0x02701BF5
+//   - 0x72509D3B (FindGround — Mei Ice Wall): input plug 0xC63FD388 -> output plug 0x02701BF5
+//   - 0x12AA4F0F (Mei Ice Wall Start State): input plug 0x5556C513 -> output plug 0x8CF01B33
+//   - 0x614C3A0A (Mei Ice Wall Pillar Segment State): input plug 0x5556C513 -> output plug 0x8CF01B33
+typedef uint8_t(__fastcall* traverse_link_fn)(
+    StatescriptSyncMgr* mgr,
+    StatescriptInstance* inst,
+    STUStatescriptBase* source_node,
+    STUStatescriptOutputPlug* output_plug,
+    STUStatescriptInputPlug* input_plug,
+    uint32_t a6);
+static traverse_link_fn TraverseLink_orig = nullptr;
+static uint8_t __fastcall TraverseLink_hook(
+    StatescriptSyncMgr* mgr,
+    StatescriptInstance* inst,
+    STUStatescriptBase* source_node,
+    STUStatescriptOutputPlug* output_plug,
+    STUStatescriptInputPlug* input_plug,
+    uint32_t a6)
+{
+    uint8_t res = TraverseLink_orig(mgr, inst, source_node, output_plug, input_plug, a6);
+
+    if (IsHeroOrSubEntScript(inst) && input_plug && !IsBadReadPtr(input_plug, sizeof(STUStatescriptInputPlug))) {
+        STUStatescriptBase* target_node = (STUStatescriptBase*)SafeReadVal<uintptr_t>((uintptr_t)input_plug + 0x18);
+        if (target_node && !IsBadReadPtr(target_node, sizeof(STUStatescriptState))) {
+            STUInfo* info = (target_node->graph_node.base.vfptr && !IsBadReadPtr(target_node->graph_node.base.vfptr, sizeof(STUBase_vt)))
+                ? target_node->graph_node.base.vfptr->GetSTUInfo() : nullptr;
+            uint32_t stu_hash = (info && !IsBadReadPtr(info, sizeof(STUInfo))) ? info->name_hash : 0;
+
+            if (stu_hash == 0x160C4F1Du || stu_hash == 0x72509D3Bu || stu_hash == 0x12AA4F0Fu || stu_hash == 0x614C3A0Au) {
+                auto* stu_state = (STUStatescriptState*)target_node;
+                int32_t state_idx = SafeReadVal<int32_t>((uintptr_t)stu_state + 0xF8);
+                StatescriptState* state = (state_idx >= 0 && state_idx < inst->state_impl_list.num && inst->state_impl_list.ptr)
+                    ? inst->state_impl_list.ptr[state_idx] : nullptr;
+                StatescriptSyncMgr* sync_mgr = mgr ? mgr : inst->ss_inner;
+
+                if (state && !IsBadReadPtr(state, 0x100)) {
+                    if (stu_hash == 0x160C4F1Du) {
+                        auto* place_in = GetSTUFieldByHash<STUStatescriptInputPlug*>(target_node, 0xC63FD388u);
+                        if (place_in && input_plug == place_in) {
+                            PlacementState_TickRay_hook(state);
+                            auto* cvd_pos = GetSTUFieldByHash<STUConfigVarDynamic*>(target_node, 0xC500D8CFu);
+                            auto* cvd_nrm = GetSTUFieldByHash<STUConfigVarDynamic*>(target_node, 0x57216848u);
+                            auto* cvd_fwd = GetSTUFieldByHash<STUConfigVarDynamic*>(target_node, 0x2650F0BEu);
+                            if (cvd_pos) WriteDynamicVarPrim(inst, cvd_pos, StatescriptPrimitive(StatescriptPrimitive_VEC3, (__int64)((uintptr_t)state + 0xC0)));
+                            if (cvd_nrm) WriteDynamicVarPrim(inst, cvd_nrm, StatescriptPrimitive(StatescriptPrimitive_VEC3, (__int64)((uintptr_t)state + 0xD0)));
+                            if (cvd_fwd) WriteDynamicVarPrim(inst, cvd_fwd, StatescriptPrimitive(StatescriptPrimitive_VEC3, (__int64)((uintptr_t)state + 0xE0)));
+
+                            auto* out_plug = GetSTUFieldByHash<STUStatescriptOutputPlug*>(target_node, 0x02701BF5u);
+                            if (out_plug && !IsBadReadPtr(out_plug, sizeof(STUStatescriptOutputPlug))) {
+                                ShotDiagLogFmt("[PLACEMENT_CONFIRM (0x160C4F1D)] state=0x%llX pos=(%.1f,%.1f,%.1f) -> plug 0x02701BF5",
+                                    (unsigned long long)state, *(float*)((uintptr_t)state + 0xC0), *(float*)((uintptr_t)state + 0xC4), *(float*)((uintptr_t)state + 0xC8));
+                                SafeTraverseOutputPlug(sync_mgr, inst, target_node, out_plug, 0x108);
+                            }
+                        }
+                    } else if (stu_hash == 0x72509D3Bu) {
+                        auto* place_in = GetSTUFieldByHash<STUStatescriptInputPlug*>(target_node, 0xC63FD388u);
+                        if (place_in && input_plug == place_in) {
+                            *((uint8_t*)state + 0xC8) = 1;
+                            float* gpos = (float*)((uintptr_t)state + 0xB0);
+                            if (gpos[0] == 0.0f && gpos[1] == 0.0f && gpos[2] == 0.0f) {
+                                if (Entity* hero = GetLocalHeroModelEnt()) {
+                                    auto* c1 = hero->getById<Component_1_SceneRendering>(1);
+                                    auto* c15 = hero->getById<Component_15_STUCharacterMoverComponent>(0x15);
+                                    Vector4 hp = c1 ? c1->position : Vector4{};
+                                    Vector4 fwd{ 0.0f, 0.0f, 1.0f, 0.0f };
+                                    if (c15 && !IsBadReadPtr(c15, sizeof(Component_15_STUCharacterMoverComponent))) {
+                                        hp = c15->movement_state_1.absolute_position;
+                                        const Vector4& q = c15->movement_state_1.rotation_quaternion;
+                                        fwd.X = 2.0f * (q.X * q.Z + q.W * q.Y);
+                                        fwd.Z = 1.0f - 2.0f * (q.X * q.X + q.Y * q.Y);
+                                        float fl = sqrtf(fwd.X * fwd.X + fwd.Z * fwd.Z);
+                                        if (fl > 1e-4f) { fwd.X /= fl; fwd.Z /= fl; }
+                                    }
+                                    gpos[0] = hp.X + fwd.X * 4.5f;
+                                    gpos[1] = hp.Y;
+                                    gpos[2] = hp.Z + fwd.Z * 4.5f;
+                                }
+                            }
+                            auto* cvd_pos = (STUConfigVarDynamic*)SafeReadVal<uintptr_t>((uintptr_t)target_node + 0x170);
+                            auto* cvd_ok  = (STUConfigVarDynamic*)SafeReadVal<uintptr_t>((uintptr_t)target_node + 0x178);
+                            if (cvd_pos) WriteDynamicVarPrim(inst, cvd_pos, StatescriptPrimitive(StatescriptPrimitive_VEC3, (__int64)gpos));
+                            if (cvd_ok)  WriteDynamicVarPrim(inst, cvd_ok,  StatescriptPrimitive(StatescriptPrimitive_BYTE, 1));
+
+                            auto* out_plug = GetSTUFieldByHash<STUStatescriptOutputPlug*>(target_node, 0x02701BF5u);
+                            if (out_plug && !IsBadReadPtr(out_plug, sizeof(STUStatescriptOutputPlug))) {
+                                ShotDiagLogFmt("[ICEWALL_FINDGROUND (0x72509D3B)] state=0x%llX pos=(%.1f,%.1f,%.1f) -> plug 0x02701BF5",
+                                    (unsigned long long)state, gpos[0], gpos[1], gpos[2]);
+                                SafeTraverseOutputPlug(sync_mgr, inst, target_node, out_plug, 0x108);
+                            }
+                        }
+                    } else if (stu_hash == 0x12AA4F0Fu) {
+                        auto* place_in = GetSTUFieldByHash<STUStatescriptInputPlug*>(target_node, 0x5556C513u);
+                        if (place_in && input_plug == place_in) {
+                            __try {
+                                ((void(__fastcall*)(StatescriptState*))(globals::gameBase + 0x1099FA0))(state);
+                            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+                            for (int k = 0; k < 4; ++k) {
+                                auto* cvd = (STUConfigVarDynamic*)SafeReadVal<uintptr_t>((uintptr_t)target_node + 0x148 + (uintptr_t)k * 8);
+                                float fval = SafeReadVal<float>((uintptr_t)state + 0xA8 + (uintptr_t)k * 4);
+                                if (cvd) WriteDynamicVarPrim(inst, cvd, StatescriptPrimitive(fval));
+                            }
+                            auto* out_plug = GetSTUFieldByHash<STUStatescriptOutputPlug*>(target_node, 0x8CF01B33u);
+                            if (out_plug && !IsBadReadPtr(out_plug, sizeof(STUStatescriptOutputPlug))) {
+                                SafeTraverseOutputPlug(sync_mgr, inst, target_node, out_plug, 0x108);
+                            }
+                        }
+                    } else if (stu_hash == 0x614C3A0Au) {
+                        auto* place_in = GetSTUFieldByHash<STUStatescriptInputPlug*>(target_node, 0x5556C513u);
+                        if (place_in && input_plug == place_in) {
+                            __try {
+                                ((void(__fastcall*)(StatescriptState*))(globals::gameBase + 0x109A580))(state);
+                            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+                            for (int k = 0; k < 2; ++k) {
+                                auto* cvd = (STUConfigVarDynamic*)SafeReadVal<uintptr_t>((uintptr_t)target_node + 0x140 + (uintptr_t)k * 8);
+                                float fval = SafeReadVal<float>((uintptr_t)state + 0xA8 + (uintptr_t)k * 4);
+                                if (cvd) WriteDynamicVarPrim(inst, cvd, StatescriptPrimitive(fval));
+                            }
+                            auto* out_plug = GetSTUFieldByHash<STUStatescriptOutputPlug*>(target_node, 0x8CF01B33u);
+                            if (out_plug && !IsBadReadPtr(out_plug, sizeof(STUStatescriptOutputPlug))) {
+                                SafeTraverseOutputPlug(sync_mgr, inst, target_node, out_plug, 0x108);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return res;
 }
 
 typedef uint8_t(__fastcall* attach_c1_world_fn)(Component_1_SceneRendering* child_c1, Component_1_SceneRendering* parent_c1);
@@ -4366,6 +6701,104 @@ static uintptr_t SafeRva(uintptr_t addr) {
     return (addr >= globals::gameBase && addr < globals::gameBase + 0x3000000ULL) ? (addr - globals::gameBase) : addr;
 }
 
+static std::string FmtRvaShort(uintptr_t addr) {
+    if (!addr) return "0";
+    uintptr_t rva = SafeRva(addr);
+    if (rva == 0x5A0C20) return "ret0";
+    return std::format("+0x{:X}", rva);
+}
+
+static const char* ResolveSSNodeName(uint32_t hash) {
+    switch (hash) {
+    case 0x2F937AE3: return "Entry:GameMsg";
+    case 0x902C07FC: return "Entry:Start";
+    case 0xC71FD31C: return "Entry:Event";
+    case 0xE811ECBB: return "Cond:BoolSwitch";
+    case 0xCD462C0E: return "Cond:CmpSwitch";
+    case 0xD5411AC4: return "Cond:FilterSwitch";
+    case 0x7555AC24: return "Act:SendEvent";
+    case 0xF9EF59A6: return "Act:PlayScript";
+    case 0x8CD9A3B0: return "Act:StopScript";
+    case 0xAD6D8308: return "Act:ResetState";
+    case 0xBA2A3B19: return "Act:WaitDelay";
+    case 0x558B92CA: return "Act:ClientSimTick";
+    case 0xA329F060: return "Act:SetVarClient";
+    case 0xB3934B2D: return "Act:ModifyVar";
+    case 0xFB58999F: return "Act:ClearVar";
+    case 0xA1ABA697: return "Act:PlayAnim";
+    case 0xB2301AC1: return "Act:PlaySound";
+    case 0x4935CA8D: return "Act:CamFX";
+    case 0x1CA9A2AC: return "Act:Rumble";
+    case 0x4E83BC01: return "SRV_Act:SetVar";
+    case 0x04CC5359: return "SRV_Act:DmgHeal";
+    case 0x5C46D801: return "SRV_Act:DestroyEnt";
+    case 0x1BB99C36: return "SRV_Act:CreateEntA";
+    case 0x4CCED352: return "SRV_Act:CreateEntB";
+    case 0x0E3689F3: return "SRV_Act:CreateEntC";
+    case 0xEA036C1F: return "SRV_Act:CombatAmmo";
+    case 0xC75B4AD2: return "SRV_Act:UltCharge";
+    case 0xFC39E2F1: return "SRV_Act:RespawnTele";
+    case 0xC5E146B4: return "SRV_Act:TeamObj";
+    case 0xF53C5DA8: return "State:LogicalBtn";
+    case 0xF7D6498C: return "State:StateStack(Mtx)";
+    case 0x860EE5FC: return "State:WeaponVolley";
+    case 0x6E81F6D4: return "State:Effect";
+    case 0xCD396790: return "State:WaitTimer";
+    case 0x3DB862C4: return "State:Subscript";
+    case 0xC17B255D: return "State:MoveImpulse";
+    case 0x2A0FB7E6: return "State:DirDash";
+    case 0x619D9E95: return "State:MeleeSweep";
+    case 0xC2A01675: return "State:TargetSweep";
+    case 0x6A6C9D8B: return "State:ChannelHold";
+    case 0x8A71D6B6: return "State:StatusMod";
+    case 0x3E7B1C90: return "State:Barrier";
+    case 0x72596FBE: return "State:RecallRewind";
+    case 0xA6D7759E: return "State:BlinkTele";
+    case 0x2E3B1980: return "State:HealTether";
+    case 0xFD0D8424: return "State:Deployable";
+    case 0x5F1C8A02: return "State:HookTether";
+    case 0x237949CC: return "State:HealthWatch";
+    default: break;
+    }
+    auto it = allmighty_hash_lib::hashes.find(hash);
+    return (it != allmighty_hash_lib::hashes.end()) ? it->second.c_str() : "?";
+}
+
+static std::string DecodeConfigVarCompact(uintptr_t obj_addr, uint32_t chash) {
+    if (!obj_addr || IsBadReadPtr((const void*)obj_addr, 0x18)) return "?";
+    if (chash == 0xF8CC195D) { // STUConfigVarDynamic
+        auto* cvd = (STUConfigVarDynamic*)obj_addr;
+        std::string pstr;
+        if (!IsBadReadPtr(cvd, sizeof(STUConfigVarDynamic)) && cvd->item_location.list() && !IsBadReadPtr(cvd->item_location.list(), 8)) {
+            for (int pi = 0; pi < cvd->item_location.count() && pi < 4; pi++) {
+                if (pi > 0) pstr += "/";
+                pstr += std::format("0x{:X}", (unsigned long long)cvd->item_location.list()[pi].resource_id);
+            }
+        }
+        return std::format("CVD({})", pstr);
+    }
+    if (chash == 0x92C535C6) { // STUStatescriptDataStoreBase
+        uint64_t rid10 = SafeReadVal<uint64_t>(obj_addr + 0x10);
+        uint64_t rid08 = SafeReadVal<uint64_t>(obj_addr + 0x08);
+        return std::format("DS(0x{:X})", rid10 ? rid10 : rid08);
+    }
+    if (chash == 0xE476E0B4) { // STUConfigVarFloat
+        return std::format("Flt({:.2f})", SafeReadVal<float>(obj_addr + 0x10));
+    }
+    if (chash == 0x636E86DD) { // STUConfigVarInt
+        return std::format("Int({})", SafeReadVal<int32_t>(obj_addr + 0x10));
+    }
+    if (chash == 0xB233D29C) { // STUConfigVarBool
+        return std::format("Bool({})", SafeReadVal<uint8_t>(obj_addr + 0x10));
+    }
+    uint64_t c10 = SafeReadVal<uint64_t>(obj_addr + 0x10);
+    float cf10 = SafeReadVal<float>(obj_addr + 0x10);
+    if ((c10 >> 48) != 0 && (c10 >> 48) < 0x1000) {
+        return std::format("0x{:08X}(res=0x{:X})", chash, c10);
+    }
+    return std::format("0x{:08X}(+10=0x{:X}/{:.2f})", chash, c10, cf10);
+}
+
 static void AppendVarBagSummary(std::string& out, const char* prefix, Entity* ent, bool dump_script_nodes = false) {
     if (!ent) return;
     auto* ss = ent->getById<Component_23_Statescript>(0x23);
@@ -4373,9 +6806,74 @@ static void AppendVarBagSummary(std::string& out, const char* prefix, Entity* en
     auto* vb = ss->ss_inner.rid_entity_varbag;
     uintptr_t ss_core = (uintptr_t)ss + 0xC0;
     uint8_t auth_374 = SafeReadVal<uint8_t>(ss_core + 0x374);
-    out.append(std::format("  - **{} `Component_23` VarBag (`0x{:X}`, `auth_374={}`)**: ", prefix, (unsigned long long)vb, auth_374));
+    out.append(std::format("  - **{} `Component_23` VarBag (`0x{:X}`, `auth_374={}`, `is_aim={}`, `scope={}`)**: ",
+        prefix, (unsigned long long)vb, auth_374, (int)ss->ss_inner.is_aim_ent, (int)ss->ss_inner.entity_admin_scope));
     AppendSingleVarBagEntries(out, vb, 0);
     out += "\n";
+
+    if (dump_script_nodes) {
+        // A. Dump 8-Bucket Ability Mutex Priority Queue (comp23 + 0x10, each bucket = 0x18 bytes)
+        std::string mtx_out;
+        for (int b = 0; b < 8; b++) {
+            uintptr_t b_addr = (uintptr_t)ss + 0x10 + (uintptr_t)b * 0x18;
+            uintptr_t entry = SafeReadVal<uintptr_t>(b_addr + 0x00);
+            int guard = 0;
+            while (entry && !IsBadReadPtr((const void*)entry, 0x20) && guard++ < 16) {
+                uint64_t mkey = SafeReadVal<uint64_t>(entry + 0x00);
+                uintptr_t head_st = SafeReadVal<uintptr_t>(entry + 0x10);
+                uintptr_t tail_st = SafeReadVal<uintptr_t>(entry + 0x18);
+                if (mkey || head_st || tail_st) {
+                    mtx_out.append(std::format("      * `Bucket[{}]` `key=0x{:X}` `head=0x{:X}` `tail=0x{:X}`: ",
+                        b, (unsigned long long)mkey, (unsigned long long)head_st, (unsigned long long)tail_st));
+                    uintptr_t cur_st = head_st;
+                    int sguard = 0;
+                    while (cur_st && !IsBadReadPtr((const void*)cur_st, 0xC0) && sguard++ < 16) {
+                        auto* st_obj = (StatescriptState*)cur_st;
+                        auto* st_inst = (StatescriptInstance*)SafeReadVal<uintptr_t>(cur_st + 0x10);
+                        int16_t st_iid = (st_inst && !IsBadReadPtr(st_inst, 0x260)) ? st_inst->instance_id : 0;
+                        uint64_t st_scid = (st_inst && !IsBadReadPtr(st_inst, 0x260)) ? st_inst->script_id : 0;
+                        STUStatescriptGraph* st_gr = (st_inst && !IsBadReadPtr(st_inst, 0x260)) ? st_inst->graph : nullptr;
+                        STUStatescriptState* stu_s = (st_gr && !IsBadReadPtr(st_gr, sizeof(STUStatescriptGraph))) ? st_gr->STUFromState(st_obj) : nullptr;
+                        int n_idx = (stu_s && !IsBadReadPtr(stu_s, sizeof(STUStatescriptBase))) ? stu_s->ss_base.idx_in_nodes : -1;
+                        STUInfo* si_info = (stu_s && !IsBadReadPtr(stu_s, 8) && stu_s->ss_base.graph_node.base.vfptr && !IsBadReadPtr(stu_s->ss_base.graph_node.base.vfptr, 8))
+                            ? stu_s->ss_base.graph_node.base.vfptr->GetSTUInfo() : nullptr;
+                        uint32_t sh = (si_info && !IsBadReadPtr(si_info, sizeof(STUInfo))) ? si_info->name_hash : 0;
+                        float prio = SafeReadVal<float>(cur_st + 0xB8);
+                        bool is_tail = (cur_st == tail_st);
+                        mtx_out.append(std::format("[{}inst={} sc=0x{:X} node={} stu=0x{:08X}({}) flg=0x{:X} prio={:.1f}] ",
+                            is_tail ? "TAIL:" : "", st_iid, (unsigned long long)(st_scid & 0xFFFFULL), n_idx, sh, ResolveSSNodeName(sh),
+                            (uint32_t)st_obj->state_flags, prio));
+                        cur_st = SafeReadVal<uintptr_t>(cur_st + 0xA0);
+                    }
+                    mtx_out += "\n";
+                }
+                entry = SafeReadVal<uintptr_t>(entry + 0x08);
+            }
+        }
+        if (!mtx_out.empty()) {
+            out.append(std::format("    - **{} Ability Mutex Queue (`comp23+0x10`)**:\n{}", prefix, mtx_out));
+        }
+
+        // B. Dump comp23 + 0x1458 Child Visual/Weapon Slot Records (stride 0x250)
+        uintptr_t arr_1458 = SafeReadVal<uintptr_t>((uintptr_t)ss + 0x1458);
+        int32_t cnt_1458 = SafeReadVal<int32_t>((uintptr_t)ss + 0x1460);
+        if (arr_1458 && cnt_1458 > 0 && cnt_1458 <= 32 && !IsBadReadPtr((const void*)arr_1458, (size_t)cnt_1458 * 0x250)) {
+            std::string slots_str;
+            for (int32_t si = 0; si < cnt_1458; si++) {
+                uintptr_t rec = arr_1458 + (uintptr_t)si * 0x250;
+                uint32_t e0 = SafeReadVal<uint32_t>(rec + 0x00);
+                uint32_t e1 = SafeReadVal<uint32_t>(rec + 0x04);
+                uint64_t key = SafeReadVal<uint64_t>(rec + 0x230);
+                uint32_t fxh = SafeReadVal<uint32_t>(rec + 0x238);
+                if ((e0 && e0 != 0xFFFFFFFF) || (e1 && e1 != 0xFFFFFFFF) || key || fxh) {
+                    slots_str.append(std::format("[slot{}:e0=0x{:X},e1=0x{:X},key=0x{:X},fx=0x{:X}] ", si, e0, e1, (unsigned long long)key, fxh));
+                }
+            }
+            if (!slots_str.empty()) {
+                out.append(std::format("    - **{} Child Slots (`comp23+0x1458`, cnt={})**: {}\n", prefix, cnt_1458, slots_str));
+            }
+        }
+    }
 
     // Also dump script-instance VarBags at ss_core + 0x120 (g3_arrWithIds: StatescriptInstance* has VarBags at +0x98, +0x270, +0x280)
     uintptr_t inst_arr = SafeReadVal<uintptr_t>(ss_core + 0x120);
@@ -4411,25 +6909,34 @@ static void AppendVarBagSummary(std::string& out, const char* prefix, Entity* en
                     scope_id, (unsigned long long)script_id, st_cnt));
                 for (int32_t si = 0; si < st_cnt; si++) {
                     auto* st = (StatescriptState*)SafeReadVal<uintptr_t>(st_arr + (uintptr_t)si * 8);
-                    if (!st || IsBadReadPtr(st, 0x88)) continue;
+                    if (!st || IsBadReadPtr(st, 0xC0)) continue;
                     uintptr_t svt = SafeReadVal<uintptr_t>((uintptr_t)st);
                     uintptr_t fn110 = svt ? SafeReadVal<uintptr_t>(svt + 0x110) : 0;
-                    uintptr_t fn138 = svt ? SafeReadVal<uintptr_t>(svt + 0x138) : 0;
-                    uintptr_t fn140 = svt ? SafeReadVal<uintptr_t>(svt + 0x140) : 0;
-                    uintptr_t fn160 = svt ? SafeReadVal<uintptr_t>(svt + 0x160) : 0;
-                    uintptr_t fn168 = svt ? SafeReadVal<uintptr_t>(svt + 0x168) : 0;
-                    uintptr_t fn1C8 = svt ? SafeReadVal<uintptr_t>(svt + 0x1C8) : 0;
+                    uintptr_t fn170 = svt ? SafeReadVal<uintptr_t>(svt + 0x170) : 0;
+                    uintptr_t fn178 = svt ? SafeReadVal<uintptr_t>(svt + 0x178) : 0;
+                    uintptr_t fn188 = svt ? SafeReadVal<uintptr_t>(svt + 0x188) : 0;
+                    uintptr_t fn190 = svt ? SafeReadVal<uintptr_t>(svt + 0x190) : 0;
+                    uintptr_t fn260 = svt ? SafeReadVal<uintptr_t>(svt + 0x260) : 0;
                     STUStatescriptState* stu_st = graph->STUFromState(st);
                     int node_idx = (stu_st && !IsBadReadPtr(stu_st, sizeof(STUStatescriptBase))) ? stu_st->ss_base.idx_in_nodes : -1;
                     STUInfo* s_info = (stu_st && !IsBadReadPtr(stu_st, 8) && stu_st->ss_base.graph_node.base.vfptr && !IsBadReadPtr(stu_st->ss_base.graph_node.base.vfptr, 8))
                         ? stu_st->ss_base.graph_node.base.vfptr->GetSTUInfo() : nullptr;
                     uint32_t s_hash = (s_info && !IsBadReadPtr(s_info, sizeof(STUInfo))) ? s_info->name_hash : 0;
-                    const char* s_name = allmighty_hash_lib::hashes.count(s_hash) ? allmighty_hash_lib::hashes[s_hash].c_str() : "?";
-                    out.append(std::format("        * `state_impl[{}]`: `m_st={}` `node={}` `stu=0x{:08X}({})` `cO={}` `sO={}` `flags(+0x40)=0x{:X}` `f44={}` `f80={}` `vt=+0x{:X}` (`110=+0x{:X}`,`138=+0x{:X}`,`140=+0x{:X}`,`160=+0x{:X}`,`168=+0x{:X}`,`1C8=+0x{:X}`)\n",
+                    const char* s_name = ResolveSSNodeName(s_hash);
+                    uintptr_t svt_rva = SafeRva(svt);
+                    uintptr_t fn170_rva = SafeRva(fn170);
+                    const char* vt_tag = (svt_rva == 0x15CCFC0 || svt_rva == 0x15CA730) ? "[STRIPPED_ST]"
+                        : (fn170_rva == 0xF43450) ? "[GRP1_STUB]"
+                        : (fn170_rva != 0x5A0C20 && fn170_rva != 0xF495C0) ? "[SUBCLASS_START]" : "";
+                    uint64_t mkey = SafeReadVal<uint64_t>((uintptr_t)st + 0x90);
+                    float mprio = SafeReadVal<float>((uintptr_t)st + 0xB8);
+                    std::string mtx_tag = mkey ? std::format(" `mtx=0x{:X}(prio={:.1f})`", (unsigned long long)mkey, mprio) : "";
+                    out.append(std::format("        * `state_impl[{}]`: `m_st={}` `node={}` `stu=0x{:08X}({})` `cO={}` `sO={}` `flags(+0x40)=0x{:X}` `f44={}` `f80={}`{} `vt=+0x{:X}`{} (`170={}`,`178={}`,`188={}`,`190={}`,`260={}`,`110={}`)\n",
                         si, st->idx_in_m_states, node_idx, s_hash, s_name,
                         stu_st ? (int)stu_st->ss_base.m_clientOnly : -1, stu_st ? (int)stu_st->ss_base.m_serverOnly : -1,
-                        (uint32_t)st->state_flags, st->field_44, (int)st->field_80,
-                        SafeRva(svt), SafeRva(fn110), SafeRva(fn138), SafeRva(fn140), SafeRva(fn160), SafeRva(fn168), SafeRva(fn1C8)));
+                        (uint32_t)st->state_flags, st->field_44, (int)st->field_80, mtx_tag,
+                        svt_rva, vt_tag,
+                        FmtRvaShort(fn170), FmtRvaShort(fn178), FmtRvaShort(fn188), FmtRvaShort(fn190), FmtRvaShort(fn260), FmtRvaShort(fn110)));
                 }
             }
 
@@ -4446,7 +6953,7 @@ static void AppendVarBagSummary(std::string& out, const char* prefix, Entity* en
                     STUInfo* n_info = (node->graph_node.base.vfptr && !IsBadReadPtr(node->graph_node.base.vfptr, 8))
                         ? node->graph_node.base.vfptr->GetSTUInfo() : nullptr;
                     uint32_t n_hash = (n_info && !IsBadReadPtr(n_info, sizeof(STUInfo))) ? n_info->name_hash : 0;
-                    const char* n_name = allmighty_hash_lib::hashes.count(n_hash) ? allmighty_hash_lib::hashes[n_hash].c_str() : "?";
+                    const char* n_name = ResolveSSNodeName(n_hash);
                     uintptr_t act_ptr = (act_arr && ni < act_cnt && !IsBadReadPtr((const void*)(act_arr + (uintptr_t)ni * 8), 8))
                         ? SafeReadVal<uintptr_t>(act_arr + (uintptr_t)ni * 8) : 0;
                     uintptr_t avt = (act_ptr && !IsBadReadPtr((const void*)act_ptr, 8)) ? SafeReadVal<uintptr_t>(act_ptr) : 0;
@@ -4457,9 +6964,13 @@ static void AppendVarBagSummary(std::string& out, const char* prefix, Entity* en
                     const char* n_stat = (sit == sc_state_map.end()) ? "NEVER" : (sit->second.is_finish_state ? "FINISHED" : "ACTIVE");
                     int64_t n_ts = (sit != sc_state_map.end()) ? sit->second.change_timestamp : 0;
 
+                    bool has_unreached_succ = false;
                     std::string links_str;
                     auto plug_map = node->get_output_plugs();
                     for (auto& pe : plug_map) {
+                        STUArgumentInfo* parg = (n_info && !IsBadReadPtr(n_info, sizeof(STUInfo))) ? n_info->argumentByHash(pe.first) : nullptr;
+                        uint32_t poff = (parg && !IsBadReadPtr(parg, sizeof(STUArgumentInfo))) ? parg->offset : 0;
+                        const char* ptag = (poff == 0x58) ? "Beg" : (poff == 0x60) ? "End" : nullptr;
                         for (auto* plug : pe.second) {
                             if (!plug || IsBadReadPtr(plug, sizeof(STUGraphPlug))) continue;
                             for (auto* lnk : plug->m_links) {
@@ -4467,11 +6978,24 @@ static void AppendVarBagSummary(std::string& out, const char* prefix, Entity* en
                                 if (lnk->m_inputPlug && !IsBadReadPtr(lnk->m_inputPlug, sizeof(STUStatescriptInputPlug))) {
                                     auto* tgt = lnk->m_inputPlug->plug_base.m_parentNode;
                                     if (tgt && !IsBadReadPtr(tgt, sizeof(STUStatescriptBase))) {
-                                        links_str += std::format("->{} ", tgt->idx_in_nodes);
+                                        if (sc_state_map.find(tgt->idx_in_nodes) == sc_state_map.end()) has_unreached_succ = true;
+                                        if (ptag) links_str += std::format("{}(+0x{:X})->{} ", ptag, poff, tgt->idx_in_nodes);
+                                        else links_str += std::format("+0x{:X}->{} ", poff, tgt->idx_in_nodes);
                                     }
                                 }
                             }
                         }
+                    }
+
+                    std::string diag_tags;
+                    if (sit != sc_state_map.end() && (!sit->second.is_finish_state || has_unreached_succ)) {
+                        diag_tags += "[FRONTIER] ";
+                    }
+                    if (!node->m_isState && avt == 0 && n_hash != 0x2F937AE3 && n_hash != 0x902C07FC && n_hash != 0xC71FD31C && n_hash != 0xE811ECBB && n_hash != 0xCD462C0E && n_hash != 0xD5411AC4) {
+                        diag_tags += "[STRIPPED_ACT] ";
+                    }
+                    if (n_hash == 0xCD396790 && SafeReadVal<uintptr_t>((uintptr_t)node + 0x108) == 0) {
+                        diag_tags += "[NULL_TIMER_0x108] ";
                     }
 
                     std::string fields_str;
@@ -4479,6 +7003,7 @@ static void AppendVarBagSummary(std::string& out, const char* prefix, Entity* en
                         for (auto ap : *n_info) {
                             STUArgumentInfo* arg = ap.second;
                             if (!arg || IsBadReadPtr(arg, sizeof(STUArgumentInfo))) continue;
+                            if (arg->offset < 0x78) continue; // Skip base STUGraphNode / STUStatescriptBase layout noise!
                             uintptr_t fa = (uintptr_t)node + arg->offset;
                             uint64_t fraw = SafeReadVal<uint64_t>(fa);
                             if (!fraw) continue;
@@ -4489,35 +7014,34 @@ static void AppendVarBagSummary(std::string& out, const char* prefix, Entity* en
                                 STUInfo* ci = (ch->vfptr && !IsBadReadPtr(ch->vfptr, 8) && ch->vfptr->GetSTUInfo) ? ch->vfptr->GetSTUInfo() : nullptr;
                                 uint32_t chash = (ci && !IsBadReadPtr(ci, sizeof(STUInfo))) ? ci->name_hash : 0;
                                 if (chash == 0x3E490486 || chash == 0x11D7F052 || chash == 0x24AB1F0B || chash == 0xB8F35B20) continue; // skip plugs
-                                if (chash == 0xF8CC195D) { // STUConfigVarDynamic
-                                    auto* cvd = (STUConfigVarDynamic*)fraw;
-                                    std::string pstr;
-                                    if (!IsBadReadPtr(cvd, sizeof(STUConfigVarDynamic)) && cvd->item_location.list() && !IsBadReadPtr(cvd->item_location.list(), 8)) {
-                                        for (int pi = 0; pi < cvd->item_location.count() && pi < 4; pi++) {
-                                            pstr += std::format("0x{:X}/", (unsigned long long)cvd->item_location.list()[pi].resource_id);
-                                        }
-                                    }
-                                    fields_str += std::format("[+0x{:X}:CVD={}] ", arg->offset, pstr);
-                                } else {
-                                    uint64_t c10 = SafeReadVal<uint64_t>(fraw + 0x10);
-                                    float cf10 = SafeReadVal<float>(fraw + 0x10);
-                                    fields_str += std::format("[+0x{:X}:obj=0x{:08X}(+10=0x{:X}/{:.2f})] ", arg->offset, chash, c10, cf10);
+                                fields_str += std::format("[+0x{:X}:{}] ", arg->offset, DecodeConfigVarCompact(fraw, chash));
+                            } else if (ct == STU_ConstraintType_BSList_Object || ct == STU_ConstraintType_BSList_InlinedObject || ct == STU_ConstraintType_BSList_ResourceRef) {
+                                auto* bs = (STUBullshitListFull<uint64_t>*)fa;
+                                if (!IsBadReadPtr(bs, sizeof(*bs)) && bs->list_ptr && !IsBadReadPtr(bs->list_ptr, 16)) {
+                                    int cnt = bs->count();
+                                    if (cnt > 0) fields_str += std::format("[+0x{:X}:list(cnt={})] ", arg->offset, cnt);
                                 }
                             } else if (ct == STU_ConstraintType_ResourceRef || ct == STU_ConstraintType_NonSTUResourceRef) {
                                 uint64_t rid = SafeReadVal<uint64_t>(fa + 0x08);
                                 if (rid) fields_str += std::format("[+0x{:X}:ref=0x{:X}] ", arg->offset, rid);
-                            } else if (ct == STU_ConstraintType_Primitive) {
+                            } else if (ct == STU_ConstraintType_Primitive || ct == STU_ConstraintType_Enum) {
+                                uint32_t u32 = (uint32_t)fraw;
                                 float fflt = SafeReadVal<float>(fa);
-                                fields_str += std::format("[+0x{:X}:val=0x{:X}({:.2f})] ", arg->offset, (uint32_t)fraw, fflt);
+                                if (u32 != 0 && u32 != 0xFFFFFFFF) {
+                                    if (fflt > -1e6f && fflt < 1e6f && (fflt < -1e-4f || fflt > 1e-4f))
+                                        fields_str += std::format("[+0x{:X}:0x{:X}({:.2f})] ", arg->offset, u32, fflt);
+                                    else
+                                        fields_str += std::format("[+0x{:X}:0x{:X}] ", arg->offset, u32);
+                                }
                             }
                         }
                     }
 
-                    out.append(std::format("        * `node[{}]`: `stu=0x{:08X}({})` `isSt={}` `cO={}` `sO={}` `stat={}({})` `act_vt=+0x{:X}`(`F0=+0x{:X}`,`F8=+0x{:X}`,`100=+0x{:X}`) {} {}\n",
+                    out.append(std::format("        * `node[{}]`: `stu=0x{:08X}({})` `isSt={}` `cO={}` `sO={}` `stat={}({})` `act_vt={}`(`F0={}`,`F8={}`,`100={}`) {}{}{}\n",
                         node->idx_in_nodes, n_hash, n_name,
                         (int)node->m_isState, (int)node->m_clientOnly, (int)node->m_serverOnly,
-                        n_stat, n_ts, SafeRva(avt), SafeRva(fnF0), SafeRva(fnF8), SafeRva(fn100),
-                        links_str, fields_str));
+                        n_stat, n_ts, FmtRvaShort(avt), FmtRvaShort(fnF0), FmtRvaShort(fnF8), FmtRvaShort(fn100),
+                        diag_tags, links_str, fields_str));
                 }
             }
         }
@@ -4923,14 +7447,26 @@ void WeaponHardpointDiag::DumpDummyCombatForensics(EntityAdminBase* game_ea, con
         AppendHeroEntityForensics(out, "LOCAL PLAYER (Team 0)", local_ctrl, local_mdl);
 
         int idx = 0;
+        int sub_idx = 0;
         for (Entity* ent : *game_ea) {
             if (!ent || ent->entity_id == local_ctrl_id || ent->entity_id == local_mdl_id) continue;
-            if (!ent->hasComponent(0x15) || !ent->hasComponent(0x28)) continue;
-            uint32 ctrl_id = 0;
-            if (auto* c1f = ent->getById<Component_1F_Backref>(0x1F)) ctrl_id = c1f->backref_entid;
-            Entity* ctrl = ctrl_id ? game_ea->getEntById(ctrl_id) : nullptr;
-            std::string lbl = std::format("ENEMY DUMMY #{} (entid=0x{:X})", idx++, ent->entity_id);
-            AppendHeroEntityForensics(out, lbl.c_str(), ctrl, ent);
+            if (ent->hasComponent(0x15) && ent->hasComponent(0x28)) {
+                uint32 ctrl_id = 0;
+                if (auto* c1f = ent->getById<Component_1F_Backref>(0x1F)) ctrl_id = c1f->backref_entid;
+                Entity* ctrl = ctrl_id ? game_ea->getEntById(ctrl_id) : nullptr;
+                std::string lbl = std::format("ENEMY DUMMY #{} (entid=0x{:X})", idx++, ent->entity_id);
+                AppendHeroEntityForensics(out, lbl.c_str(), ctrl, ent);
+            } else if (local_ctrl_id && ent->entity_id > local_ctrl_id && sub_idx < 12 &&
+                       (ent->hasComponent(0x23) || ent->hasComponent(0x2A))) {
+                uintptr_t rl = SafeReadVal<uintptr_t>((uintptr_t)ent + 0x08);
+                uint64_t res_id = (rl && !IsBadReadPtr((const void*)rl, 0x60)) ? SafeReadVal<uint64_t>(rl + 0x58) : 0;
+                auto* c1 = ent->getById<Component_1_SceneRendering>(1);
+                Vector4 wpos = c1 ? SafeReadVal<Vector4>((uintptr_t)c1 + 0xC0) : Vector4{};
+                uintptr_t scene_nd = c1 ? SafeReadVal<uintptr_t>((uintptr_t)c1 + 0x148) : 0;
+                out.append(std::format("### SPAWNED SUB-ENTITY #{} (`entid=0x{:X}`, `res=0x{:X}`, `wpos=({:.2f},{:.2f},{:.2f})`, `c1_scene(+0x148)=0x{:X}`)\n",
+                    sub_idx++, ent->entity_id, (unsigned long long)res_id, wpos.X, wpos.Y, wpos.Z, (unsigned long long)scene_nd));
+                AppendVarBagSummary(out, "SubEnt", ent, true);
+            }
         }
     }
 
@@ -5140,6 +7676,8 @@ void __cdecl StartHook(void*) {
     MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xd381f0)));
     MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xd3eee0), ProjectileSpawnImpactEffect_hook, (PVOID*)&ProjectileSpawnImpactEffect_orig));
     MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xd3eee0)));
+    MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xd3dc50), ShouldDeferProjectileImpact_hook, (PVOID*)&ShouldDeferProjectileImpact_orig));
+    MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xd3dc50)));
     MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xa01070), AttachComponent1World_hook, (PVOID*)&AttachComponent1World_orig));
     MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xa01070)));
     MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xca7200), UpdateHealthbarVisibility_hook, (PVOID*)&UpdateHealthbarVisibility_orig));
@@ -5164,7 +7702,25 @@ void __cdecl StartHook(void*) {
     MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xd423c0)));
     MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xd39500), OnProjectileDetonate_hook, (PVOID*)&OnProjectileDetonate_orig));
     MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xd39500)));
-    printf("hooked Component_1 transforms, weapon hardpoint fixes, shot/projectile impact, healthbar & ability hooks (+0xd67bf0, +0x108a160, +0xd667a0, +0xd44d60, +0xd423c0, +0xd39500)\n");
+    MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xf43450), FindStatescriptStateImpl_hook, (PVOID*)&FindStatescriptStateImpl_orig));
+    MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xf43450)));
+    MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xf47740), StatescriptAction_ExecuteAndContinue_hook, (PVOID*)&StatescriptAction_ExecuteAndContinue_orig));
+    MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xf47740)));
+    MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xf495c0), StatescriptState_StartState_hook, (PVOID*)&StatescriptState_StartState_orig));
+    MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xf495c0)));
+    MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xd739a0), IsGraphNodeClientOnly_hook, (PVOID*)&IsGraphNodeClientOnly_orig));
+    MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xd739a0)));
+    MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xf4d1d0), CanAcquireAbilityMutex_hook, (PVOID*)&CanAcquireAbilityMutex_orig));
+    MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xf4d1d0)));
+    MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0x1096500), PlacementState_TickRay_hook, (PVOID*)&PlacementState_TickRay_orig));
+    MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0x1096500)));
+    MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xd6d270), FindGround_Begin_hook, (PVOID*)&FindGround_Begin_orig));
+    MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xd6d270)));
+    MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xf471f0), TraverseLink_hook, (PVOID*)&TraverseLink_orig));
+    MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xf471f0)));
+    statescript_logger::s_universal_state_entry_cb = OnUniversalStateEntry;
+    statescript_logger::s_universal_state_exit_cb = OnUniversalStateExit;
+    printf("hooked Component_1 transforms, weapon hardpoint fixes, shot/projectile impact, healthbar & Horizon 1 Stage H1.2+H1.3 hooks\n");
 
     /*MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xbff460), testVIGSTickHook, (PVOID*)&VigsTickOrig));
     MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xbff460)));*/
@@ -5476,9 +8032,10 @@ int __stdcall VectoredExceptionHandler(EXCEPTION_POINTERS* exception) {
     }
     ShotDiagLogFmt("[CRASH_STACK] %s", stack_rvas.c_str());
 
-    // Only write dummy_combat_diag.log from VEH when shots have been fired in this session (never overwrite combat logs on startup exceptions)
+    // Write dummy_combat_diag.log from VEH when shots have been fired or a local player entity is active in GameEntityAdmin
     static bool s_in_veh_dump = false;
-    if (WeaponHardpointDiag::s_shot_raycast_calls > 0 && !s_in_veh_dump) {
+    bool in_live_session = (WeaponHardpointDiag::s_shot_raycast_calls > 0) || (GameEntityAdmin() && GameEntityAdmin()->local_entid != 0);
+    if (in_live_session && !s_in_veh_dump) {
         s_in_veh_dump = true;
         // Write raw crash exception info FIRST before calling DumpDummyCombatForensics so recursive faults can never lose the crash log
         if (FILE* f = fopen("dummy_combat_diag.log", "wb")) {

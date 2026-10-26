@@ -44,7 +44,9 @@ void Component_28_STUHealthComponent::InitHeroHealthPools(uint64_t heroid, uint6
 		norm_hp = 150.0f;
 	} else if (heroid == 0x02E0000000000009ULL || (hero_name && strstr(hero_name, "Winston"))) {
 		norm_hp = 400.0f; arm_hp = 100.0f;
-	} else if (heroid == 0x02E000000000007AULL || (hero_name && strstr(hero_name, "D.Va"))) {
+	} else if (model_res_id == 0x040000000000040AULL) {
+		norm_hp = 150.0f;
+	} else if (heroid == 0x02E000000000007AULL || model_res_id == 0x0400000000000407ULL || (hero_name && strstr(hero_name, "D.Va"))) {
 		norm_hp = 100.0f; arm_hp = 400.0f;
 	} else if (heroid == 0x02E0000000000015ULL || (hero_name && strstr(hero_name, "Bastion"))) {
 		norm_hp = 200.0f; arm_hp = 100.0f;
@@ -272,11 +274,6 @@ void player_spawner::modify_ent(spawn_info info, Entity* ent) {
 				} else {
 					inst->execution_flags = (inst->execution_flags | 0x400009u) & ~(0x1004u | 0x200000u);
 				}
-				if (inst->graph) {
-					for (auto* node : inst->graph->m_nodes) {
-						if (node) node->m_serverOnly = 0;
-					}
-				}
 				inst->vfptr->RedoCheckIsAimEnt(inst);
 			}
 		}
@@ -351,11 +348,21 @@ std::pair<Entity*, Entity*> player_spawner::spawn() {
 		controller_info.heroid = 0x02E0000000000003ULL;
 		model_info.heroid = 0x02E0000000000003ULL;
 	}
+	// D.Va's STUHero::m_gameplayEntity points to Pilot D.Va (0x040000000000040A); spawn her in her Mech (0x0400000000000407)
+	if (model_info.heroid == 0x02E000000000007AULL && model_info.resource_id == 0x040000000000040AULL) {
+		model_info.resource_id = 0x0400000000000407ULL;
+	}
 
 	controller_ent = spawn_ent(controller_info);
 	model_ent = spawn_ent(model_info);
 	if (!controller_ent || !model_ent) {
 		return {};
+	}
+
+	if (model_info.set_health) {
+		if (auto* health = model_ent->getById<Component_28_STUHealthComponent>(0x28)) {
+			health->InitHeroHealthPools((uint64_t)model_info.heroid, (uint64_t)model_info.resource_id);
+		}
 	}
 
 	if (!use_deferred_spawn) {

@@ -33,6 +33,7 @@ class statescript_diag_window : public window {
 	void dump_trace_to_file();
 	void dump_weapon_graph_to_file();
 	void dump_weapon_nodes_forensics_to_file();
+	void dump_horizon1_audit_to_file();
 
 	// Gate B & C Test Functions
 	void call_init_ss();

@@ -1650,6 +1650,908 @@ void statescript_diag_window::dump_weapon_nodes_forensics_to_file() {
 	_experiment_status_msg = "Successfully dumped weapon_nodes_forensics.log!";
 }
 
+static void collect_stu_resource_refs_recursive(
+	void* obj_ptr,
+	STUInfo* sinfo,
+	int depth,
+	int max_depth,
+	std::unordered_set<uintptr_t>& visited_ptrs,
+	std::vector<std::pair<uint32_t, uint64_t>>& out_field_and_resid)
+{
+	if (!obj_ptr || !sinfo || depth > max_depth) return;
+	if (!is_valid_read_memory(obj_ptr, 8) || !is_valid_read_memory(sinfo, sizeof(STUInfo))) return;
+
+	for (auto arg_pair : *sinfo) {
+		STUArgumentInfo* arg = arg_pair.second;
+		if (!arg || !is_valid_read_memory(arg, sizeof(STUArgumentInfo))) continue;
+		uint32_t field_hash = arg->name_hash;
+		int offset = arg->offset;
+		if (offset < 0 || offset > 0x1000) continue;
+
+		// Skip parent-node/subgraph backrefs and base plugs
+		if (field_hash == 0x365378c7 || field_hash == 0xa2eca5de ||
+			field_hash == 0xbec2beae || field_hash == 0xfd24b86e ||
+			field_hash == 0x25c665a || field_hash == 0xd2cd7c9f || field_hash == 0x3f6ffa05) {
+			continue;
+		}
+
+		if (!arg->constraint || !is_valid_read_memory(arg->constraint, sizeof(void*))) continue;
+		STUConstraintType ctype = arg->constraint->get_type_flag();
+		void* field_ptr = (void*)((uintptr_t)obj_ptr + offset);
+
+		if (ctype == STU_ConstraintType_ResourceRef || ctype == STU_ConstraintType_NonSTUResourceRef) {
+			STUResourceReference* ref = (STUResourceReference*)field_ptr;
+			if (is_valid_read_memory(ref, sizeof(STUResourceReference)) && ref->resource_id != 0) {
+				out_field_and_resid.push_back({ field_hash, (uint64_t)ref->resource_id });
+			}
+		}
+		else if (ctype == STU_ConstraintType_BSList_ResourceRef || ctype == STU_ConstraintType_BSList_NonSTUResourceRef) {
+			auto* bs = (STUBullshitListFull<__int64>*)field_ptr;
+			if (is_valid_read_memory(bs, sizeof(STUBullshitListFull<__int64>)) &&
+				bs->list_ptr && is_valid_read_memory(bs->list_ptr, sizeof(STUBullshitListPtr))) {
+				int cnt = bs->count();
+				if (cnt > 0 && cnt < 256 && is_valid_read_memory(bs->list(), cnt * sizeof(STUResourceReference))) {
+					auto* arr = (STUResourceReference*)bs->list();
+					for (int k = 0; k < cnt; k++) {
+						if (arr[k].resource_id != 0) {
+							out_field_and_resid.push_back({ field_hash, (uint64_t)arr[k].resource_id });
+						}
+					}
+				}
+			}
+		}
+		else if (ctype == STU_ConstraintType_Object) {
+			if (!is_valid_read_memory(field_ptr, 8)) continue;
+			uint64_t raw_val = *(uint64_t*)field_ptr;
+			if (raw_val > 0x10000 && raw_val < 0x7FFFFFFFFFFFull) {
+				void* child_ptr = (void*)raw_val;
+				if (!visited_ptrs.count((uintptr_t)child_ptr) && is_valid_read_memory(child_ptr, 8)) {
+					visited_ptrs.insert((uintptr_t)child_ptr);
+					STUInfo* child_info = safe_get_stu_info(child_ptr);
+					if (!child_info) child_info = GetSTUInfoByHash(arg->constraint->get_stu_type());
+					uint32_t ch = child_info ? child_info->name_hash : 0;
+					bool is_plug = (ch == 0x11d7f052 || ch == 0x3e490486 || ch == 0x24ab1f0b || ch == 0xe51f3e8d || ch == 0xf1f0a36d || ch == 0xb8f35b20);
+					if (child_info && !is_plug) {
+						collect_stu_resource_refs_recursive(child_ptr, child_info, depth + 1, max_depth, visited_ptrs, out_field_and_resid);
+					}
+				}
+			}
+		}
+		else if (ctype == STU_ConstraintType_InlinedObject) {
+			if (!visited_ptrs.count((uintptr_t)field_ptr) && is_valid_read_memory(field_ptr, 8)) {
+				visited_ptrs.insert((uintptr_t)field_ptr);
+				STUInfo* child_info = safe_get_stu_info(field_ptr);
+				if (!child_info) child_info = GetSTUInfoByHash(arg->constraint->get_stu_type());
+				uint32_t ch = child_info ? child_info->name_hash : 0;
+				bool is_plug = (ch == 0x11d7f052 || ch == 0x3e490486 || ch == 0x24ab1f0b || ch == 0xe51f3e8d || ch == 0xf1f0a36d || ch == 0xb8f35b20);
+				if (child_info && !is_plug) {
+					collect_stu_resource_refs_recursive(field_ptr, child_info, depth + 1, max_depth, visited_ptrs, out_field_and_resid);
+				}
+			}
+		}
+		else if (ctype == STU_ConstraintType_BSList_Object || ctype == STU_ConstraintType_BSList_InlinedObject) {
+			auto* bs = (STUBullshitListFull<__int64>*)field_ptr;
+			if (is_valid_read_memory(bs, sizeof(STUBullshitListFull<__int64>)) &&
+				bs->list_ptr && is_valid_read_memory(bs->list_ptr, sizeof(STUBullshitListPtr))) {
+				STUInfo* list_type = GetSTUInfoByHash(arg->constraint->get_stu_type());
+				if (list_type) {
+					STU_ObjectList obj_list(arg, field_ptr);
+					if (obj_list.valid()) {
+						int cnt = obj_list.count();
+						int lim = (cnt < 64) ? cnt : 64;
+						for (int k = 0; k < lim; k++) {
+							STU_Object elem = obj_list[k];
+							if (elem.valid() && elem.value && is_valid_read_memory(elem.value, 8)) {
+								STU_Object root_elem = elem.get_runtime_root();
+								uint32_t eh = root_elem.struct_info ? root_elem.struct_info->name_hash : 0;
+								bool is_plug = (eh == 0x11d7f052 || eh == 0x3e490486 || eh == 0x24ab1f0b || eh == 0xe51f3e8d || eh == 0xf1f0a36d || eh == 0xb8f35b20);
+								if (root_elem.struct_info && !is_plug && !visited_ptrs.count((uintptr_t)root_elem.value)) {
+									visited_ptrs.insert((uintptr_t)root_elem.value);
+									collect_stu_resource_refs_recursive(root_elem.value, root_elem.struct_info, depth + 1, max_depth, visited_ptrs, out_field_and_resid);
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+void statescript_diag_window::dump_horizon1_audit_to_file() {
+	ensure_known_stu_hashes();
+
+	std::ofstream out("horizon1_stu_audit.log", std::ios::out | std::ios::trunc);
+	if (!out.is_open()) {
+		_dump_status_msg = "ERROR: Failed to open horizon1_stu_audit.log for writing!";
+		_experiment_status_msg = _dump_status_msg;
+		return;
+	}
+
+	out << "# HORIZON 1: LIVE STU & STATESCRIPT CENSUS AUDIT (`horizon1_stu_audit.log`)\n";
+	out << "- **Game Base**: `0x" << std::hex << (uintptr_t)globals::gameBase << std::dec << "`\n\n";
+
+	// =========================================================================
+	// PRE-PASS: Ensure all 21 STUHero resources, their m_gameplayEntity (0x0400...),
+	// their weapon/component scripts (0x0580...), and child sub-scripts/entities
+	// are constructed in stu_resources before running the census!
+	// =========================================================================
+	for (uint64_t hid = 0x02E0000000000001ULL; hid <= 0x02E0000000000020ULL; hid++) {
+		if (!stu_resources::GetByID((__int64)hid)) {
+			try_load_resource((__int64)hid);
+		}
+	}
+
+	struct GraphOrEntLink {
+		uint64_t parent_id;      // 0x02E..., 0x0400..., or 0x0580...
+		int node_idx;            // -1 if from entity/component
+		uint32_t owner_stu_hash; // component hash or node STU hash
+		uint32_t field_hash;
+		uint64_t child_id;       // 0x0580..., 0x0400..., 0x09A0..., etc.
+	};
+	std::vector<GraphOrEntLink> discovered_links;
+	std::unordered_set<uint64_t> queued_res_ids;
+	std::vector<uint64_t> bfs_queue;
+	std::map<uint64_t, std::string> res_owner_hero_map;
+
+	auto enqueue_res = [&](uint64_t rid, const std::string& hero_tag) {
+		if (rid == 0) return;
+		if (!hero_tag.empty()) {
+			if (res_owner_hero_map[rid].empty()) res_owner_hero_map[rid] = hero_tag;
+			else if (res_owner_hero_map[rid].find(hero_tag) == std::string::npos) {
+				res_owner_hero_map[rid] += ", " + hero_tag;
+			}
+		}
+		uint64_t hi = (rid >> 48) & 0xFFFF;
+		if (hi != 0x0400 && hi != 0x0580 && hi != 0x09A0 && hi != 0x0330) return;
+		if (queued_res_ids.insert(rid).second) {
+			bfs_queue.push_back(rid);
+		}
+	};
+
+	auto heroes_map = stu_resources::GetIfAssignableTo(stringHash("STUHero"));
+	for (auto& hpair : heroes_map) {
+		uint64_t hero_id = (uint64_t)hpair.first;
+		STUBase<>* hero_base = hpair.second;
+		if (!hero_base || !hero_base->valid()) continue;
+		STU_Object hero_obj = hero_base->to_editable();
+
+		std::string hero_name = std::format("Hero_0x{:X}", hero_id & 0xFFFF);
+		if (auto* name_ref = hero_obj.get_argument_resource(0xcd16baa)) {
+			if (is_valid_read_memory(name_ref, sizeof(STUResourceReference)) &&
+				name_ref->resource_id != 0 &&
+				(name_ref->resource_id & 0xDE0000000000000ULL) != 0) {
+				const char* s = GetUXDisplayString(name_ref->resource_id);
+				if (s && s[0] != '\0') hero_name = s;
+			}
+		}
+
+		uint64_t gp_ent_id = 0;
+		if (auto* gp_ref = hero_obj.get_argument_resource("m_gameplayEntity")) {
+			if (is_valid_read_memory(gp_ref, sizeof(STUResourceReference))) {
+				gp_ent_id = (uint64_t)gp_ref->resource_id;
+			}
+		}
+		if (gp_ent_id == 0 && is_valid_read_memory((void*)((uintptr_t)hero_base + 0x28), 8)) {
+			uint64_t cand = *(uint64_t*)((uintptr_t)hero_base + 0x28);
+			if (((cand >> 48) & 0xFFFF) == 0x0400) gp_ent_id = cand;
+		}
+		if (gp_ent_id != 0) {
+			discovered_links.push_back({ hero_id, -1, stringHash("STUHero"), stringHash("m_gameplayEntity"), gp_ent_id });
+			enqueue_res(gp_ent_id, hero_name);
+		}
+	}
+
+	for (size_t qi = 0; qi < bfs_queue.size() && qi < 2500; qi++) {
+		uint64_t cur_id = bfs_queue[qi];
+		STUBase<>* res_ptr = stu_resources::GetByID((__int64)cur_id);
+		if (!res_ptr) {
+			try_load_resource((__int64)cur_id);
+			res_ptr = stu_resources::GetByID((__int64)cur_id);
+		}
+		if (!res_ptr || !res_ptr->valid()) continue;
+		STUInfo* rinfo = safe_get_stu_info(res_ptr);
+		if (!rinfo) continue;
+		std::string cur_hero_tag = res_owner_hero_map[cur_id];
+
+		uint64_t hi = (cur_id >> 48) & 0xFFFF;
+		if (hi == 0x0400) {
+			STU_Object ent_obj(rinfo, res_ptr);
+			// Scan m_childEntityData
+			std::unordered_set<uintptr_t> vis_ent;
+			vis_ent.insert((uintptr_t)res_ptr);
+			std::vector<std::pair<uint32_t, uint64_t>> ent_refs;
+			collect_stu_resource_refs_recursive(res_ptr, rinfo, 0, 4, vis_ent, ent_refs);
+			for (auto& er : ent_refs) {
+				discovered_links.push_back({ cur_id, -1, rinfo->name_hash, er.first, er.second });
+				enqueue_res(er.second, cur_hero_tag);
+			}
+			// Scan m_componentMap
+			STUArgumentInfo* cmap_arg = rinfo->argumentByHash(stringHash("m_componentMap"));
+			if (cmap_arg) {
+				auto* bs_map = (STUBullshitMapFull<void*>*)((uintptr_t)res_ptr + cmap_arg->offset);
+				if (is_valid_read_memory(bs_map, sizeof(STUBullshitMapFull<void*>)) &&
+					bs_map->list_ptr && is_valid_read_memory(bs_map->list_ptr, sizeof(STUBullshitMapPtr<void*>)) &&
+					bs_map->flag == 2) {
+					STU_Map comp_map(cmap_arg, bs_map);
+					if (comp_map.valid()) {
+						for (auto entry : comp_map) {
+							STU_Object comp_obj = entry.second;
+							if (!comp_obj.value || !is_valid_read_memory(comp_obj.value, 8)) continue;
+							STUInfo* cinfo = safe_get_stu_info(comp_obj.value);
+							if (!cinfo) cinfo = comp_obj.struct_info;
+							if (!cinfo) continue;
+							std::unordered_set<uintptr_t> vis_c;
+							vis_c.insert((uintptr_t)comp_obj.value);
+							std::vector<std::pair<uint32_t, uint64_t>> crefs;
+							collect_stu_resource_refs_recursive(comp_obj.value, cinfo, 0, 5, vis_c, crefs);
+							for (auto& cr : crefs) {
+								discovered_links.push_back({ cur_id, -1, cinfo->name_hash, cr.first, cr.second });
+								enqueue_res(cr.second, cur_hero_tag);
+							}
+						}
+					}
+				}
+			}
+		}
+		else if (hi == 0x0580 && rinfo->assignable_to_hash(stringHash("STUStatescriptGraph"))) {
+			STUStatescriptGraph* graph = (STUStatescriptGraph*)res_ptr;
+			if (graph->m_nodes.list_ptr && is_valid_read_memory(graph->m_nodes.list_ptr, sizeof(STUBullshitListPtr))) {
+				for (auto* node : graph->m_nodes) {
+					if (!node || !is_valid_read_memory(node, sizeof(STUStatescriptBase))) continue;
+					STUInfo* ninfo = safe_get_stu_info(node);
+					if (!ninfo) continue;
+					std::unordered_set<uintptr_t> vis_n;
+					vis_n.insert((uintptr_t)node);
+					std::vector<std::pair<uint32_t, uint64_t>> nrefs;
+					collect_stu_resource_refs_recursive(node, ninfo, 0, 5, vis_n, nrefs);
+					for (auto& nr : nrefs) {
+						uint64_t ref_hi = (nr.second >> 48) & 0xFFFF;
+						if (ref_hi == 0x0580 || ref_hi == 0x0400 || ref_hi == 0x09A0 || ref_hi == 0x0330) {
+							discovered_links.push_back({ cur_id, node->idx_in_nodes, ninfo->name_hash, nr.first, nr.second });
+							enqueue_res(nr.second, cur_hero_tag);
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// =========================================================================
+	// SECTION 1: Complete StatescriptRTTI & STURegistry Implementation Matrix
+	// =========================================================================
+	out << "## Section 1: Complete `StatescriptRTTI` & `STURegistry` Implementation Matrix\n\n";
+
+	std::unordered_map<InheritanceInfo*, StatescriptRTTI*> rtti_map;
+	int total_rtti_nodes = 0;
+	StatescriptRTTI* rtti_head = *(StatescriptRTTI**)(globals::gameBase + 0x18f8e88);
+	for (StatescriptRTTI* cur = rtti_head; cur && is_valid_read_memory(cur, sizeof(StatescriptRTTI)); cur = cur->next_instance) {
+		total_rtti_nodes++;
+		if (cur->stuclass_inherit) {
+			rtti_map[cur->stuclass_inherit] = cur;
+		}
+	}
+	out << "- **`StatescriptRTTI` List Head (`+0x18F8E88`)**: `" << total_rtti_nodes << "` registered entries (`" << rtti_map.size() << "` unique `stuclass_inherit` pointers)\n\n";
+
+	struct STUClassAuditEntry {
+		STUInfo* info;
+		uint32_t hash;
+		std::string name;
+		std::string category;
+		int cat_order;
+		int inst_size;
+		bool has_direct_rtti;
+		bool has_inherited_rtti;
+		uint32_t inherited_from_hash;
+		uintptr_t factory_rva;
+		uintptr_t cv_impl_rva;
+	};
+	std::vector<STUClassAuditEntry> class_entries;
+	std::unordered_set<uint32_t> stripped_node_hashes;
+	std::unordered_map<uint32_t, STUClassAuditEntry> class_entry_by_hash;
+
+	uint32_t hash_ss_base = stringHash("STUStatescriptBase");
+	for (STURegistry* reg = GetSTURegistry(); reg && is_valid_read_memory(reg, sizeof(STURegistry)); reg = reg->next) {
+		STUInfo* info = reg->info;
+		if (!info || !is_valid_read_memory(info, sizeof(STUInfo))) continue;
+
+		std::string category;
+		int cat_order = 99;
+		if (info->assignable_to_rtti(STU_RTTI::STUStatescriptState) || info->assignable_to_hash(STU_NAME::STUStatescriptState)) {
+			category = "State";
+			cat_order = 1;
+		}
+		else if (info->assignable_to_rtti(STU_RTTI::STUStatescriptActionTerminator) || info->assignable_to_hash(STU_NAME::STUStatescriptAction)) {
+			category = "Action";
+			cat_order = 2;
+		}
+		else if (info->assignable_to_rtti(STU_RTTI::STUStatescriptCondition)) {
+			category = "Condition";
+			cat_order = 3;
+		}
+		else if (info->assignable_to_rtti(STU_RTTI::STUStatescriptGameEntry)) {
+			category = "Entry";
+			cat_order = 4;
+		}
+		else if (info->assignable_to_hash( hash_ss_base )) {
+			category = "StatescriptBase";
+			cat_order = 5;
+		}
+		else if (info->assignable_to_hash(STU_NAME::STUConfigVar)) {
+			category = "ConfigVar";
+			cat_order = 6;
+		}
+		else {
+			continue;
+		}
+
+		StatescriptRTTI* direct_rtti = nullptr;
+		auto it_r = rtti_map.find(info->rtti_info);
+		if (it_r != rtti_map.end()) {
+			direct_rtti = it_r->second;
+		}
+
+		StatescriptRTTI* inherited_rtti = nullptr;
+		uint32_t inherited_hash = 0;
+		for (STUInfo* p = info->base_stu; p && is_valid_read_memory(p, sizeof(STUInfo)); p = p->base_stu) {
+			auto it_p = rtti_map.find(p->rtti_info);
+			if (it_p != rtti_map.end()) {
+				inherited_rtti = it_p->second;
+				inherited_hash = p->name_hash;
+				break;
+			}
+		}
+
+		StatescriptRTTI* eff_rtti = direct_rtti ? direct_rtti : inherited_rtti;
+		uintptr_t fn_ptr = (eff_rtti && eff_rtti->field_8 && is_valid_read_memory((void*)eff_rtti->field_8, 8))
+			? *(uintptr_t*)eff_rtti->field_8
+			: (eff_rtti ? (uintptr_t)eff_rtti->factory_func : 0);
+		uintptr_t cv_ptr = (eff_rtti && eff_rtti->field_8 && is_valid_read_memory((void*)(eff_rtti->field_8 + 8), 8))
+			? *(uintptr_t*)(eff_rtti->field_8 + 8)
+			: 0;
+
+		uintptr_t fn_rva = (fn_ptr >= (uintptr_t)globals::gameBase && fn_ptr < (uintptr_t)globals::gameBase + 0x3000000)
+			? (fn_ptr - (uintptr_t)globals::gameBase) : fn_ptr;
+		uintptr_t cv_rva = (cv_ptr >= (uintptr_t)globals::gameBase && cv_ptr < (uintptr_t)globals::gameBase + 0x3000000)
+			? (cv_ptr - (uintptr_t)globals::gameBase) : cv_ptr;
+
+		bool has_direct = (direct_rtti != nullptr) && ((cat_order == 6) ? (cv_ptr != 0 || fn_ptr != 0) : (fn_ptr != 0));
+		bool has_inh = (!has_direct && inherited_rtti != nullptr) && ((cat_order == 6) ? (cv_ptr != 0 || fn_ptr != 0) : (fn_ptr != 0));
+
+		std::string kname = "Unknown";
+		auto it_n = allmighty_hash_lib::hashes.find(info->name_hash);
+		if (it_n != allmighty_hash_lib::hashes.end()) kname = it_n->second;
+
+		STUClassAuditEntry e{
+			info,
+			info->name_hash,
+			kname,
+			category,
+			cat_order,
+			info->instance_size,
+			has_direct,
+			has_inh,
+			inherited_hash,
+			fn_rva,
+			cv_rva
+		};
+		class_entries.push_back(e);
+		class_entry_by_hash[info->name_hash] = e;
+		if (!has_direct && cat_order <= 5) {
+			stripped_node_hashes.insert(info->name_hash);
+		}
+	}
+
+	std::sort(class_entries.begin(), class_entries.end(), [](const STUClassAuditEntry& a, const STUClassAuditEntry& b) {
+		if (a.cat_order != b.cat_order) return a.cat_order < b.cat_order;
+		if (a.has_direct_rtti != b.has_direct_rtti) return a.has_direct_rtti < b.has_direct_rtti; // Stripped first!
+		return a.hash < b.hash;
+	});
+
+	// Summary counts per category
+	out << "### 1.1 Category Summary\n";
+	out << "| Category | Total STU Classes | With Direct RTTI | Stripped (No Direct RTTI) | With Base Fallback RTTI |\n";
+	out << "|---|---|---|---|---|\n";
+	for (int co = 1; co <= 6; co++) {
+		std::string cname;
+		int tot = 0, dir = 0, strp = 0, inh = 0;
+		for (auto& ce : class_entries) {
+			if (ce.cat_order != co) continue;
+			cname = ce.category;
+			tot++;
+			if (ce.has_direct_rtti) dir++;
+			else {
+				strp++;
+				if (ce.has_inherited_rtti) inh++;
+			}
+		}
+		if (tot > 0) {
+			out << std::format("| **{}** | {} | {} | **{}** | {} |\n", cname, tot, dir, strp, inh);
+		}
+	}
+	out << "\n";
+
+	// Full Matrix for States, Actions, Conditions, Entries (and stripped ConfigVars)
+	out << "### 1.2 Statescript Node & Stripped ConfigVar Implementation Matrix\n";
+	out << "| STU Hash | Known Name | Base STU Hash | Category | `inst_size` | Has Direct RTTI? | Fallback RTTI | `factory_func` RVA | `cv_impl` RVA |\n";
+	out << "|---|---|---|---|---|---|---|---|---|\n";
+	for (auto& ce : class_entries) {
+		// Include all States/Actions/Conditions/Entries/StatescriptBase, and stripped ConfigVars
+		if (ce.cat_order == 6 && ce.has_direct_rtti) continue;
+		uint32_t base_h = (ce.info->base_stu && is_valid_read_memory(ce.info->base_stu, sizeof(STUInfo))) ? ce.info->base_stu->name_hash : 0;
+		std::string fb_str = ce.has_inherited_rtti ? std::format("Yes (`0x{:08X}`)", ce.inherited_from_hash) : "NO";
+		out << std::format("| `0x{:08X}` | `{}` | `0x{:08X}` | {} | `0x{:X}` | **{}** | {} | `+0x{:X}` | `+0x{:X}` |\n",
+			ce.hash, ce.name, base_h, ce.category, ce.inst_size,
+			ce.has_direct_rtti ? "YES" : "NO", fb_str, ce.factory_rva, ce.cv_impl_rva);
+	}
+	out << "\n";
+
+	// Detailed Schema Dump of Every Stripped Node Class (and Stripped ConfigVars)
+	out << "### 1.3 Complete `.bss`-Populated `STUInfo` Schemas for All Stripped Node & ConfigVar Classes\n\n";
+	for (auto& ce : class_entries) {
+		if (ce.has_direct_rtti) continue;
+		STUInfo* info = ce.info;
+		out << std::format("#### Stripped {} `0x{:08X}` (`{}`), `instance_size = 0x{:X}`\n",
+			ce.category, ce.hash, ce.name, ce.inst_size);
+
+		// Inheritance chain
+		out << "- **Inheritance Chain**: ";
+		for (STUInfo* p = info; p && is_valid_read_memory(p, sizeof(STUInfo)); p = p->base_stu) {
+			std::string pname = "Unknown";
+			auto it_p = allmighty_hash_lib::hashes.find(p->name_hash);
+			if (it_p != allmighty_hash_lib::hashes.end()) pname = it_p->second;
+			out << std::format("`0x{:08X}` (`{}`, sz=`0x{:X}`, args={})", p->name_hash, pname, p->instance_size, p->argument_count);
+			if (p->base_stu) out << " -> ";
+		}
+		out << "\n";
+
+		out << "- **Arguments (`STUArgumentInfo`)**:\n";
+		int arg_idx = 0;
+		for (auto arg_pair : *info) {
+			STUInfo* def_cls = arg_pair.first;
+			STUArgumentInfo* arg = arg_pair.second;
+			if (!arg || !is_valid_read_memory(arg, sizeof(STUArgumentInfo))) continue;
+			std::string aname = "Unknown";
+			auto it_a = allmighty_hash_lib::hashes.find(arg->name_hash);
+			if (it_a != allmighty_hash_lib::hashes.end()) aname = it_a->second;
+
+			STUConstraintType ctype = (arg->constraint && is_valid_read_memory(arg->constraint, sizeof(void*)))
+				? arg->constraint->get_type_flag() : (STUConstraintType)-1;
+			uint32_t target_stu = (arg->constraint && is_valid_read_memory(arg->constraint, sizeof(void*)))
+				? (uint32_t)arg->constraint->get_stu_type() : 0;
+			std::string target_name = "Unknown";
+			auto it_t = allmighty_hash_lib::hashes.find(target_stu);
+			if (it_t != allmighty_hash_lib::hashes.end()) target_name = it_t->second;
+
+			out << std::format("  - [{}] `+0x{:03X}`: Field `0x{:08X}` (`{}`) | Constraint: `{}` | TargetType: `0x{:08X}` (`{}`) | DefinedIn: `0x{:08X}`\n",
+				arg_idx++, arg->offset, arg->name_hash, aname,
+				STU_ConstraintType_ToString(ctype), target_stu, target_name,
+				def_cls ? def_cls->name_hash : 0);
+
+			if ((ctype == STU_ConstraintType_Enum || ctype == STU_ConstraintType_BSList_Enum) && target_stu != 0) {
+				if (STUEnumDefinition* edef = STUFindEnum(target_stu)) {
+					if (is_valid_read_memory(edef, sizeof(STUEnumDefinition)) && edef->values && edef->values_count > 0 && edef->values_count < 64) {
+						out << "    * Enum Values: ";
+						for (int ev = 0; ev < edef->values_count; ev++) {
+							out << std::format("`{}=0x{:X}` ", edef->values[ev].value, edef->values[ev].hash);
+						}
+						out << "\n";
+					}
+				}
+			}
+		}
+		out << "\n";
+	}
+
+	// =========================================================================
+	// SECTION 2: Corpus-Wide Usage Census Across All Loaded STUStatescriptGraphs
+	// =========================================================================
+	out << "## Section 2: Corpus-Wide Usage Census Across All Loaded `STUStatescriptGraph`s (`0x0580...`)\n\n";
+
+	struct NodeRepresentative {
+		uint64_t script_id;
+		STUStatescriptBase* node;
+		STUInfo* node_info;
+	};
+	struct StrippedNodeUsage {
+		uint32_t stu_hash = 0;
+		std::string stu_name;
+		std::string category;
+		bool is_stripped = false;
+		int total_nodes = 0;
+		int server_only_nodes = 0;
+		std::set<uint64_t> script_ids;
+		std::vector<NodeRepresentative> reps;
+	};
+	std::map<uint32_t, StrippedNodeUsage> usage_by_hash;
+
+	auto all_graphs = stu_resources::GetIfAssignableTo(stringHash("STUStatescriptGraph"));
+	out << "- **Total Loaded `STUStatescriptGraph` Resources Scanned**: `" << all_graphs.size() << "`\n\n";
+
+	for (auto& gpair : all_graphs) {
+		uint64_t script_id = (uint64_t)gpair.first;
+		STUStatescriptGraph* graph = (STUStatescriptGraph*)gpair.second;
+		if (!graph || !is_valid_read_memory(graph, sizeof(STUStatescriptGraph))) continue;
+		if (!graph->m_nodes.list_ptr || !is_valid_read_memory(graph->m_nodes.list_ptr, sizeof(STUBullshitListPtr))) continue;
+
+		for (auto* node : graph->m_nodes) {
+			if (!node || !is_valid_read_memory(node, sizeof(STUStatescriptBase))) continue;
+			STUInfo* ninfo = safe_get_stu_info(node);
+			if (!ninfo) continue;
+			uint32_t nhash = ninfo->name_hash;
+			bool is_strp = (stripped_node_hashes.count(nhash) > 0);
+			bool is_srv = (node->m_serverOnly != 0);
+			if (!is_strp && !is_srv) continue;
+
+			auto& u = usage_by_hash[nhash];
+			if (u.stu_hash == 0) {
+				u.stu_hash = nhash;
+				auto it_ce = class_entry_by_hash.find(nhash);
+				u.stu_name = (it_ce != class_entry_by_hash.end()) ? it_ce->second.name : "Unknown";
+				u.category = (it_ce != class_entry_by_hash.end()) ? it_ce->second.category : (node->m_isState ? "State" : "Action/Node");
+				u.is_stripped = is_strp;
+			}
+			u.total_nodes++;
+			if (is_srv) u.server_only_nodes++;
+			u.script_ids.insert(script_id);
+
+			if (u.reps.size() < 5) {
+				bool already_from_script = false;
+				for (auto& r : u.reps) {
+					if (r.script_id == script_id) { already_from_script = true; break; }
+				}
+				if (!already_from_script || u.reps.size() < 2) {
+					u.reps.push_back({ script_id, node, ninfo });
+				}
+			}
+		}
+	}
+
+	std::vector<StrippedNodeUsage> sorted_usage;
+	for (auto& kv : usage_by_hash) sorted_usage.push_back(kv.second);
+	std::sort(sorted_usage.begin(), sorted_usage.end(), [](const StrippedNodeUsage& a, const StrippedNodeUsage& b) {
+		if (a.is_stripped != b.is_stripped) return a.is_stripped > b.is_stripped;
+		return a.total_nodes > b.total_nodes;
+	});
+
+	out << "### 2.1 Ranked Usage Table of Stripped & `m_serverOnly` Node Classes\n";
+	out << "| STU Hash | Known Name | Category | Stripped (`act_vt==NULL`)? | Total Nodes | `m_serverOnly` Nodes | Graphs Count | Sample `0x0580...` Script IDs (with Hero Owner) |\n";
+	out << "|---|---|---|---|---|---|---|---|\n";
+	for (auto& u : sorted_usage) {
+		std::string scripts_sample;
+		int sc = 0;
+		for (uint64_t sid : u.script_ids) {
+			if (sc++ >= 8) { scripts_sample += "..."; break; }
+			if (!scripts_sample.empty()) scripts_sample += ", ";
+			std::string htag = res_owner_hero_map[sid];
+			if (!htag.empty()) scripts_sample += std::format("`0x{:X}` ({})", sid, htag);
+			else scripts_sample += std::format("`0x{:X}`", sid);
+		}
+		out << std::format("| `0x{:08X}` | `{}` | {} | **{}** | **{}** | {} | {} | {} |\n",
+			u.stu_hash, u.stu_name, u.category, u.is_stripped ? "YES (STRIPPED)" : "Has RTTI",
+			u.total_nodes, u.server_only_nodes, u.script_ids.size(), scripts_sample);
+	}
+	out << "\n";
+
+	out << "### 2.2 Representative Live Node Instances (Up to 5 Per Stripped / `m_serverOnly` Class)\n\n";
+	for (auto& u : sorted_usage) {
+		out << std::format("#### Class `0x{:08X}` (`{}` — {}, Stripped={}, TotalNodes={}, Graphs={})\n\n",
+			u.stu_hash, u.stu_name, u.category, u.is_stripped ? "YES" : "NO", u.total_nodes, u.script_ids.size());
+
+		for (size_t ri = 0; ri < u.reps.size(); ri++) {
+			auto& rep = u.reps[ri];
+			std::string htag = res_owner_hero_map[rep.script_id];
+			out << std::format("##### Representative [{}] in Graph `0x{:016X}` ({}) — `node[{}]` at `0x{:X}` (`m_isState={}`, `m_clientOnly={}`, `m_serverOnly={}`)\n",
+				ri + 1, rep.script_id, htag.empty() ? "Shared/Map" : htag,
+				rep.node->idx_in_nodes, (uintptr_t)rep.node,
+				(int)rep.node->m_isState, (int)rep.node->m_clientOnly, (int)rep.node->m_serverOnly);
+
+			// Outgoing plugs
+			auto plug_map = rep.node->get_output_plugs();
+			for (auto& pe : plug_map) {
+				for (auto* plug : pe.second) {
+					if (!plug || !is_valid_read_memory(plug, sizeof(STUGraphPlug))) continue;
+					STUInfo* pinfo = safe_get_stu_info(plug);
+					uint32_t phash = pinfo ? pinfo->name_hash : 0;
+					out << std::format("  - OutPlug `0x{:08X}` [{}] (links: {}):", phash, get_rtti_classname(plug), plug->m_links.count());
+					for (auto* link : plug->m_links) {
+						if (link && is_valid_read_memory(link, sizeof(STUGraphLink)) &&
+							link->m_inputPlug && is_valid_read_memory(link->m_inputPlug, sizeof(STUStatescriptInputPlug))) {
+							auto* tgt = link->m_inputPlug->plug_base.m_parentNode;
+							if (tgt && is_valid_read_memory(tgt, sizeof(STUStatescriptBase))) {
+								STUInfo* tinfo = safe_get_stu_info(tgt);
+								out << std::format(" ==> `node[{}]` (`0x{:08X}`)", tgt->idx_in_nodes, tinfo ? tinfo->name_hash : 0);
+							}
+						}
+					}
+					out << "\n";
+				}
+			}
+
+			std::unordered_set<uintptr_t> visited;
+			visited.insert((uintptr_t)rep.node);
+			dump_stu_object_fields(out, rep.node, rep.node_info, 1, 4, visited);
+			if (u.is_stripped || ri == 0) {
+				dump_node_raw_hex(out, rep.node, rep.node->idx_in_nodes);
+			}
+		}
+		out << "---\n\n";
+	}
+
+	// =========================================================================
+	// SECTION 3: All 21 Launch Heroes' Gameplay Entities, Components, Weapons & Scripts Manifest
+	// =========================================================================
+	out << "## Section 3: All 21 Launch Heroes' Gameplay Entities, Components, Weapons & Scripts Manifest\n\n";
+
+	std::set<uint64_t> dumped_full_topology_scripts;
+	auto dump_graph_stripped_summary = [&](uint64_t script_id, const std::string& indent) {
+		STUBase<>* gbase = stu_resources::GetByID((__int64)script_id);
+		if (!gbase) {
+			try_load_resource((__int64)script_id);
+			gbase = stu_resources::GetByID((__int64)script_id);
+		}
+		if (!gbase || !gbase->valid()) {
+			out << indent << std::format("- Script `0x{:016X}`: (not loaded)\n", script_id);
+			return;
+		}
+		STUStatescriptGraph* graph = (STUStatescriptGraph*)gbase;
+		if (!graph->m_nodes.list_ptr || !is_valid_read_memory(graph->m_nodes.list_ptr, sizeof(STUBullshitListPtr))) return;
+
+		int total_n = graph->m_nodes.count();
+		int total_s = graph->m_states.count();
+		std::vector<std::string> notable_nodes;
+		for (auto* node : graph->m_nodes) {
+			if (!node || !is_valid_read_memory(node, sizeof(STUStatescriptBase))) continue;
+			STUInfo* ninfo = safe_get_stu_info(node);
+			uint32_t nh = ninfo ? ninfo->name_hash : 0;
+			bool is_strp = (stripped_node_hashes.count(nh) > 0);
+			bool is_srv = (node->m_serverOnly != 0);
+			if (is_strp || is_srv || nh == 0x3db862c4 || nh == 0x860ee5fc || nh == 0xc2a01675 || nh == 0x6e81f6d4) {
+				notable_nodes.push_back(std::format("node[{}]:`0x{:08X}`({}{}{})",
+					node->idx_in_nodes, nh,
+					is_strp ? "STRIPPED" : "ok",
+					is_srv ? ",SRV" : "",
+					node->m_isState ? ",State" : ",Act"));
+			}
+		}
+		out << indent << std::format("- Script `0x{:016X}` (`nodes={}`, `states={}`): ", script_id, total_n, total_s);
+		if (notable_nodes.empty()) {
+			out << "No stripped or serverOnly nodes.\n";
+		} else {
+			for (size_t i = 0; i < notable_nodes.size(); i++) {
+				if (i > 0) out << ", ";
+				out << notable_nodes[i];
+			}
+			out << "\n";
+		}
+		if (dumped_full_topology_scripts.insert(script_id).second && total_n > 0 && total_n < 256) {
+			for (auto* node : graph->m_nodes) {
+				if (!node || !is_valid_read_memory(node, sizeof(STUStatescriptBase))) continue;
+				STUInfo* ninfo = safe_get_stu_info(node);
+				uint32_t nh = ninfo ? ninfo->name_hash : 0;
+				bool is_strp = (stripped_node_hashes.count(nh) > 0);
+				std::string links_s;
+				auto pmap = node->get_output_plugs();
+				for (auto& pe : pmap) {
+					STUArgumentInfo* parg = ninfo ? ninfo->argumentByHash(pe.first) : nullptr;
+					uint32_t poff = (parg && is_valid_read_memory(parg, sizeof(STUArgumentInfo))) ? parg->offset : 0;
+					for (auto* plug : pe.second) {
+						if (!plug || !is_valid_read_memory(plug, sizeof(STUGraphPlug))) continue;
+						for (auto* lnk : plug->m_links) {
+							if (lnk && is_valid_read_memory(lnk, sizeof(STUGraphLink)) &&
+								lnk->m_inputPlug && is_valid_read_memory(lnk->m_inputPlug, sizeof(STUStatescriptInputPlug))) {
+								auto* tgt = lnk->m_inputPlug->plug_base.m_parentNode;
+								if (tgt && is_valid_read_memory(tgt, sizeof(STUStatescriptBase))) {
+									links_s += std::format("+0x{:X}->{} ", poff, tgt->idx_in_nodes);
+								}
+							}
+						}
+					}
+				}
+				out << indent << std::format("  * `node[{}]`: `stu=0x{:08X}` `isSt={}` `cO={}` `sO={}` {} {}\n",
+					node->idx_in_nodes, nh, (int)node->m_isState, (int)node->m_clientOnly, (int)node->m_serverOnly,
+					is_strp ? "[STRIPPED]" : "", links_s);
+			}
+		}
+	};
+
+	uint32_t hash_ss_comp = 0x9b38211b; // STUStatescriptComponent
+	uint32_t hash_wpn_comp = stringHash("STUWeaponComponent");
+	uint32_t hash_hp_comp = 0xaebe9baa;  // STUHealthComponent
+
+	for (auto& hpair : heroes_map) {
+		uint64_t hero_id = (uint64_t)hpair.first;
+		STUBase<>* hero_base = hpair.second;
+		if (!hero_base || !hero_base->valid()) continue;
+		STU_Object hero_obj = hero_base->to_editable();
+
+		std::string hero_name = "Unknown";
+		if (auto* name_ref = hero_obj.get_argument_resource(0xcd16baa)) {
+			if (is_valid_read_memory(name_ref, sizeof(STUResourceReference)) &&
+				name_ref->resource_id != 0 &&
+				(name_ref->resource_id & 0xDE0000000000000ULL) != 0) {
+				const char* s = GetUXDisplayString(name_ref->resource_id);
+				if (s && s[0] != '\0') hero_name = s;
+			}
+		}
+
+		uint64_t gp_ent_id = 0;
+		if (auto* gp_ref = hero_obj.get_argument_resource("m_gameplayEntity")) {
+			if (is_valid_read_memory(gp_ref, sizeof(STUResourceReference))) {
+				gp_ent_id = (uint64_t)gp_ref->resource_id;
+			}
+		}
+		if (gp_ent_id == 0 && is_valid_read_memory((void*)((uintptr_t)hero_base + 0x28), 8)) {
+			uint64_t cand = *(uint64_t*)((uintptr_t)hero_base + 0x28);
+			if (((cand >> 48) & 0xFFFF) == 0x0400) gp_ent_id = cand;
+		}
+
+		out << std::format("### Hero `{}` — `STUHero` `0x{:016X}` | `m_gameplayEntity` `0x{:016X}`\n\n",
+			hero_name, hero_id, gp_ent_id);
+
+		STUBase<>* ent_res = gp_ent_id ? stu_resources::GetByID((__int64)gp_ent_id) : nullptr;
+		if (!ent_res || !ent_res->valid()) {
+			out << "(Gameplay entity resource not loaded)\n\n---\n\n";
+			continue;
+		}
+
+		STUInfo* ent_info = safe_get_stu_info(ent_res);
+		STUArgumentInfo* cmap_arg = ent_info ? ent_info->argumentByHash(stringHash("m_componentMap")) : nullptr;
+		if (!cmap_arg) {
+			out << "(No m_componentMap argument on gameplay entity)\n\n---\n\n";
+			continue;
+		}
+
+		auto* bs_map = (STUBullshitMapFull<void*>*)((uintptr_t)ent_res + cmap_arg->offset);
+		if (!is_valid_read_memory(bs_map, sizeof(STUBullshitMapFull<void*>)) ||
+			!bs_map->list_ptr || !is_valid_read_memory(bs_map->list_ptr, sizeof(STUBullshitMapPtr<void*>)) ||
+			bs_map->flag != 2) {
+			out << "(m_componentMap invalid)\n\n---\n\n";
+			continue;
+		}
+
+		STU_Map comp_map(cmap_arg, bs_map);
+		out << "#### Component Map (`m_componentMap`):\n";
+		out << "| Key Hash | Component STU Hash | Known Name | MSVC RTTI |\n";
+		out << "|---|---|---|---|\n";
+
+		std::vector<std::pair<uint32_t, STU_Object>> key_comps;
+		for (auto entry : comp_map) {
+			uint32_t key = (uint32_t)entry.first;
+			STU_Object comp_obj = entry.second;
+			STUInfo* cinfo = comp_obj.value ? safe_get_stu_info(comp_obj.value) : comp_obj.struct_info;
+			uint32_t chash = cinfo ? cinfo->name_hash : 0;
+			std::string cname = "Unknown";
+			auto it_c = allmighty_hash_lib::hashes.find(chash);
+			if (it_c != allmighty_hash_lib::hashes.end()) cname = it_c->second;
+			std::string crtti = comp_obj.value ? get_rtti_classname(comp_obj.value) : "";
+			out << std::format("| `0x{:08X}` | `0x{:08X}` | `{}` | `{}` |\n", key, chash, cname, crtti);
+			if (comp_obj.value && cinfo) {
+				key_comps.push_back({ chash, STU_Object(cinfo, comp_obj.value) });
+			}
+		}
+		out << "\n";
+
+		for (auto& kc : key_comps) {
+			uint32_t chash = kc.first;
+			STU_Object& cobj = kc.second;
+			if (chash == hash_ss_comp || chash == hash_wpn_comp || chash == hash_hp_comp) {
+				std::string label = (chash == hash_ss_comp) ? "STUStatescriptComponent (0x9B38211B)"
+					: (chash == hash_wpn_comp) ? "STUWeaponComponent" : "STUHealthComponent (0xAEBE9BAA)";
+				out << "#### " << label << " (`0x" << std::hex << (uintptr_t)cobj.value << std::dec << "`):\n";
+				std::unordered_set<uintptr_t> vis;
+				vis.insert((uintptr_t)cobj.value);
+				dump_stu_object_fields(out, cobj.value, cobj.struct_info, 1, 4, vis);
+
+				std::unordered_set<uintptr_t> vis_r;
+				vis_r.insert((uintptr_t)cobj.value);
+				std::vector<std::pair<uint32_t, uint64_t>> crefs;
+				collect_stu_resource_refs_recursive(cobj.value, cobj.struct_info, 0, 5, vis_r, crefs);
+				bool printed_hdr = false;
+				for (auto& cr : crefs) {
+					if (((cr.second >> 48) & 0xFFFF) == 0x0580) {
+						if (!printed_hdr) {
+							out << "- **Referenced `0x0580...` Graphs & Stripped Node Audit**:\n";
+							printed_hdr = true;
+						}
+						dump_graph_stripped_summary(cr.second, "  ");
+					}
+				}
+				out << "\n";
+			}
+		}
+		out << "---\n\n";
+	}
+
+	// =========================================================================
+	// SECTION 4: Subscript & Projectile/Deployable Entity Graph Discovery
+	// =========================================================================
+	out << "## Section 4: Subscript (`0x3DB862C4`) & Projectile/Deployable Entity (`0x0400...` / `0x09A0...`) Call Graph\n\n";
+	out << "| Parent Resource | Hero Owner | Node Idx | Owner STU Hash | Field Hash | Child Resource ID | Child Type |\n";
+	out << "|---|---|---|---|---|---|---|\n";
+	std::set<std::tuple<uint64_t, int, uint32_t, uint64_t>> seen_edges;
+	std::set<uint64_t> child_entities_to_inspect;
+	for (auto& lnk : discovered_links) {
+		uint64_t chi_hi = (lnk.child_id >> 48) & 0xFFFF;
+		if (chi_hi != 0x0580 && chi_hi != 0x0400 && chi_hi != 0x09A0 && chi_hi != 0x0330) continue;
+		auto key = std::make_tuple(lnk.parent_id, lnk.node_idx, lnk.field_hash, lnk.child_id);
+		if (!seen_edges.insert(key).second) continue;
+
+		std::string htag = res_owner_hero_map[lnk.parent_id];
+		if (htag.empty()) htag = res_owner_hero_map[lnk.child_id];
+		std::string ctype_str = (chi_hi == 0x0580) ? "STUStatescriptGraph"
+			: (chi_hi == 0x0400) ? "STUEntityDefinition"
+			: (chi_hi == 0x09A0) ? "ProjectileConfig (0x09A0)" : "GameEffect (0x0330)";
+		out << std::format("| `0x{:016X}` | {} | `{}` | `0x{:08X}` | `0x{:08X}` | `0x{:016X}` | {} |\n",
+			lnk.parent_id, htag.empty() ? "-" : htag, lnk.node_idx, lnk.owner_stu_hash, lnk.field_hash, lnk.child_id, ctype_str);
+
+		if (chi_hi == 0x0400 && ((lnk.parent_id >> 48) & 0xFFFF) != 0x02E0) {
+			child_entities_to_inspect.insert(lnk.child_id);
+		}
+		if (chi_hi == 0x09A0 || chi_hi == 0x0330) {
+			child_entities_to_inspect.insert(lnk.child_id);
+		}
+	}
+	out << "\n";
+
+	out << "### 4.1 Spawned Projectile / Deployable / Effect STU Resources (`0x0400...`, `0x09A0...`, `0x0330...`) Deep Dump\n\n";
+	for (uint64_t cid : child_entities_to_inspect) {
+		STUBase<>* cres = stu_resources::GetByID((__int64)cid);
+		if (!cres || !cres->valid()) continue;
+		STUInfo* cinfo = safe_get_stu_info(cres);
+		if (!cinfo) continue;
+		std::string htag = res_owner_hero_map[cid];
+		out << std::format("#### Resource `0x{:016X}` ({}) — STU `0x{:08X}` (`{}`), RTTI `{}`\n",
+			cid, htag.empty() ? "Shared" : htag, cinfo->name_hash,
+			allmighty_hash_lib::hashes.count(cinfo->name_hash) ? allmighty_hash_lib::hashes[cinfo->name_hash] : "Unknown",
+			get_rtti_classname(cres));
+
+		uint64_t chi_hi = (cid >> 48) & 0xFFFF;
+		if (chi_hi == 0x0400) {
+			STUArgumentInfo* cmap_arg = cinfo->argumentByHash(stringHash("m_componentMap"));
+			if (cmap_arg) {
+				auto* bs_map = (STUBullshitMapFull<void*>*)((uintptr_t)cres + cmap_arg->offset);
+				if (is_valid_read_memory(bs_map, sizeof(STUBullshitMapFull<void*>)) &&
+					bs_map->list_ptr && is_valid_read_memory(bs_map->list_ptr, sizeof(STUBullshitMapPtr<void*>)) &&
+					bs_map->flag == 2) {
+					STU_Map comp_map(cmap_arg, bs_map);
+					for (auto entry : comp_map) {
+						STU_Object comp_obj = entry.second;
+						if (!comp_obj.value || !is_valid_read_memory(comp_obj.value, 8)) continue;
+						STUInfo* sub_info = safe_get_stu_info(comp_obj.value);
+						if (!sub_info) sub_info = comp_obj.struct_info;
+						if (!sub_info) continue;
+						out << std::format("- **Component `0x{:08X}`** (`{}`):\n",
+							sub_info->name_hash, get_rtti_classname(comp_obj.value));
+						std::unordered_set<uintptr_t> vis;
+						vis.insert((uintptr_t)comp_obj.value);
+						dump_stu_object_fields(out, comp_obj.value, sub_info, 2, 4, vis);
+						std::vector<std::pair<uint32_t, uint64_t>> child_crefs;
+						std::unordered_set<uintptr_t> cvis;
+						cvis.insert((uintptr_t)comp_obj.value);
+						collect_stu_resource_refs_recursive(comp_obj.value, sub_info, 0, 5, cvis, child_crefs);
+						for (auto& ccr : child_crefs) {
+							if (((ccr.second >> 48) & 0xFFFF) == 0x0580) {
+								dump_graph_stripped_summary(ccr.second, "    ");
+							}
+						}
+					}
+				}
+			}
+		} else {
+			std::unordered_set<uintptr_t> vis;
+			vis.insert((uintptr_t)cres);
+			dump_stu_object_fields(out, cres, cinfo, 1, 4, vis);
+		}
+		out << "\n";
+	}
+
+	out.close();
+	_dump_status_msg = std::format("Successfully dumped Horizon 1 STU & 21-Hero Audit to horizon1_stu_audit.log! ({} classes, {} graphs)",
+		class_entries.size(), all_graphs.size());
+	_experiment_status_msg = _dump_status_msg;
+}
+
 void statescript_diag_window::test_enable_0x2f_aim_and_rebind() {
 	auto* ea = GameEntityAdmin();
 	if (!ea) {
@@ -1742,6 +2644,14 @@ void statescript_diag_window::test_enable_0x2f_aim_and_rebind() {
 
 void statescript_diag_window::render_diagnostic_panel() {
 	if (ImGui::CollapsingHeader("[Step 1 Diagnostic] Weapon & Input Tracer", ImGuiTreeNodeFlags_DefaultOpen)) {
+		if (ImGui::Button("[Horizon 1] Dump All Stripped STU Nodes & 21 Hero Graphs (horizon1_stu_audit.log)")) {
+			dump_horizon1_audit_to_file();
+		}
+		if (!_dump_status_msg.empty()) {
+			ImGui::TextColored(ImVec4(0.3f, 1.f, 0.3f, 1.f), "%s", _dump_status_msg.c_str());
+		}
+		ImGui::Separator();
+
 		if (ImGui::Button("Select Local Player Model (via 0x20)")) {
 			select_local_model_0x23();
 		}
@@ -1887,6 +2797,10 @@ void statescript_diag_window::render_diagnostic_panel() {
 			// Forensics Dump
 			if (ImGui::Button("[Step 1 Forensics] Dump Weapon Nodes & Entity State -> weapon_nodes_forensics.log")) {
 				dump_weapon_nodes_forensics_to_file();
+			}
+
+			if (ImGui::Button("[Horizon 1] Dump All Stripped STU Nodes & 21 Hero Graphs (horizon1_stu_audit.log)##exp")) {
+				dump_horizon1_audit_to_file();
 			}
 
 			ImGui::Checkbox("[Gate B+] Force Authoritative Execution Flags (0x608009) on Model Scripts", &s_force_weapon_exec_flags);

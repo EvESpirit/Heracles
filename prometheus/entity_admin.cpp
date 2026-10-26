@@ -81,6 +81,12 @@ void PrometheusSystem::OnDeletion(Entity* ent) {
 		if (_local_controller_entities.ptr[i] == ent)
 			_local_controller_entities.remove_item(i--);
 	}
+	for (auto it = _newly_added_entities.begin(); it != _newly_added_entities.end();) {
+		if (*it == ent)
+			it = _newly_added_entities.erase(it);
+		else
+			++it;
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1110,7 +1116,9 @@ void PrometheusSystem::OnTick(float tick) {
 
 		if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, false)) {
 			for (auto ent : _local_controller_entities) {
+				if (!ent) continue;
 				auto ref_comp = ent->getById<Component_20_ModelReference>(0x20);
+				if (!ref_comp) continue;
 				auto aim_entid = ref_comp->aim_entid;
 				//Many checks are probably not needed but better be safe than sorry...
 				if (aim_entid > 0) {
@@ -1125,7 +1133,9 @@ void PrometheusSystem::OnTick(float tick) {
 			}
 		} else if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, false)) {
 			for (auto ent : _local_controller_entities) {
+				if (!ent) continue;
 				auto ref_comp = ent->getById<Component_20_ModelReference>(0x20);
+				if (!ref_comp) continue;
 				auto aim_entid = ref_comp->aim_entid;
 				//Many checks are probably not needed but better be safe than sorry...
 				if (aim_entid > 0) {
@@ -1176,14 +1186,16 @@ void PrometheusSystem::OnTick(float tick) {
 
 	if (local_freeLookView) {
 		for (auto ent : _local_controller_entities) {
+			if (!ent) continue;
 			auto ref_comp = ent->getById<Component_20_ModelReference>(0x20);
+			if (!ref_comp) continue;
 			auto aim_entid = ref_comp->aim_entid;
 			//Many checks are probably not needed but better be safe than sorry...
 			if (aim_entid > 0) {
 				auto aim_ent = _game_ea->getEntById(aim_entid);
 				if (aim_ent) {
 					auto filterbits = aim_ent->getById<Component_10_FilterBits>(0x10);
-					filterbits->filter_bits |= 0x10 | 0x400000;
+					if (filterbits) filterbits->filter_bits |= 0x10 | 0x400000;
 				}
 			}
 		}
@@ -1225,13 +1237,15 @@ void PrometheusSystem::OnTick(float tick) {
 	}
 	else {
 		for (auto ent : _local_controller_entities) {
+			if (!ent) continue;
 			auto ref_comp = ent->getById<Component_20_ModelReference>(0x20);
+			if (!ref_comp) continue;
 			auto aim_entid = ref_comp->aim_entid;
 			if (aim_entid > 0) {
 				auto aim_ent = _game_ea->getEntById(aim_entid);
 				if (aim_ent) {
 					auto filterbits = aim_ent->getById<Component_10_FilterBits>(0x10);
-					filterbits->filter_bits &= ~(__int64)0x400000;
+					if (filterbits) filterbits->filter_bits &= ~(__int64)0x400000;
 				}
 			}
 		}
@@ -1239,7 +1253,8 @@ void PrometheusSystem::OnTick(float tick) {
 
 	for (auto it = _newly_added_entities.begin(); it != _newly_added_entities.end();) {
 		Entity* controller = *it;
-		Entity* model = _game_ea->getEntById(controller->getById<Component_20_ModelReference>(0x20)->aim_entid);
+		auto ref_comp = controller ? controller->getById<Component_20_ModelReference>(0x20) : nullptr;
+		Entity* model = (ref_comp && ref_comp->aim_entid != 0) ? _game_ea->getEntById(ref_comp->aim_entid) : nullptr;
 		if (model) {
 			//Moved into player spawner
 			/*auto ss = model->getById<StatescriptComponent>(0x23);

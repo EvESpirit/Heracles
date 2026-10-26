@@ -717,11 +717,25 @@ struct EntityAdminBase {
     };
 
     inline Entity* getEntById(uint32 id) {
+        if (!id || !entity_list_array)
+            return nullptr;
+        // Native +0x80FDC6: entity_list_array is a 4096-bucket hash table indexed by (id & 0xFFF),
+        // where each bucket has `is_possessed_by_a_demon_` (num) entries in `entity_im[0..num-1]`.
+        const EntityListItem& bucket = entity_list_array[id & (ENTITYLIST_MAX - 1)];
+        if (bucket.entity_im && bucket.is_possessed_by_a_demon_ > 0) {
+            for (int j = 0; j < bucket.is_possessed_by_a_demon_; j++) {
+                if (bucket.entity_im[j].entitiy_id == id && bucket.entity_im[j].ent)
+                    return bucket.entity_im[j].ent;
+            }
+        }
         EntityListItem* entities = entity_list_array;
         for (int i = 0; i < ENTITYLIST_MAX; i++) {
-            if (entities->is_possessed_by_a_demon_ && entities->entity_im->entitiy_id == id)
-                return entities->entity_im->ent;
-            entities++;
+            if (entities[i].entity_im && entities[i].is_possessed_by_a_demon_ > 0) {
+                for (int j = 0; j < entities[i].is_possessed_by_a_demon_; j++) {
+                    if (entities[i].entity_im[j].entitiy_id == id && entities[i].entity_im[j].ent)
+                        return entities[i].entity_im[j].ent;
+                }
+            }
         }
         return nullptr;
     }
@@ -753,17 +767,31 @@ struct EntityAdminBase {
         using difference_type = std::ptrdiff_t;
 
         EntityIterator() {}
-        EntityIterator(EntityAdminBase* ea) : _ea(ea) {
+        EntityIterator(EntityAdminBase* ea) : _ea(ea), _current_pos(0), _current_sub_idx(-1) {
             this->operator++();
         }
         EntityIterator& operator++() {
-            do {
-                if (++_current_pos >= ENTITYLIST_MAX) {
-                    _ea = nullptr;
-                    _current_pos = 0;
-                    break;
+            if (!_ea || !_ea->entity_list_array) {
+                _ea = nullptr;
+                _current_pos = 0;
+                _current_sub_idx = 0;
+                return *this;
+            }
+            while (_current_pos < ENTITYLIST_MAX) {
+                const EntityListItem& bucket = _ea->entity_list_array[_current_pos];
+                _current_sub_idx++;
+                while (bucket.entity_im && _current_sub_idx < bucket.is_possessed_by_a_demon_) {
+                    if (bucket.entity_im[_current_sub_idx].ent != nullptr) {
+                        return *this;
+                    }
+                    _current_sub_idx++;
                 }
-            } while (!_ea->entity_list_array[_current_pos].is_possessed_by_a_demon_);
+                _current_pos++;
+                _current_sub_idx = -1;
+            }
+            _ea = nullptr;
+            _current_pos = 0;
+            _current_sub_idx = 0;
             return *this;
         }
 
@@ -776,15 +804,16 @@ struct EntityAdminBase {
         value_type operator*() const {
             if (!_ea)
                 throw std::out_of_range("Iterator out of range");
-            return _ea->entity_list_array[_current_pos].entity_im->ent;
+            return _ea->entity_list_array[_current_pos].entity_im[_current_sub_idx].ent;
         }
 
         bool operator==(const EntityIterator& it) const {
-            return it._current_pos == _current_pos && it._ea == _ea;
+            return it._current_pos == _current_pos && it._current_sub_idx == _current_sub_idx && it._ea == _ea;
         }
     private:
         EntityAdminBase* _ea = nullptr;
         int _current_pos = 0;
+        int _current_sub_idx = 0;
     };
 
 
@@ -1039,12 +1068,28 @@ public:
                     _local_controller_entities.remove_item(i--);
                 }
             }
+            for (auto it = _newly_added_entities.begin(); it != _newly_added_entities.end();) {
+                if (*it == local_ent) {
+                    it = _newly_added_entities.erase(it);
+                } else {
+                    ++it;
+                }
+            }
 
             auto pet_comp = local_ent->getById<Component_20_ModelReference>(0x20);
             if (pet_comp) {
-                _game_ea->delEnt(_game_ea->getEntById(pet_comp->aim_entid));
-                _game_ea->delEnt(_game_ea->getEntById(pet_comp->cam_attach_entid));
-                _game_ea->delEnt(_game_ea->getEntById(pet_comp->movement_attach_entid));
+                uint32_t id1 = pet_comp->aim_entid;
+                uint32_t id2 = pet_comp->cam_attach_entid;
+                uint32_t id3 = pet_comp->movement_attach_entid;
+                if (id1) {
+                    if (Entity* e1 = _game_ea->getEntById(id1)) _game_ea->delEnt(e1);
+                }
+                if (id2 && id2 != id1) {
+                    if (Entity* e2 = _game_ea->getEntById(id2)) _game_ea->delEnt(e2);
+                }
+                if (id3 && id3 != id1 && id3 != id2) {
+                    if (Entity* e3 = _game_ea->getEntById(id3)) _game_ea->delEnt(e3);
+                }
             }
             _game_ea->delEnt(local_ent);
         }
@@ -1094,7 +1139,7 @@ struct OriginEntitySlot {
 };
 
 struct OriginClutterTracker {
-    static constexpr int MAX_SLOTS = 0x1000;
+    static constexpr int MAX_SLOTS = 0x4000;
     static inline OriginEntitySlot s_slots[MAX_SLOTS]{};
     static inline bool s_block_zero_overwrites = true;
     static inline bool s_auto_cull_unplaced_origin_props = false;
