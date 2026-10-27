@@ -229,6 +229,8 @@ char matchmaking_cv(__int64, __int64, __int64, StatescriptPrimitive* result) {
 	return 1;
 }
 
+static uint32 s_pachi_marker_entid = 0;
+
 void pachipachi(Vector4 position, Vector4 rotation, Vector4 scaling) {
 	auto res = try_load_resource(0x04000000000006CA);
 	if (res == 0) //Not valid on all maps, this is only for hanamura
@@ -241,10 +243,23 @@ void pachipachi(Vector4 position, Vector4 rotation, Vector4 scaling) {
 	init_data.scale = scaling;
 
 	loader->loader_entries[1].init_data = (__int64)&init_data;
-	loader->Spawn(ea);
+	Entity* ent = loader->Spawn(ea);
+	if (ent) {
+		s_pachi_marker_entid = ent->entity_id;
+	}
 }
 
 void spawn_pachis() {
+	auto ea = GameEntityAdmin();
+	if (!ea)
+		return;
+	// Guard against duplicating the 257 Pachimaris on every in-game hero swap (H -> SendHeroSelection).
+	if (s_pachi_marker_entid != 0) {
+		if (ea->getEntById(s_pachi_marker_entid) != nullptr) {
+			return;
+		}
+		s_pachi_marker_entid = 0;
+	}
 	pachipachi(Vector4(6.444336, 0.000000, -4.373047, 0), Vector4(0.000000, 0.697113, 0.000000, 0.716962), Vector4(1.000000, 1.000000, 1.000000, 1.000000));
 	pachipachi(Vector4(6.405273, 0.000000, -3.110352, 0), Vector4(0.000000, 0.697113, 0.000000, 0.716962), Vector4(1.000000, 1.000000, 1.000000, 1.000000));
 	pachipachi(Vector4(6.374023, 0.000000, -2.089844, 0), Vector4(0.000000, 0.697113, 0.000000, 0.716962), Vector4(1.000000, 1.000000, 1.000000, 1.000000));
@@ -1263,12 +1278,22 @@ void PrometheusSystem::OnTick(float tick) {
 			cv.value = 1;
 			ss->ss_inner.rid_entity_varbag->SetVar({ StatescriptVar_ENTITY_VARBAG, 0x0D800000000000FD }, cv);*/
 			if (globals::isDemo) {
-				auto localplayer = controller->getById<Component_2F_LocalPlayer>(0x2F);
-				localplayer->SetRotation(Vector4(0.000000, -0.713039, 0.000000, 0));
 				auto comp = model->getById<__int64>(0x15);
+				bool has_custom_pos = false;
 				if (comp) {
-					*((Vector4*)((__int64)comp + 0xC70)) = Vector4(108.336914, 0.999023, 0.142578, 0);
-					//Is inside MovementState, i need to finisht the demo this is ugly ;(
+					Vector4* pos_ptr = (Vector4*)((__int64)comp + 0xC70);
+					if (fabsf(pos_ptr->X) + fabsf(pos_ptr->Y) + fabsf(pos_ptr->Z) > 0.5f) {
+						has_custom_pos = true;
+					}
+				}
+				if (!has_custom_pos) {
+					if (auto localplayer = controller->getById<Component_2F_LocalPlayer>(0x2F)) {
+						localplayer->SetRotation(Vector4(0.000000, -0.713039, 0.000000, 0));
+					}
+					if (comp) {
+						*((Vector4*)((__int64)comp + 0xC70)) = Vector4(108.336914, 0.999023, 0.142578, 0);
+						//Is inside MovementState, i need to finisht the demo this is ugly ;(
+					}
 				}
 			}
 
@@ -1347,6 +1372,7 @@ void PrometheusSystem_Mapfunc::change_state_3_globalloading() {
 	printf("PrometheusSystem_Mapfunc: change_state_3_globalloading\n");
 }
 void PrometheusSystem_Mapfunc::change_state_4_worldloading() {
+	s_pachi_marker_entid = 0;
 	printf("PrometheusSystem_Mapfunc: change_state_4_worldloading\n");
 }
 void PrometheusSystem_Mapfunc::change_state_5_worldloaded() {
@@ -1365,6 +1391,7 @@ void PrometheusSystem_Mapfunc::on_gamemode_loading() {
 	printf("PrometheusSystem_Mapfunc: on_gamemode_loading\n");
 }
 void PrometheusSystem_Mapfunc::maybe_on_map_unload() {
+	s_pachi_marker_entid = 0;
 	printf("PrometheusSystem_Mapfunc: maybe_on_map_unload\n");
 }
 void PrometheusSystem_Mapfunc::OnWorldLoadedAndInGameEnttiyAdmin() {
