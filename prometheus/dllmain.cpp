@@ -2241,6 +2241,10 @@ uint8_t __fastcall RayIntersectsAABB_hook(const Vector4* aabb_min_max, const Vec
     return ret;
 }
 
+static uintptr_t s_saved_prop_hit_c27 = 0;
+static float s_saved_prop_hit_frac = 1.0f;
+static uint8_t s_saved_prop_hit_buf[0x70] = {};
+
 typedef void(__fastcall* on_pellet_hitbox_hit_fn)(uintptr_t cb_vt, uintptr_t ctx_ptr, uintptr_t a3);
 on_pellet_hitbox_hit_fn OnPelletHitboxHit_orig = nullptr;
 void __fastcall OnPelletHitboxHit_hook(uintptr_t cb_vt, uintptr_t ctx_ptr, uintptr_t a3) {
@@ -2256,18 +2260,40 @@ void __fastcall OnPelletHitboxHit_hook(uintptr_t cb_vt, uintptr_t ctx_ptr, uintp
     uint32_t f54 = out_hit ? SafeReadVal<uint32_t>(out_hit + 0x54) : 0;
     uint16_t w60 = out_hit ? SafeReadVal<uint16_t>(out_hit + 0x60) : 0;
     uint8_t c27_230 = pellet_c27 ? SafeReadVal<uint8_t>(pellet_c27 + 0x230) : 0xFF;
+    uint8_t pre_a4 = pellet_c27 ? SafeReadVal<uint8_t>(pellet_c27 + 0xA4) : 0;
     int32_t pre_a38 = pellet_c27 ? SafeReadVal<int32_t>(pellet_c27 + 0xA38) : 0;
+
+    // In +0x1038860 (+0x1038E81..+0x1038F59), when Havok raycast (+0x10820C0) hits a dynamic physics rigidbody prop
+    // with Havok property flag 0x0102 (e.g. 0x04000000000006CA Pachimari, bl == 1), +0x1038ED2 jumps to +0x1038EE7,
+    // calls vt[+0x68] (+0xD381F0, OnPelletHitboxHit) to apply the Havok physics impulse (+0xD3B200 with r8b=0, r9b=0),
+    // appends hit_ent to the Havok raycast ignore list [r15 + 0x50], and unconditionally loops back to +0x1038A00,
+    // overwriting *out_hit with whatever is behind the Pachimari (ret = 0 on that sub-step).
+    // For standalone projectiles (cb_vt == +0x15C3048, e.g. Soldier: 76 Helix Rockets), snapshot the 0x68-byte out_hit
+    // before +0x1038860 overwrites it on the loop-back, and leave [pellet_c27 + 0xA4] == 0 so +0x1032CB0 -> +0x10393D0
+    // -> vt[+0x58] (+0xD37E70) -> +0xD3B200(r8b=1, r9b=1) -> +0xD3D370 natively terminates the rocket and spawns the explosion VFX.
+    uintptr_t cb_vt_ptr = cb_vt ? SafeReadVal<uintptr_t>(cb_vt) : 0;
+    bool is_proj_vt = (cb_vt_ptr == globals::gameBase + 0x15C3048);
+    bool is_dynamic_prop_hit = (hit_ent != nullptr && (bone36 == 0xFFFF || !hit_ent->hasComponent(0x28)));
+    if (is_proj_vt && is_dynamic_prop_hit && pellet_c27 != 0 && out_hit != 0 && !IsBadReadPtr((const void*)out_hit, 0x68)) {
+        if (s_saved_prop_hit_c27 != pellet_c27 || hit_frac < s_saved_prop_hit_frac) {
+            memcpy(s_saved_prop_hit_buf, (const void*)out_hit, 0x68);
+            s_saved_prop_hit_c27 = pellet_c27;
+            s_saved_prop_hit_frac = hit_frac;
+        }
+    }
 
     OnPelletHitboxHit_orig(cb_vt, ctx_ptr, a3);
 
+    uint8_t post_a4 = pellet_c27 ? SafeReadVal<uint8_t>(pellet_c27 + 0xA4) : 0;
     int32_t post_a38 = pellet_c27 ? SafeReadVal<int32_t>(pellet_c27 + 0xA38) : 0;
+    uintptr_t r9_cfg = a3 ? SafeReadVal<uintptr_t>(a3 + 0x90) : 0;
     float r12_4c = a3 ? SafeReadVal<float>(a3 + 0x4C) : 0.0f;
     uintptr_t r12_88 = a3 ? SafeReadVal<uintptr_t>(a3 + 0x88) : 0;
     uintptr_t r12_b0 = a3 ? SafeReadVal<uintptr_t>(a3 + 0xB0) : 0;
 
-    ShotDiagLogFmt("[HITBOX_CB (+0xD381F0 vt+0x68)] pellet_c27=%p out_hit=%p hit_ent=0x%X w34=0x%X bone36=0x%X f50=0x%X f54=0x%X w60=0x%X a38=%d->%d c27_230=%u a3=%p(4C=%.2f,88=%p,B0=%p) pos=(%.2f,%.2f,%.2f)",
-        (void*)pellet_c27, (void*)out_hit, hit_entid, w34, bone36, f50, f54, w60, pre_a38, post_a38, c27_230,
-        (void*)a3, r12_4c, (void*)r12_88, (void*)r12_b0, hit_pos.X, hit_pos.Y, hit_pos.Z);
+    ShotDiagLogFmt("[HITBOX_CB (+0xD381F0 vt+0x68)] pellet_c27=%p out_hit=%p hit_ent=0x%X w34=0x%X bone36=0x%X f50=0x%X f54=0x%X w60=0x%X a4=%u->%u a38=%d->%d c27_230=%u a3=%p(4C=%.2f,88=%p,90=%p,B0=%p) pos=(%.2f,%.2f,%.2f)",
+        (void*)pellet_c27, (void*)out_hit, hit_entid, w34, bone36, f50, f54, w60, pre_a4, post_a4, pre_a38, post_a38, c27_230,
+        (void*)a3, r12_4c, (void*)r12_88, (void*)r9_cfg, (void*)r12_b0, hit_pos.X, hit_pos.Y, hit_pos.Z);
 }
 
 static std::mutex s_pellet_hit_mutex;
@@ -2390,11 +2416,22 @@ uint8_t __fastcall PerformPelletWorldAndHitboxRaycast_hook(
     s_a45aa0_total_calls = 0;
     s_a45aa0_dummy_calls = 0;
     s_a45aa0_dummy_last_ret = -1;
+    s_saved_prop_hit_c27 = 0;
+    s_saved_prop_hit_frac = 1.0f;
     s_in_pellet_raycast_1038860 = true;
 
     uint8_t ret = PerformPelletWorldAndHitboxRaycast_orig(cb_vt, pellet_c27, a3, ray_start, out_hit, hit_ctx, a7);
 
     s_in_pellet_raycast_1038860 = false;
+
+    if (s_saved_prop_hit_c27 == pellet_c27 && pellet_c27 != 0 && out_hit != 0) {
+        s_saved_prop_hit_c27 = 0;
+        float post_frac = SafeReadVal<float>(out_hit + 0x30);
+        if (ret == 0 || s_saved_prop_hit_frac <= post_frac) {
+            memcpy((void*)out_hit, s_saved_prop_hit_buf, 0x68);
+            ret = 1;
+        }
+    }
 
     uint64_t c27_228 = pellet_c27 ? SafeReadVal<uint64_t>(pellet_c27 + 0x228) : 0;
     uint8_t c27_230 = pellet_c27 ? SafeReadVal<uint8_t>(pellet_c27 + 0x230) : 0xFF;
