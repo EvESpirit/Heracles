@@ -44,6 +44,11 @@ struct StatescriptPrimitive {
 	__int32 field_8;
 	StatescriptPrimitive_Type type;
 
+	StatescriptPrimitive() : value(0), field_8(0), type((StatescriptPrimitive_Type)0) {}
+	StatescriptPrimitive(StatescriptPrimitive_Type t, __int64 v) : value(v), field_8(0), type(t) {}
+	explicit StatescriptPrimitive(float f) : value(0), field_8(0), type(StatescriptPrimitive_FLT) { *(float*)&value = f; }
+	StatescriptPrimitive(__int64 v, __int32 f8, StatescriptPrimitive_Type t) : value(v), field_8(f8), type(t) {}
+
 	std::string get_type_str();
 	std::string get_value_str();
 	StatescriptPrimitive clone();

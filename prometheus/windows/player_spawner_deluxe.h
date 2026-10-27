@@ -103,7 +103,7 @@ class player_spawner_deluxe : public window {
 		ImGui::RadioButton("3", &inf->team, 3);
 	}
 
-	void template_teamplayer() {
+	void template_teamplayer(int team_idx = 1) {
 		_spawner.controller_info.resource_id = 0x40000000000000E;
 		_spawner.controller_info.aim_attach = 2;
 		_spawner.controller_info.cam_attach = 2;
@@ -113,7 +113,7 @@ class player_spawner_deluxe : public window {
 		_spawner.controller_info.load_3f = true;
 		_spawner.controller_info.movement_attach = 2;
 		_spawner.controller_info.set_filterbits_controller = false;
-		_spawner.controller_info.team = 1;
+		_spawner.controller_info.team = team_idx;
 		if (_spawner.model_info.resource_id == 0) {
 			_spawner.model_info.resource_id = 0x400000000000001;
 		}
@@ -125,7 +125,21 @@ class player_spawner_deluxe : public window {
 		_spawner.model_info.set_health = true;
 		_spawner.model_info.weapon_attach = true;
 		_spawner.model_info.fixup_player_statescript = true;
-		_spawner.model_info.team = 1;
+		_spawner.model_info.team = team_idx;
+	}
+
+	void template_friendlyplayer() {
+		int ally_team = 0;
+		if (auto* ea = GameEntityAdmin()) {
+			if (Entity* local = ea->getLocalEnt()) {
+				if (auto* c10 = local->getById<Component_10_FilterBits>(0x10)) {
+					if (c10->filter_bits & 0x80000) ally_team = 1;
+					else if (c10->filter_bits & 0x100000) ally_team = 2;
+					else if (c10->filter_bits & 0x200000) ally_team = 3;
+				}
+			}
+		}
+		template_teamplayer(ally_team);
 	}
 
 	static bool compute_local_player_spawn_transform(float forward_dist, Vector4& out_pos, Vector4& out_rot, bool face_towards_player) {
@@ -394,20 +408,24 @@ class player_spawner_deluxe : public window {
 			}
 			ImGui::SameLine();
 			if (ImGui::Button("Preset: Enemy Bot/Dummy (Team 1)")) {
-				template_teamplayer();
+				template_teamplayer(1);
+			}
+			ImGui::SameLine();
+			if (ImGui::Button("Preset: Friendly Bot/Dummy (Team 0)")) {
+				template_friendlyplayer();
 			}
 
 			ImGui::Separator();
-			ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f), "One-Click Enemy Target Dummy Spawner (Team 1):");
+			ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f), "One-Click Target Dummy Spawner (Enemy Team 1 / Friendly Team 0):");
 			ImGui::SetNextItemWidth(140.0f);
 			ImGui::SliderFloat("Forward Dist (m)", &_dummy_forward_dist, 0.0f, 12.0f, "%.1f m");
 			ImGui::SameLine();
 			ImGui::Checkbox("Face Player", &_dummy_face_player);
 			ImGui::SameLine();
-			if (ImGui::Button("Spawn Jeff Kaplan")) {
+			if (ImGui::Button("Spawn Jeff Kaplan (Enemy)")) {
 				Vector4 spawn_pos{}, spawn_rot{};
 				if (compute_local_player_spawn_transform(_dummy_forward_dist, spawn_pos, spawn_rot, _dummy_face_player)) {
-					template_teamplayer();
+					template_teamplayer(1);
 					_spawner.model_info.set_position = true;
 					_spawner.model_info.spawn_position = spawn_pos;
 					_spawner.model_info.spawn_rotation = spawn_rot;
@@ -415,10 +433,32 @@ class player_spawner_deluxe : public window {
 				}
 			}
 			ImGui::SameLine();
-			if (ImGui::Button("Spawn Jeff Kaplan At Exact Player Pos")) {
+			if (ImGui::Button("Spawn Enemy At Exact Player Pos")) {
 				Vector4 spawn_pos{}, spawn_rot{};
 				if (compute_local_player_spawn_transform(0.0f, spawn_pos, spawn_rot, _dummy_face_player)) {
-					template_teamplayer();
+					template_teamplayer(1);
+					_spawner.model_info.set_position = true;
+					_spawner.model_info.spawn_position = spawn_pos;
+					_spawner.model_info.spawn_rotation = spawn_rot;
+					_spawner.spawn();
+				}
+			}
+			ImGui::SameLine();
+			if (ImGui::Button("Spawn Friendly Dummy (Team 0)")) {
+				Vector4 spawn_pos{}, spawn_rot{};
+				if (compute_local_player_spawn_transform(_dummy_forward_dist, spawn_pos, spawn_rot, _dummy_face_player)) {
+					template_friendlyplayer();
+					_spawner.model_info.set_position = true;
+					_spawner.model_info.spawn_position = spawn_pos;
+					_spawner.model_info.spawn_rotation = spawn_rot;
+					_spawner.spawn();
+				}
+			}
+			ImGui::SameLine();
+			if (ImGui::Button("Spawn Friendly At Exact Player Pos")) {
+				Vector4 spawn_pos{}, spawn_rot{};
+				if (compute_local_player_spawn_transform(0.0f, spawn_pos, spawn_rot, _dummy_face_player)) {
+					template_friendlyplayer();
 					_spawner.model_info.set_position = true;
 					_spawner.model_info.spawn_position = spawn_pos;
 					_spawner.model_info.spawn_rotation = spawn_rot;
@@ -563,6 +603,20 @@ class player_spawner_deluxe : public window {
 								}
 								c28->InitHeroHealthPools(h_id, 0);
 								sync_entity_health_varbag(ent);
+							}
+							ImGui::SameLine();
+							if (ImGui::SmallButton("Team 0")) {
+								if (c10) {
+									c10->pre_filter_bits |= 0x800000;
+									c10->set_team(0);
+									c10->FilterBitsMakeFinal();
+								}
+								if (ctrl_ent) {
+									if (auto* cc10 = ctrl_ent->getById<Component_10_FilterBits>(0x10)) {
+										cc10->set_team(0);
+										cc10->FilterBitsMakeFinal();
+									}
+								}
 							}
 							ImGui::SameLine();
 							if (ImGui::SmallButton("Team 1")) {
