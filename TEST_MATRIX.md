@@ -49,7 +49,7 @@
 | Roadhog | Take a Breather | Pass |
 | Roadhog | Ultimate | Pass |
 | Winston | Jump Pack | Pass |
-| Winston | Barrier Projector | Partial Pass (spawns already visually damaged and doesn't appear to despawn, but it does spawn) |
+| Winston | Barrier Projector | Pass |
 | Winston | Ultimate | Fail (no knockback to enemies on slap and seems to damage... by aura? instead of by slapping bots around) |
 | Zarya | Particle Barrier | Fail (spawns attached to the ground directly underneath player, not the player, and spawns too small to encompass Zarya even if it was attached to her) |
 | Zarya | Projected Barrier | Fail (will not activate to target friendlies that are being aimed at even up close) |
