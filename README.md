@@ -214,7 +214,7 @@ Also don't look into the window manager. It's an abomination. You have been warn
 # 8. License and Credits
 
 * **Original Prometheus Project:** [saturn-xvi / BreakingBread0](https://github.com/BreakingBread0)
-* **Contributors:** [tslocum](https://github.com/tslocum), [Hazno-dev](https://github.com/Hazno-dev), [Groot36-yep](https://github.com/Groot36-yep), [EvESpirit](https://github.com/EvESpirit)
+* **Contributors:** [tslocum](https://github.com/tslocum), [Hazno-dev](https://github.com/Hazno-dev), [Groot36-yep](https://github.com/Groot36-yep), [EvESpirit](https://github.com/EvESpirit), [BreakingBread0](https://github.com/BreakingBread0)
 
 **AGPL-3.0 License.** Kept under AGPL to ensure this remains a project made by the community, for the community.
 
