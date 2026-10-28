@@ -6,9 +6,10 @@ on:
   workflow_dispatch:
 
 env:
+  # Path to the solution file relative to the root of the project.
   SOLUTION_FILE_PATH: .
 
-permissions:
+permissions: # For creating a release
   contents: write
   packages: write
 
@@ -17,7 +18,8 @@ jobs:
     runs-on: windows-latest
 
     steps:
-    - uses: actions/checkout@v6
+    - name: Checkout repository and submodules
+      uses: actions/checkout@v6
       with:
         submodules: recursive
 
@@ -25,28 +27,30 @@ jobs:
       uses: microsoft/setup-msbuild@v3
 
     - name: Restore NuGet packages
-      working-directory: ${{env.GITHUB_WORKSPACE}}
-      run: nuget restore ${{env.SOLUTION_FILE_PATH}}
+      working-directory: ${{ github.workspace }}
+      run: nuget restore ${{ env.SOLUTION_FILE_PATH }}
 
     - name: Stage vcpkg
-      working-directory: ${{env.GITHUB_WORKSPACE}}
+      working-directory: ${{ github.workspace }}
       run: . .\external\vcpkg\scripts\bootstrap.ps1
 
     - name: Build
-      working-directory: ${{env.GITHUB_WORKSPACE}}
-      run: msbuild /p:Configuration=Release /p:PlatformTarget=x64 /p:OutDir=${{env.GITHUB_WORKSPACE}}\output ${{env.SOLUTION_FILE_PATH}}
+      working-directory: ${{ github.workspace }}
+      run: msbuild /p:Configuration=Release /p:PlatformTarget=x64 /p:OutDir=${{ github.workspace }}\output\ ${{ env.SOLUTION_FILE_PATH }}
 
     - name: Zip
-      run: Compress-Archive -Path ${{env.GITHUB_WORKSPACE}}\output\*.* -DestinationPath ${{env.GITHUB_WORKSPACE}}\heracles-release.zip
+      working-directory: ${{ github.workspace }}
+      run: Compress-Archive -Path "${{ github.workspace }}\output\*.*" -DestinationPath "${{ github.workspace }}\heracles.zip"
 
-    - uses: ncipollo/release-action@v1
+    - name: Publish Release
+      uses: ncipollo/release-action@v1
       with:
-        tag: v0.0.0x
+        tag: v0.0.1
         allowUpdates: true
         artifactErrorsFailBuild: true
         body: "CI release for main branch."
-        commit: ${{ env.GITHUB_SHA }}
+        commit: ${{ github.sha }}
         generateReleaseNotes: true
         removeArtifacts: true
         replacesArtifacts: true
-        artifacts: ${{env.GITHUB_WORKSPACE}}\heracles.zip
+        artifacts: "heracles.zip"
