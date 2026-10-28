@@ -154,6 +154,8 @@ Component `0x12` holds a ring buffer of network movement snapshots from the serv
 
 # 3. What Heracles fixed & what's still broken
 
+For further reference for heroes specifically, please check out the TEST_MATRIX.md file in the repo root.
+
 ## What works now
 
 * **Weapons shoot, reload, and show muzzle flashes:** Primary and secondary fire, ammo consumption, reloading, and 1P barrel muzzle flashes (mostly) work across the cast. There are still issues - like dual-weapon heroes - but the core logic works.
