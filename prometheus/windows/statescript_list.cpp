@@ -104,6 +104,17 @@ static void ensure_known_stu_hashes() {
 	add(0xbfd9aadd, "STUConfigVar");
 	add(0xf8cc195d, "STUConfigVarDynamic");
 	add(0x34D7F9EE, "STUIdentifier");
+	add(0xec502a81, "STUConfigVarExpression");
+	add(0x85c28a9a, "STUStatescriptStateShaderParam");
+	add(0x99d0cf4a, "STUStatescriptStateBarrierHealthMonitor");
+	add(0x65f5405f, "STUStatescriptActionInitBarrierHealthVars");
+	add(0xaf645748, "STUStatescriptActionBarrierHealthEvent");
+	add(0x1e2d3677, "STUStatescriptStateBarrierActiveSub");
+	add(0xd0b42497, "STUStatescriptConditionJunctionGate");
+	add(0x837e8660, "STUStatescriptActionStopState");
+	add(0x4cced352, "STUStatescriptStateCreateEntity");
+	add(0x0e3689f3, "STUStatescriptActionCreateEntity");
+	add(0xf9ef59a6, "STUStatescriptActionPlayScript");
 }
 
 static void dump_varbag_entries(std::ofstream& out, StatescriptVar_VarBag* vb, const std::string& prefix) {

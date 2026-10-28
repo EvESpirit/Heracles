@@ -815,6 +815,7 @@ struct StatescriptSyncMgr
 		STRUCT_PLACE(char, is_aim_ent_assigned, 0x4D3); //is above value assigend
 
 		STRUCT_PLACE(teList<__int64*>, cvd_get_callbacks, 0x410);
+		STRUCT_PLACE(StatescriptVar_VarBag*, aim_varbag, 0xEA0); // NULL on non-aim sub-entities (returned by +0xF64B30 when is_aim_ent != 0)
 	};
 
 	StatescriptInstance* getByInstanceId(int instance_id) {
@@ -856,6 +857,9 @@ struct Component_23_Statescript {
 		ComponentBase base;
 		Statescript_vt* vfptr;
 		STRUCT_PLACE(StatescriptSyncMgr, ss_inner, 0xC0);
+		STRUCT_PLACE(uintptr_t, child_slot_arr, 0x1458);        // 0x250-byte child weapon/effect slot array (+0xD551F0 / +0xD55AA0)
+		STRUCT_PLACE(__int32, child_slot_cnt, 0x1460);          // Active count in child_slot_arr
+		STRUCT_PLACE(uintptr_t, shader_param_provider, 0x14C0); // Component_03 shader provider (vt = +0x15C5D50, cb = +0xD71030, flushed by +0xD71110)
 	};
 
 	void loadScript(__int64 resource_id) {

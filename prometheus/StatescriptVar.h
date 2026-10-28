@@ -8,6 +8,7 @@ struct StatescriptVar_Dictionary;
 struct StatescriptVar_InstanceReference;
 
 enum StatescriptVar_SpecialType : __int64 {
+	StatescriptVar_AIM_ENTITY_VARBAG = 0xD80000000000002,
 	StatescriptVar_INSTANCE_VARBAG = 0xD80000000000003,
 	StatescriptVar_ENTITY_VARBAG = 0xD80000000000004,
 	StatescriptVar_CHILD_VARBAG = 0xD80000000000005,
@@ -16,6 +17,29 @@ enum StatescriptVar_SpecialType : __int64 {
 	StatescriptVar_VEC3_Y = 0xD80000000000009,
 	StatescriptVar_VEC3_Z = 0xD8000000000000A,
 	StatescriptVar_DICTSIZE = 0xD8000000000000B,
+	StatescriptVar_HERO_ENTITY_ID        = 0x0D8000000000001D,
+	StatescriptVar_ABILITY_MUTEX_021     = 0x0D80000000000021,
+	StatescriptVar_OWNER_ENTITY_ID       = 0x0D80000000000028,
+	StatescriptVar_WEAPON_SLOT_31        = 0x0D80000000000031,
+	StatescriptVar_WEAPON_SLOT_32        = 0x0D80000000000032,
+	StatescriptVar_ULT_PCT_0F3           = 0x0D800000000000F3,
+	StatescriptVar_CURRENT_HP_0FD        = 0x0D800000000000FD, // Float Current HP (used in 0x0FD / 0x24B shader ratio & truthy > 0.0f)
+	StatescriptVar_BARRIER_BASE_HP_151   = 0x0D80000000000151,
+	StatescriptVar_ULT_CHARGE_MAX_152    = 0x0D80000000000152,
+	StatescriptVar_ULT_CHARGE_CUR_156    = 0x0D80000000000156,
+	StatescriptVar_HEALTH_MOD_TAG_1DB    = 0x0D800000000001DB,
+	StatescriptVar_IS_DEAD_OR_BROKEN_1DE = 0x0D800000000001DE, // Byte: 0 = alive/intact, 1 = dead/broken
+	StatescriptVar_BARRIER_CUR_HP_24A    = 0x0D8000000000024A, // Float Current HP
+	StatescriptVar_BARRIER_MAX_HP_24B    = 0x0D8000000000024B, // Int32 Max HP (divisor in 0x05800000000000FC node[15] bc=1F001F016700)
+	StatescriptVar_HEALTH_RATIO_317      = 0x0D80000000000317,
+	StatescriptVar_HEALTH_RATIO_318      = 0x0D80000000000318,
+	StatescriptVar_HEALTH_RATIO_319      = 0x0D80000000000319,
+	StatescriptVar_HEALTH_RATIO_31A      = 0x0D8000000000031A,
+	StatescriptVar_HERO_SELECT_ACTIVE    = 0x0D800000000003D5,
+	StatescriptVar_CURRENT_HP_6C4        = 0x0D800000000006C4,
+	StatescriptVar_MAX_HP_6C9            = 0x0D800000000006C9,
+	StatescriptVar_HEALTH_RATIO_6F9      = 0x0D800000000006F9,
+	StatescriptVar_BARRIER_MAX_HP_805    = 0x0D80000000000805,
 };
 
 struct StatescriptVar_DictionaryArray // sizeof=0x18

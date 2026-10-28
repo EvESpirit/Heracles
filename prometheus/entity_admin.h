@@ -285,11 +285,14 @@ struct Component_28_STUHealthComponent {
     union {
         ComponentBase base;
         STUHealthComponent_vt* vfptr;
+        STRUCT_PLACE(uintptr_t, shader_param_provider_vt, 0x18); // Embedded Component_03 shader provider (vt = +0x15C5A80, cb = +0xCC3EA0)
 
         // Verified in +0xCC5F92 and +0xCC67F5: 16 HealthPart entries (stride 0x14 = 0x140 bytes) per pool
         STRUCT_PLACE_ARRAY(HealthPart, normal_health, 0x10, 0x98);
         STRUCT_PLACE_ARRAY(HealthPart, armour_health, 0x10, 0x1D8);
         STRUCT_PLACE_ARRAY(HealthPart, shield_health, 0x10, 0x318);
+        STRUCT_PLACE(unsigned char, byte_484, 0x484); // Previous overhead healthbar visibility state
+        STRUCT_PLACE(unsigned char, byte_485, 0x485); // Current overhead healthbar visibility state (set by System #46 +0xCA7200)
     };
 
     float CalcTotalCurrentHealth() const {

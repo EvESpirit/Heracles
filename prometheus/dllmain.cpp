@@ -1493,6 +1493,53 @@ static bool NotifyVarInBag(StatescriptSyncMgr* ss_inner, StatescriptInstance* sc
     return false;
 }
 
+static void RefreshEntityShaderProviders(Entity* ent) {
+    if (!ent || IsBadReadPtr(ent, sizeof(Entity))) return;
+    using UpdateShaderParamsFn = void(__fastcall*)(uintptr_t c23_14C0);
+    using MarkProviderDirtyFn  = void(__fastcall*)(uintptr_t comp03, uintptr_t provider);
+    auto update_shader_params  = (UpdateShaderParamsFn)(globals::gameBase + 0xD71110);
+    auto mark_provider_dirty   = (MarkProviderDirtyFn)(globals::gameBase + 0xA084C0);
+
+    auto* c03 = ent->getById<ComponentBase>(3);
+    auto* c23 = ent->getById<Component_23_Statescript>(0x23);
+    auto* c28 = ent->getById<Component_28_STUHealthComponent>(0x28);
+
+    uintptr_t c23_14C0 = (c23 && !IsBadReadPtr(c23, sizeof(Component_23_Statescript)))
+        ? SafeReadVal<uintptr_t>((uintptr_t)c23 + 0x14C0) : 0;
+    if (c23_14C0 && !IsBadReadPtr((const void*)c23_14C0, 0x30)) {
+        __try { update_shader_params(c23_14C0); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    if (c03 && !IsBadReadPtr(c03, 0x60)) {
+        if (c28 && !IsBadReadPtr(c28, sizeof(Component_28_STUHealthComponent))) {
+            __try { mark_provider_dirty((uintptr_t)c03, (uintptr_t)c28 + 0x18); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+        if (c23_14C0 && !IsBadReadPtr((const void*)c23_14C0, 0x30)) {
+            __try { mark_provider_dirty((uintptr_t)c03, c23_14C0); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+    }
+    EntityAdminBase* ea = GameEntityAdmin();
+    if (ea && c23 && c23_14C0 && !IsBadReadPtr(c23, sizeof(Component_23_Statescript))) {
+        uintptr_t slot_arr = SafeReadVal<uintptr_t>((uintptr_t)c23 + 0x1458);
+        int32_t slot_cnt   = SafeReadVal<int32_t>((uintptr_t)c23 + 0x1460);
+        if (slot_arr && slot_cnt > 0 && slot_cnt <= 16) {
+            for (int si = 0; si < slot_cnt; ++si) {
+                uintptr_t slot_base = slot_arr + (uintptr_t)si * 0x250;
+                for (int ei = 0; ei < 2; ++ei) {
+                    uint32_t cid = SafeReadVal<uint32_t>(slot_base + (uintptr_t)ei * 4);
+                    if (!cid || cid == 0xFFFFFFFFu) continue;
+                    Entity* child_ent = ea->getEntById(cid);
+                    if (!child_ent || IsBadReadPtr(child_ent, sizeof(Entity))) continue;
+                    if (auto* child_c03 = child_ent->getById<ComponentBase>(3)) {
+                        if (!IsBadReadPtr(child_c03, 0x60)) {
+                            __try { mark_provider_dirty((uintptr_t)child_c03, c23_14C0); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 static void SyncEntityHealthVarBag(Entity* ent) {
     auto* ss = ent->getById<Component_23_Statescript>(0x23);
     auto* c28 = ent->getById<Component_28_STUHealthComponent>(0x28);
@@ -1530,16 +1577,17 @@ static void SyncEntityHealthVarBag(Entity* ent) {
         NotifyVarInBag(&ss->ss_inner, nullptr, ss->ss_inner.rid_entity_varbag, vid, rat_cv);
     }
 
-    StatescriptPrimitive alive_cv(StatescriptPrimitive_BYTE, (cur_hp > 0.0f) ? 1 : 0);
-    ss->ss_inner.rid_entity_varbag->SetVar({ 0x0D800000000000FD }, alive_cv);
-    ss->ss_inner.rid_entity_varbag->SetVar({ StatescriptVar_ENTITY_VARBAG, 0x0D800000000000FD }, alive_cv);
-    NotifyVarInBag(&ss->ss_inner, nullptr, ss->ss_inner.rid_entity_varbag, 0x0D800000000000FDLL, alive_cv);
+    // 0x0D800000000000FD is Current Health (divided by 0x0D8000000000024B Max Health in 0x05800000000000FC node[15] bc=1F001F016700, and truthy when > 0.0f)
+    ss->ss_inner.rid_entity_varbag->SetVar({ 0x0D800000000000FD }, cv);
+    ss->ss_inner.rid_entity_varbag->SetVar({ StatescriptVar_ENTITY_VARBAG, 0x0D800000000000FD }, cv);
+    NotifyVarInBag(&ss->ss_inner, nullptr, ss->ss_inner.rid_entity_varbag, 0x0D800000000000FDLL, cv);
 
     StatescriptPrimitive dead_cv(StatescriptPrimitive_BYTE, (cur_hp > 0.0f) ? 0 : 1);
     ss->ss_inner.rid_entity_varbag->SetVar({ 0x0D800000000001DE }, dead_cv);
     ss->ss_inner.rid_entity_varbag->SetVar({ StatescriptVar_ENTITY_VARBAG, 0x0D800000000001DE }, dead_cv);
     NotifyVarInBag(&ss->ss_inner, nullptr, ss->ss_inner.rid_entity_varbag, 0x0D800000000001DELL, dead_cv);
     ss->ss_inner.needs_process_e = 1;
+    RefreshEntityShaderProviders(ent);
 }
 
 // ============================================================================
@@ -3828,8 +3876,8 @@ static void SeedBarrierVarBag(StatescriptVar_VarBag* vb, float sub_hp) {
     vb->SetVar({ StatescriptVar_ENTITY_VARBAG, 0x0D800000000006F9 }, p_one);
     vb->SetVar({ 0x0D800000000001DB }, p_one);
     vb->SetVar({ StatescriptVar_ENTITY_VARBAG, 0x0D800000000001DB }, p_one);
-    vb->SetVar({ 0x0D800000000000FD }, p_byte1);
-    vb->SetVar({ StatescriptVar_ENTITY_VARBAG, 0x0D800000000000FD }, p_byte1);
+    vb->SetVar({ 0x0D800000000000FD }, p_hp);
+    vb->SetVar({ StatescriptVar_ENTITY_VARBAG, 0x0D800000000000FD }, p_hp);
     vb->SetVar({ 0x0D800000000001DE }, p_byte0);
     vb->SetVar({ StatescriptVar_ENTITY_VARBAG, 0x0D800000000001DE }, p_byte0);
     vb->SetVar({ 0x0D80000000000317 }, p_one);
@@ -3898,9 +3946,15 @@ static void SafeTickSyncMgr(StatescriptSyncMgr* mgr, float sub_hp = 600.0f, bool
     __try {
         SetSyncMgrClientAuthoritative(mgr, sub_hp, io_entries_traversed, false);
         tick_sync_mgr_inner(mgr, ++mgr->increasing_counter1, 1);
-        uintptr_t c23_14C0 = SafeReadVal<uintptr_t>((uintptr_t)mgr - 0xC0 + 0x14C0);
-        if (c23_14C0 && !IsBadReadPtr((const void*)c23_14C0, 0x30)) {
-            update_shader_params(c23_14C0);
+        Entity* owner_ent = (mgr->component_ref && !IsBadReadPtr(mgr->component_ref, sizeof(ComponentBase)))
+            ? mgr->component_ref->base.entity_backref : nullptr;
+        if (owner_ent) {
+            RefreshEntityShaderProviders(owner_ent);
+        } else {
+            uintptr_t c23_14C0 = SafeReadVal<uintptr_t>((uintptr_t)mgr - 0xC0 + 0x14C0);
+            if (c23_14C0 && !IsBadReadPtr((const void*)c23_14C0, 0x30)) {
+                update_shader_params(c23_14C0);
+            }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
@@ -4973,6 +5027,8 @@ static Entity* SpawnStatescriptSubEntity(StatescriptInstance* inst, STUStatescri
             nc23->loadScript(0x0580000000000636ULL);
         }
         SeedBarrierVarBag(nc23->ss_inner.rid_entity_varbag, sub_hp);
+        SetEntityVarBagFloatNative(nc23, 0x0D800000000000FDULL, sub_hp);
+        SetEntityVarBagFloatNative(nc23, 0x0D8000000000024AULL, sub_hp);
         SetEntityVarBagFloatNative(nc23, 0x0D800000000006C4ULL, sub_hp);
         SetEntityVarBagFloatNative(nc23, 0x0D800000000006C9ULL, sub_hp);
         SetEntityVarBagFloatNative(nc23, 0x0D80000000000805ULL, sub_hp);
@@ -4983,6 +5039,7 @@ static Entity* SpawnStatescriptSubEntity(StatescriptInstance* inst, STUStatescri
         SetEntityVarBagFloatNative(nc23, 0x0D80000000000319ULL, 1.0f);
         SetEntityVarBagFloatNative(nc23, 0x0D8000000000031AULL, 1.0f);
         SetSyncMgrClientAuthoritative(&nc23->ss_inner, sub_hp, nullptr, true);
+        RefreshEntityShaderProviders(new_ent);
     }
 
     if (out_cvd && !IsBadReadPtr(out_cvd, sizeof(STUConfigVarDynamic))) {
@@ -5265,6 +5322,8 @@ static uint8_t __fastcall StatescriptAction_ExecuteAndContinue_hook(
                 }
                 if (auto* tc23 = target_ent->getById<Component_23_Statescript>(0x23)) {
                     SeedBarrierVarBag(tc23->ss_inner.rid_entity_varbag, sub_hp);
+                    SetEntityVarBagFloatNative(tc23, 0x0D800000000000FDULL, sub_hp);
+                    SetEntityVarBagFloatNative(tc23, 0x0D8000000000024AULL, sub_hp);
                     SetEntityVarBagFloatNative(tc23, 0x0D800000000006C4ULL, sub_hp);
                     SetEntityVarBagFloatNative(tc23, 0x0D800000000006C9ULL, sub_hp);
                     SetEntityVarBagFloatNative(tc23, 0x0D80000000000805ULL, sub_hp);
@@ -5278,10 +5337,7 @@ static uint8_t __fastcall StatescriptAction_ExecuteAndContinue_hook(
                     tc23->loadScript(target_script);
                     SeedBarrierVarBag(tc23->ss_inner.rid_entity_varbag, sub_hp);
                     SetSyncMgrClientAuthoritative(&tc23->ss_inner, sub_hp, nullptr, true);
-                    uintptr_t c23_14C0 = SafeReadVal<uintptr_t>((uintptr_t)tc23 + 0x14C0);
-                    if (c23_14C0 && !IsBadReadPtr((const void*)c23_14C0, 0x30)) {
-                        ((void(__fastcall*)(uintptr_t))(globals::gameBase + 0xD71110))(c23_14C0);
-                    }
+                    RefreshEntityShaderProviders(target_ent);
                 }
             }
         } else if (stu_hash == 0x65F5405Fu) {
@@ -7183,6 +7239,16 @@ static const char* ResolveSSNodeName(uint32_t hash) {
     case 0xD78490D1: return "State:Knockback";
     case 0x6332D975: return "SRV_Act:DestroyEnt2";
     case 0xA323EC29: return "State:PetPossess";
+    case 0xBE49A4C2: return "Entry:GameMsgA";
+    case 0x46C48944: return "Entry:SubEntStart";
+    case 0x85C28A9A: return "State:ShaderParam(0xEE)";
+    case 0x99D0CF4A: return "State:BarrierHealthMonitor";
+    case 0x65F5405F: return "SRV_Act:InitBarrierHealthVars";
+    case 0xAF645748: return "Act:BarrierHealthEvent";
+    case 0x1E2D3677: return "State:BarrierActiveSub";
+    case 0xD0B42497: return "Cond:JunctionGate";
+    case 0x837E8660: return "Act:StopState";
+    case 0xEC502A81: return "CV:Expression";
     default: break;
     }
     auto it = allmighty_hash_lib::hashes.find(hash);
