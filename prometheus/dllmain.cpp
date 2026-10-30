@@ -992,6 +992,12 @@ void WeaponHardpointDiag::TickProjectileTracker(EntityAdminBase* game_ea) {
         s_pending_dummy_dump_reason = "AUTO_POST_KEY_E_45TICKS";
         s_pending_dummy_hit_dump_ticks = 45;
     }
+    if ((GetAsyncKeyState(VK_LSHIFT) & 1) != 0) {
+        statescript_logger::StartTrace(3000, "KEY_LSHIFT_ABILITY");
+        ShotDiagLogFmt("[ABILITY_TRACE] Key 'LShift' pressed -> tracing Statescript for 3000ms, auto-dump in 45 ticks");
+        s_pending_dummy_dump_reason = "AUTO_POST_KEY_LSHIFT_45TICKS";
+        s_pending_dummy_hit_dump_ticks = 45;
+    }
     if ((GetAsyncKeyState(VK_F8) & 1) != 0) {
         WeaponHardpointDiag::DumpDummyCombatForensics(game_ea, "MANUAL_F8_KEY");
     }
@@ -3634,10 +3640,93 @@ static bool     s_winston_beam_active     = false;
 static uint64_t s_winston_beam_last_ms    = 0;
 static bool     s_zarya_beam_active       = false;
 static uint64_t s_zarya_beam_last_ms      = 0;
+static bool     s_zen_harmony_hot_active   = false;
+static uint64_t s_zen_harmony_last_ms      = 0;
+static uint32_t s_zen_harmony_target_entid = 0;
+static uint32_t s_zen_harmony_cfg_low32    = 0;
+static uint32_t s_zen_discord_cfg_low32    = 0;
 static uint64_t s_biotic_field_end_ms     = 0;
 static uint64_t s_biotic_field_last_ms    = 0;
 static uint32_t s_biotic_field_ent_id     = 0;
 static Vector4  s_biotic_field_pos{};
+
+static uint32_t ResolveAimConeTargetForScript(Entity* owner_ent, uint64_t script_id, uint32_t targeting_cfg_low32) {
+    EntityAdminBase* ea = GameEntityAdmin();
+    if (!ea) return 0;
+    if (!owner_ent) owner_ent = GetLocalHeroModelEnt();
+    if (!owner_ent || IsBadReadPtr(owner_ent, sizeof(Entity))) return 0;
+
+    auto* comp15 = owner_ent->getById<Component_15_STUCharacterMoverComponent>(0x15);
+    auto* comp01 = owner_ent->getById<Component_1_SceneRendering>(1);
+    auto* owner_c10 = owner_ent->getById<Component_10_FilterBits>(0x10);
+    Vector4 hero_pos = (comp15 && !IsBadReadPtr(comp15, sizeof(Component_15_STUCharacterMoverComponent)))
+        ? comp15->movement_state_1.absolute_position : (comp01 ? comp01->position : Vector4{});
+    Vector4 aim_dir{ 0.0f, 0.0f, 1.0f, 0.0f };
+    if (comp15 && !IsBadReadPtr(comp15, sizeof(Component_15_STUCharacterMoverComponent))) {
+        const Vector4& q = comp15->movement_state_1.rotation_quaternion;
+        float pitch = -comp15->movement_state_1.y_lookdir;
+        float cp = cosf(pitch), sp = sinf(pitch);
+        float hx = 2.0f * (q.X * q.Z + q.W * q.Y);
+        float hz = 1.0f - 2.0f * (q.X * q.X + q.Y * q.Y);
+        float hlen = sqrtf(hx * hx + hz * hz);
+        if (hlen > 1e-4f) { hx /= hlen; hz /= hlen; }
+        aim_dir.X = hx * cp;
+        aim_dir.Y = sp;
+        aim_dir.Z = hz * cp;
+    }
+    Vector4 eye_pos = hero_pos;
+    eye_pos.Y += 1.45f;
+
+    // +1 = Friendly lock-on (Orb of Harmony, Mercy Heal/Boost/GA, Zarya Projected Barrier, Symmetra Photon Shield)
+    // -1 = Enemy lock-on (Orb of Discord, McCree Deadeye, Soldier Tactical Visor)
+    //  0 = Unknown targeting_cfg_low32 (prefer entity closest to crosshair in aim cone)
+    int team_pref = 0;
+    if (script_id == 0x05800000000002F3ULL || script_id == 0x058000000000006BULL ||
+        script_id == 0x0580000000000045ULL || script_id == 0x0580000000000246ULL ||
+        script_id == 0x05800000000000ABULL ||
+        (s_zen_harmony_cfg_low32 != 0 && targeting_cfg_low32 == s_zen_harmony_cfg_low32)) {
+        team_pref = +1;
+    } else if (script_id == 0x0580000000000176ULL || script_id == 0x05800000000001ECULL ||
+               script_id == 0x05800000000001C5ULL ||
+               (s_zen_discord_cfg_low32 != 0 && targeting_cfg_low32 == s_zen_discord_cfg_low32)) {
+        team_pref = -1;
+    }
+
+    uint32_t best_pref_entid = 0;
+    float best_pref_cos = 0.80f; // ~36 deg half-angle lock-on cone
+    uint32_t best_any_entid = 0;
+    float best_any_cos = 0.80f;
+
+    for (Entity* ent : *ea) {
+        if (!ent || ent == owner_ent || !ent->hasComponent(0x15) || !ent->hasComponent(0x28)) continue;
+        auto* c1 = ent->getById<Component_1_SceneRendering>(1);
+        auto* c28 = ent->getById<Component_28_STUHealthComponent>(0x28);
+        if (!c1 || IsBadReadPtr(c1, sizeof(Component_1_SceneRendering)) || !c28 || c28->CalcTotalCurrentHealth() <= 0.0f) continue;
+
+        Vector4 tgt_center = c1->position;
+        tgt_center.Y += 1.0f;
+        Vector4 d = Sub3(tgt_center, eye_pos);
+        float dist = sqrtf(Dot3(d, d));
+        if (dist > 40.0f || dist < 0.05f) continue;
+        float cos_ang = Dot3(d, aim_dir) / dist;
+        if (cos_ang < 0.80f) continue;
+
+        auto* c10 = ent->getById<Component_10_FilterBits>(0x10);
+        bool same_team = (owner_c10 && c10 && (owner_c10->filter_bits & 0x3C0000ULL) == (c10->filter_bits & 0x3C0000ULL));
+
+        if (cos_ang > best_any_cos) {
+            best_any_cos = cos_ang;
+            best_any_entid = ent->entity_id;
+        }
+        if ((team_pref == +1 && same_team) || (team_pref == -1 && !same_team) || team_pref == 0) {
+            if (cos_ang > best_pref_cos) {
+                best_pref_cos = cos_ang;
+                best_pref_entid = ent->entity_id;
+            }
+        }
+    }
+    return (best_pref_entid != 0) ? best_pref_entid : ((team_pref == 0) ? best_any_entid : 0);
+}
 
 static void ArmHeroHealOverTime(uint64_t script_id, float total_hp, uint64_t dur_ms, const char* tag = nullptr) {
     if (dur_ms == 0 || total_hp <= 0.0f) return;
@@ -3705,6 +3794,8 @@ static void SafeTraverseOutputPlug(
 
 static void WriteDynamicVarPrim(StatescriptInstance* inst, STUConfigVarDynamic* out_var, const StatescriptPrimitive& val_prim) {
     if (!inst || !out_var || IsBadReadPtr(out_var, sizeof(STUConfigVarDynamic))) return;
+    uintptr_t list_ptr = SafeReadVal<uintptr_t>((uintptr_t)out_var + 0x10);
+    if (!list_ptr || list_ptr == ~0ULL || IsBadReadPtr((const void*)list_ptr, 16)) return;
     int loc_cnt = out_var->item_location.count();
     STUResourceReference* loc_arr = out_var->item_location.list();
     if (loc_cnt <= 0 || !loc_arr || IsBadReadPtr(loc_arr, sizeof(STUResourceReference) * loc_cnt)) return;
@@ -4329,6 +4420,8 @@ static void __fastcall TickProjectileManager_hook(void* proj_sys) {
             s_bastion_repair_active = false;
             s_winston_beam_active = false;
             s_zarya_beam_active = false;
+            s_zen_harmony_hot_active = false;
+            s_zen_harmony_target_entid = 0;
             s_biotic_field_end_ms = 0;
             s_biotic_field_ent_id = 0;
             s_active_impulse_end_ms = 0;
@@ -4500,6 +4593,86 @@ static void __fastcall TickProjectileManager_hook(void* proj_sys) {
                 }
                 ShotDiagLogFmt("[ZARYA_BEAM_TICK] hit=0x%X dist=%.2fm -%.1f -> HP %.1f",
                     best_ent->entity_id, best_s * 15.5f, kZaryaTickDmg, new_hp);
+            }
+        }
+
+        // 1c-3. Zenyatta Orb of Harmony (0x0580000000000176 / 0x058000000000018D):
+        //       10 Hz passive aim-cone target discovery + VarBag sync + 30 HP/s (+3.0 HP / 100ms) sustained HoT on locked ally
+        if (game_ea && (now_ms - s_zen_harmony_last_ms) >= 100) {
+            if (auto* c23 = local_hero->getById<Component_23_Statescript>(0x23)) {
+                if (!IsBadReadPtr(c23, sizeof(Component_23_Statescript)) &&
+                    c23->ss_inner.g3_arrWithIds.ptr && c23->ss_inner.g3_arrWithIds.num > 0 && c23->ss_inner.g3_arrWithIds.num <= 64) {
+                    StatescriptInstance* inst_176 = nullptr;
+                    StatescriptInstance* inst_18D = nullptr;
+                    StatescriptInstance* inst_2F3 = nullptr;
+                    for (int i = 0; i < c23->ss_inner.g3_arrWithIds.num; ++i) {
+                        StatescriptInstance* sub = c23->ss_inner.g3_arrWithIds.ptr[i].instance;
+                        if (!sub || IsBadReadPtr(sub, sizeof(StatescriptInstance))) continue;
+                        uint64_t sid = SafeReadVal<uint64_t>((uintptr_t)sub + 0x150);
+                        if (sid == 0x0580000000000176ULL) inst_176 = sub;
+                        else if (sid == 0x058000000000018DULL) inst_18D = sub;
+                        else if (sid == 0x05800000000002F3ULL) inst_2F3 = sub;
+                    }
+                    if (inst_176 || inst_18D || inst_2F3) {
+                        s_zen_harmony_last_ms = now_ms;
+
+                        // Auto-discover 0x0D60... targeting_cfg_low32 for Harmony (0x2F3) and Discord (0x176) once
+                        auto scan_graph_d60 = [](StatescriptInstance* s_inst) -> uint32_t {
+                            if (!s_inst || !s_inst->graph || IsBadReadPtr(s_inst->graph, sizeof(STUStatescriptGraph))) return 0;
+                            int ncnt = s_inst->graph->m_nodes.count();
+                            STUStatescriptBase** narr = s_inst->graph->m_nodes.list();
+                            if (ncnt <= 0 || ncnt > 256 || !narr || IsBadReadPtr(narr, sizeof(void*) * ncnt)) return 0;
+                            for (int n = 0; n < ncnt; ++n) {
+                                uintptr_t np = (uintptr_t)narr[n];
+                                if (!np || IsBadReadPtr((const void*)np, 0xA8)) continue;
+                                for (int off = 0x80; off <= 0x120; off += 8) {
+                                    uint64_t qw = SafeReadVal<uint64_t>(np + off);
+                                    if ((qw & 0xFFFF000000000000ULL) == 0x0D60000000000000ULL) return (uint32_t)qw;
+                                    if (qw > 0x10000ULL && !IsBadReadPtr((const void*)qw, 0x30)) {
+                                        for (int co = 0x08; co <= 0x28; co += 8) {
+                                            uint64_t cqw = SafeReadVal<uint64_t>(qw + co);
+                                            if ((cqw & 0xFFFF000000000000ULL) == 0x0D60000000000000ULL) return (uint32_t)cqw;
+                                        }
+                                    }
+                                }
+                            }
+                            return 0;
+                        };
+                        if (s_zen_harmony_cfg_low32 == 0 && inst_2F3) {
+                            s_zen_harmony_cfg_low32 = scan_graph_d60(inst_2F3);
+                            if (s_zen_harmony_cfg_low32 != 0) {
+                                ShotDiagLogFmt("[ZEN_CFG_DISCOVER] Harmony(0x2F3) cfg_low32=0x%X", s_zen_harmony_cfg_low32);
+                            }
+                        }
+                        if (s_zen_discord_cfg_low32 == 0 && inst_176) {
+                            s_zen_discord_cfg_low32 = scan_graph_d60(inst_176);
+                            if (s_zen_discord_cfg_low32 != 0) {
+                                ShotDiagLogFmt("[ZEN_CFG_DISCOVER] Discord(0x176) cfg_low32=0x%X", s_zen_discord_cfg_low32);
+                            }
+                        }
+
+                        // Read active Orb of Harmony target from 0x05800000000002F3 InstVarBag (0x0D80000000000646)
+                        uint32_t vb_harmony_tgt = (inst_2F3 && inst_2F3->rid_instance_varbag)
+                            ? (uint32_t)ReadVarBagInt32(inst_2F3->rid_instance_varbag, 0x0D80000000000646LL) : 0;
+                        if (vb_harmony_tgt != 0) {
+                            s_zen_harmony_target_entid = vb_harmony_tgt;
+                        }
+                        uint32_t active_harmony_tgt = (vb_harmony_tgt != 0) ? vb_harmony_tgt
+                            : (s_zen_harmony_hot_active ? s_zen_harmony_target_entid : 0);
+
+                        // Tick Orb of Harmony 30 HP/s (+3.0 HP / 100ms) while attached to an ally
+                        if (active_harmony_tgt != 0) {
+                            Entity* tgt = game_ea->getEntById(active_harmony_tgt);
+                            auto* tc28 = tgt ? tgt->getById<Component_28_STUHealthComponent>(0x28) : nullptr;
+                            if (tgt && tc28 && tc28->CalcTotalCurrentHealth() > 0.0f) {
+                                ApplyHeroSelfHeal(tgt, 3.0f, 0x05800000000002F3ULL, "ZEN_HARMONY_HOT");
+                            } else {
+                                s_zen_harmony_hot_active = false;
+                                s_zen_harmony_target_entid = 0;
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -5404,27 +5577,7 @@ static uint8_t __fastcall StatescriptAction_ExecuteAndContinue_hook(
             ? inst->ss_inner->component_ref->base.entity_backref : nullptr;
 
         if (stu_hash == 0x4E83BC01u) {
-            // 0x4E83BC01: Server VarBag Mutation Action (sz = 0xA8)
-            // +0x88: STUConfigVarDynamic* m_outVar, +0x98: STUConfigVar* m_value
-            auto* out_var = (STUConfigVarDynamic*)SafeReadVal<uintptr_t>((uintptr_t)stu_node + 0x88);
-            auto* m_value = (STUConfigVar*)SafeReadVal<uintptr_t>((uintptr_t)stu_node + 0x98);
-            if (out_var && m_value && !IsBadReadPtr(out_var, sizeof(STUConfigVarDynamic)) && !IsBadReadPtr(m_value, sizeof(STUConfigVar))) {
-                if (inst->rid_instance_varbag && !IsBadReadPtr(inst->rid_instance_varbag, sizeof(StatescriptVar_VarBag))) {
-                    SafeCallSetConfigVarValueFromSTU(inst->rid_instance_varbag, out_var, m_value);
-                }
-                StatescriptPrimitive val_prim{};
-                m_value->get_value(inst, &val_prim);
-                WriteDynamicVarPrim(inst, out_var, val_prim);
-
-                int loc_cnt = out_var->item_location.count();
-                STUResourceReference* loc_arr = out_var->item_location.list();
-                if (loc_cnt > 0 && loc_arr && !IsBadReadPtr(loc_arr, sizeof(STUResourceReference) * loc_cnt)) {
-                    uint64_t last_var = (uint64_t)loc_arr[loc_cnt - 1].resource_id;
-                    if ((last_var == 0x0D80000000000035ULL || last_var == 0x0D80000000000105ULL) && owner_ent) {
-                        RefillHeroWeaponAmmo(owner_ent);
-                    }
-                }
-            }
+            // 0x4E83BC01: STUStatescriptActionSendGameMessage (+0x88 is STU 0x6324DD9F, NOT STUConfigVarDynamic)
             if ((script_id == 0x05800000000001E9ULL || script_id == 0x058000000000017BULL ||
                  script_id == 0x05800000000001F0ULL || script_id == 0x058000000000022FULL) && owner_ent) {
                 RefillHeroWeaponAmmo(owner_ent);
@@ -5683,9 +5836,28 @@ static uint8_t __fastcall StatescriptAction_ExecuteAndContinue_hook(
                     }
                 }
             }
+        } else if (stu_hash == 0xBD6A3DFFu || stu_hash == 0x78184003u) {
+            // Stripped Targeting Action (Field 0x5FB6D29D out_var at +0x88, Field 0x28234534 STU 0x7B44C3C9* at +0x90)
+            auto* out_var = (STUConfigVarDynamic*)SafeReadVal<uintptr_t>((uintptr_t)stu_node + 0x88);
+            uintptr_t cfg_obj = SafeReadVal<uintptr_t>((uintptr_t)stu_node + 0x90);
+            uint32_t cfg_low32 = (cfg_obj && !IsBadReadPtr((const void*)cfg_obj, 0x20))
+                ? (uint32_t)SafeReadVal<uint64_t>(cfg_obj + 0x10) : 0;
+            uint32_t resolved = ResolveAimConeTargetForScript(owner_ent, script_id, cfg_low32);
+            if (out_var && !IsBadReadPtr(out_var, sizeof(STUConfigVarDynamic)) && resolved != 0) {
+                WriteDynamicVarPrim(inst, out_var, StatescriptPrimitive(StatescriptPrimitive_ENTITY, (__int64)resolved));
+            }
+            ShotDiagLogFmt("[TARGETING_ACTION (0x%08X)] script=0x%llX cfg=0x%X -> resolved=0x%X",
+                stu_hash, (unsigned long long)script_id, cfg_low32, resolved);
         }
     }
 
+    if (IsHeroOrSubEntScript(inst)) {
+        uint32_t saved_exec_flags = inst->execution_flags;
+        inst->execution_flags = (inst->execution_flags | 0x400008u) & ~0x1000u;
+        uint8_t ret = StatescriptAction_ExecuteAndContinue_orig(action_impl, sync_mgr, inst, stu_node);
+        inst->execution_flags = saved_exec_flags;
+        return ret;
+    }
     return StatescriptAction_ExecuteAndContinue_orig(action_impl, sync_mgr, inst, stu_node);
 }
 
@@ -5741,6 +5913,19 @@ static uint32_t __fastcall StatescriptState_StartState_hook(StatescriptState* st
     if (pre_stu_hash == 0x4CCED352u || pre_stu_hash == 0x0E3689F3u) {
         // Spawn the barrier/deployable sub-entity and populate m_outVar (0x0D80000000000026) BEFORE StartState_orig fires OnStart -> PlayScript (0xF9EF59A6)!
         SpawnStatescriptSubEntity(inst, (STUStatescriptBase*)pre_stu_state, pre_stu_hash);
+    } else if (pre_stu_hash == 0x1AB3B4D7u) {
+        // Stripped Targeting State (Field 0x5FB6D29D out_var at +0x100, Field 0x28234534 STU 0x7B44C3C9* at +0x108)
+        uint64_t pre_script_id = SafeReadVal<uint64_t>((uintptr_t)inst + 0x150);
+        auto* out_var = (STUConfigVarDynamic*)SafeReadVal<uintptr_t>((uintptr_t)pre_stu_state + 0x100);
+        uintptr_t cfg_obj = SafeReadVal<uintptr_t>((uintptr_t)pre_stu_state + 0x108);
+        uint32_t cfg_low32 = (cfg_obj && !IsBadReadPtr((const void*)cfg_obj, 0x20))
+            ? (uint32_t)SafeReadVal<uint64_t>(cfg_obj + 0x10) : 0;
+        uint32_t resolved = ResolveAimConeTargetForScript(owner_ent, pre_script_id, cfg_low32);
+        if (out_var && !IsBadReadPtr(out_var, sizeof(STUConfigVarDynamic)) && resolved != 0) {
+            WriteDynamicVarPrim(inst, out_var, StatescriptPrimitive(StatescriptPrimitive_ENTITY, (__int64)resolved));
+        }
+        ShotDiagLogFmt("[TARGETING_STATE (0x1AB3B4D7)] script=0x%llX cfg=0x%X -> resolved=0x%X",
+            (unsigned long long)pre_script_id, cfg_low32, resolved);
     } else if (pre_stu_hash == 0xC17B255Du || pre_stu_hash == 0x85C28A9Au || pre_stu_hash == 0x68CB1DF9u ||
                pre_stu_hash == 0x99D0CF4Au || pre_stu_hash == 0xCD396790u || pre_stu_hash == 0x65F158DAu ||
                pre_stu_hash == 0x7FB4BF64u) {
@@ -6227,6 +6412,24 @@ static void OnUniversalStateEntry(StatescriptSyncMgr* ss, StatescriptInstance* i
             ShotDiagLogFmt("[ZARYA_BEAM_START] script=0x%llX node=%d (95 DPS while held)",
                 (unsigned long long)script_id, node_idx);
         }
+    } else if (script_id == 0x05800000000002F3ULL && (node_idx == 49 || stu_hash == 0xE831BEF1u)) {
+        auto* tgt_cv = (STUConfigVar*)SafeReadVal<uintptr_t>((uintptr_t)stu_base + 0x118);
+        if (tgt_cv && !IsBadReadPtr(tgt_cv, sizeof(STUConfigVar))) {
+            StatescriptPrimitive tprim{};
+            tgt_cv->get_value(inst, &tprim);
+            if (tprim.type == StatescriptPrimitive_ENTITY && (uint32_t)tprim.value != 0) {
+                s_zen_harmony_target_entid = (uint32_t)tprim.value;
+            }
+        }
+        if (s_zen_harmony_target_entid == 0 && inst->rid_instance_varbag) {
+            s_zen_harmony_target_entid = (uint32_t)ReadVarBagInt32(inst->rid_instance_varbag, 0x0D80000000000646LL);
+        }
+        if (s_zen_harmony_target_entid == 0) {
+            s_zen_harmony_target_entid = ResolveAimConeTargetForScript(owner_ent, script_id, s_zen_harmony_cfg_low32);
+        }
+        s_zen_harmony_hot_active = (s_zen_harmony_target_entid != 0);
+        ShotDiagLogFmt("[ZEN_HARMONY_START (0xE831BEF1)] script=0x%llX node=%d target=0x%X (30 HP/s)",
+            (unsigned long long)script_id, node_idx, s_zen_harmony_target_entid);
     }
 
     // 5. Soldier: 76 Biotic Field (0x0580000000000257 node=6 WeaponVolley 0x860EE5FC)
@@ -6329,6 +6532,11 @@ static void OnUniversalStateExit(StatescriptSyncMgr* ss, StatescriptInstance* in
         if (s_zarya_beam_active) {
             s_zarya_beam_active = false;
             ShotDiagLogFmt("[ZARYA_BEAM_END] script=0x%llX node=%d", (unsigned long long)script_id, node_idx);
+        }
+    } else if (script_id == 0x05800000000002F3ULL && (node_idx == 49 || stu_hash == 0xE831BEF1u)) {
+        if (s_zen_harmony_hot_active) {
+            s_zen_harmony_hot_active = false;
+            ShotDiagLogFmt("[ZEN_HARMONY_END] script=0x%llX node=%d", (unsigned long long)script_id, node_idx);
         }
     }
 
@@ -6646,6 +6854,91 @@ static uint8_t __fastcall TraverseLink_hook(
         }
     }
 
+    return res;
+}
+
+// 13. +0xD74620 (StatescriptInstance_vt[+0x240]: GetSomethingFromSTUAITargetingComponent, called by STUConfigVar 0xCEF466A3)
+//     & +0x107EC60 (StatescriptInstance_vt[+0x250]: MoreAIStuff, called by STUConfigVar 0x40AD92BE):
+// Resolves target lock-on queries in offline mode when Component_3A (+0x3A) has no server target entries populated.
+typedef uint32_t* (__fastcall* get_ai_targeting_ent_fn)(
+    StatescriptInstance* inst,
+    uint32_t* out_entid_ptr,
+    uint32_t owner_entid,
+    uint32_t targeting_cfg_low32,
+    const uint32_t* default_entid_ptr);
+static get_ai_targeting_ent_fn GetSomethingFromSTUAITargetingComponent_orig = nullptr;
+static uint32_t* __fastcall GetSomethingFromSTUAITargetingComponent_hook(
+    StatescriptInstance* inst,
+    uint32_t* out_entid_ptr,
+    uint32_t owner_entid,
+    uint32_t targeting_cfg_low32,
+    const uint32_t* default_entid_ptr)
+{
+    uint32_t* ret = GetSomethingFromSTUAITargetingComponent_orig(
+        inst, out_entid_ptr, owner_entid, targeting_cfg_low32, default_entid_ptr);
+    if (out_entid_ptr && IsHeroOrSubEntScript(inst)) {
+        uint64_t script_id = SafeReadVal<uint64_t>((uintptr_t)inst + 0x150);
+        uint32_t orig_val = *out_entid_ptr;
+        if (orig_val == 0) {
+            EntityAdminBase* ea = GameEntityAdmin();
+            Entity* owner_ent = (ea && owner_entid != 0) ? ea->getEntById(owner_entid) : GetLocalHeroModelEnt();
+            if (!owner_ent) owner_ent = GetLocalHeroModelEnt();
+            uint32_t resolved = ResolveAimConeTargetForScript(owner_ent, script_id, targeting_cfg_low32);
+            if (resolved != 0) {
+                *out_entid_ptr = resolved;
+                if (script_id == 0x05800000000002F3ULL || targeting_cfg_low32 == s_zen_harmony_cfg_low32) {
+                    s_zen_harmony_target_entid = resolved;
+                }
+            }
+            static uint64_t s_last_240_log_ms = 0;
+            static uint32_t s_last_240_res = 0xFFFFFFFFu;
+            uint64_t now_ms = GetTickCount64();
+            if (resolved != s_last_240_res || (now_ms - s_last_240_log_ms) >= 500) {
+                s_last_240_log_ms = now_ms;
+                s_last_240_res = resolved;
+                ShotDiagLogFmt("[TARGETING_240 (0xCEF466A3)] script=0x%llX owner=0x%X cfg=0x%X orig=0x%X -> resolved=0x%X",
+                    (unsigned long long)script_id, owner_entid, targeting_cfg_low32, orig_val, resolved);
+            }
+        }
+    }
+    return ret;
+}
+
+typedef uint8_t(__fastcall* more_ai_stuff_fn)(
+    StatescriptInstance* inst,
+    const uint32_t* owner_entid_ptr,
+    const uint32_t* targeting_cfg_low32_ptr);
+static more_ai_stuff_fn MoreAIStuff_orig = nullptr;
+static uint8_t __fastcall MoreAIStuff_hook(
+    StatescriptInstance* inst,
+    const uint32_t* owner_entid_ptr,
+    const uint32_t* targeting_cfg_low32_ptr)
+{
+    uint8_t res = MoreAIStuff_orig(inst, owner_entid_ptr, targeting_cfg_low32_ptr);
+    if (res == 0 && IsHeroOrSubEntScript(inst)) {
+        uint64_t script_id = SafeReadVal<uint64_t>((uintptr_t)inst + 0x150);
+        uint32_t owner_entid = (owner_entid_ptr && !IsBadReadPtr(owner_entid_ptr, 4)) ? *owner_entid_ptr : 0;
+        uint32_t cfg_low32 = (targeting_cfg_low32_ptr && !IsBadReadPtr(targeting_cfg_low32_ptr, 4)) ? *targeting_cfg_low32_ptr : 0;
+        EntityAdminBase* ea = GameEntityAdmin();
+        Entity* owner_ent = (ea && owner_entid != 0) ? ea->getEntById(owner_entid) : GetLocalHeroModelEnt();
+        if (!owner_ent) owner_ent = GetLocalHeroModelEnt();
+        uint32_t resolved = ResolveAimConeTargetForScript(owner_ent, script_id, cfg_low32);
+        if (resolved != 0) {
+            res = 1;
+            if (script_id == 0x05800000000002F3ULL || cfg_low32 == s_zen_harmony_cfg_low32) {
+                s_zen_harmony_target_entid = resolved;
+            }
+        }
+        static uint64_t s_last_250_log_ms = 0;
+        static uint8_t s_last_250_res = 0xFF;
+        uint64_t now_ms = GetTickCount64();
+        if (res != s_last_250_res || (now_ms - s_last_250_log_ms) >= 500) {
+            s_last_250_log_ms = now_ms;
+            s_last_250_res = res;
+            ShotDiagLogFmt("[TARGETING_250 (0x40AD92BE)] script=0x%llX owner=0x%X cfg=0x%X -> res=%u (target=0x%X)",
+                (unsigned long long)script_id, owner_entid, cfg_low32, res, resolved);
+        }
+    }
     return res;
 }
 
@@ -8334,6 +8627,78 @@ static void AppendHeroEntityForensics(std::string& out, const char* label, Entit
         }
     }
     bool is_local_player = (label && strncmp(label, "LOCAL PLAYER", 12) == 0);
+    if (is_local_player && mdl_ent) {
+        if (ComponentBase* c3a = mdl_ent->getById(0x3A)) {
+            out.append(std::format("  - **Model `Component_3A` (AI/Ability Targeting, `0x{:X}`)**:\n    ", (unsigned long long)c3a));
+            for (int off = 0x18; off <= 0x198; off += 8) {
+                uint64_t v = SafeReadVal<uint64_t>((uintptr_t)c3a + off);
+                if (v) out.append(std::format("+0x{:03X}=0x{:X} ", off, v));
+            }
+            out += "\n";
+        }
+        if (auto* c23 = mdl_ent->getById<Component_23_Statescript>(0x23)) {
+            if (!IsBadReadPtr(c23, sizeof(Component_23_Statescript)) &&
+                c23->ss_inner.g3_arrWithIds.ptr && c23->ss_inner.g3_arrWithIds.num > 0 && c23->ss_inner.g3_arrWithIds.num <= 64) {
+                for (int i = 0; i < c23->ss_inner.g3_arrWithIds.num; ++i) {
+                    StatescriptInstance* sub = c23->ss_inner.g3_arrWithIds.ptr[i].instance;
+                    if (!sub || IsBadReadPtr(sub, sizeof(StatescriptInstance))) continue;
+                    uint64_t sid = SafeReadVal<uint64_t>((uintptr_t)sub + 0x150);
+                    if (sid != 0x058000000000018DULL && sid != 0x0580000000000176ULL && sid != 0x05800000000002F3ULL) continue;
+                    if (!sub->graph || IsBadReadPtr(sub->graph, sizeof(STUStatescriptGraph))) continue;
+                    int ncnt = sub->graph->m_nodes.count();
+                    STUStatescriptBase** narr = sub->graph->m_nodes.list();
+                    out.append(std::format("  - **Targeting Script `0x{:X}` (`nodes={}`, `exec_flags=0x{:X}`)**:\n",
+                        (unsigned long long)sid, ncnt, sub->execution_flags));
+                    if (ncnt > 0 && ncnt <= 128 && narr && !IsBadReadPtr(narr, sizeof(void*) * ncnt)) {
+                        for (int n = 0; n < ncnt; ++n) {
+                            STUStatescriptBase* nd = narr[n];
+                            if (!nd || IsBadReadPtr(nd, 0x80)) continue;
+                            STUInfo* ni = (nd->graph_node.base.vfptr && !IsBadReadPtr(nd->graph_node.base.vfptr, sizeof(STUBase_vt)))
+                                ? nd->graph_node.base.vfptr->GetSTUInfo() : nullptr;
+                            uint32_t nh = (ni && !IsBadReadPtr(ni, sizeof(STUInfo))) ? ni->name_hash : 0;
+                            uint32_t nsz = (ni && !IsBadReadPtr(ni, sizeof(STUInfo))) ? ni->instance_size : 0x110;
+                            if (nsz > 0x180) nsz = 0x180;
+                            out.append(std::format("    - `node[{}]`: STU `0x{:08X}` (`sz=0x{:X}`, `st={}`, `co={}`, `so={}`): ",
+                                n, nh, nsz, (int)nd->m_isState, (int)nd->m_clientOnly, (int)nd->m_serverOnly));
+                            for (int off = 0x70; off < (int)nsz; off += 8) {
+                                uint64_t qw = SafeReadVal<uint64_t>((uintptr_t)nd + off);
+                                if (!qw) continue;
+                                if ((qw & 0xFFFF000000000000ULL) == 0x0D60000000000000ULL ||
+                                    (qw & 0xFFFF000000000000ULL) == 0x0D80000000000000ULL) {
+                                    out.append(std::format("+0x{:02X}=res:0x{:X} ", off, qw));
+                                } else if (qw > 0x10000ULL && !IsBadReadPtr((const void*)qw, 0x28)) {
+                                    STUBase<>* ch = (STUBase<>*)qw;
+                                    STUInfo* ci = (ch->vfptr && !IsBadReadPtr(ch->vfptr, 8) && ch->vfptr->GetSTUInfo) ? ch->vfptr->GetSTUInfo() : nullptr;
+                                    uint32_t ch_hash = (ci && !IsBadReadPtr(ci, sizeof(STUInfo))) ? ci->name_hash : 0;
+                                    if (ch_hash != 0) {
+                                        out.append(std::format("+0x{:02X}=STU:0x{:08X}(", off, ch_hash));
+                                        if (ch_hash == 0xF8CC195Du) {
+                                            auto* cvd = (STUConfigVarDynamic*)qw;
+                                            int lcnt = cvd->item_location.count();
+                                            STUResourceReference* larr = cvd->item_location.list();
+                                            for (int lk = 0; lk < lcnt && lk < 3 && larr && !IsBadReadPtr(larr, sizeof(STUResourceReference) * lcnt); ++lk) {
+                                                out.append(std::format("0x{:X},", (unsigned long long)larr[lk].resource_id));
+                                            }
+                                        } else {
+                                            for (int co = 0x08; co <= 0x28; co += 8) {
+                                                uint64_t cqw = SafeReadVal<uint64_t>(qw + co);
+                                                if ((cqw & 0xFFFF000000000000ULL) == 0x0D60000000000000ULL ||
+                                                    (cqw & 0xFFFF000000000000ULL) == 0x0D80000000000000ULL) {
+                                                    out.append(std::format("+0x{:02X}:0x{:X},", co, cqw));
+                                                }
+                                            }
+                                        }
+                                        out += ") ";
+                                    }
+                                }
+                            }
+                            out += "\n";
+                        }
+                    }
+                }
+            }
+        }
+    }
     AppendVarBagSummary(out, "Model", mdl_ent, is_local_player);
 }
 
@@ -8654,6 +9019,10 @@ void __cdecl StartHook(void*) {
     MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xd6d270)));
     MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xf471f0), TraverseLink_hook, (PVOID*)&TraverseLink_orig));
     MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xf471f0)));
+    MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xd74620), GetSomethingFromSTUAITargetingComponent_hook, (PVOID*)&GetSomethingFromSTUAITargetingComponent_orig));
+    MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xd74620)));
+    MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0x107ec60), MoreAIStuff_hook, (PVOID*)&MoreAIStuff_orig));
+    MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0x107ec60)));
     statescript_logger::s_universal_state_entry_cb = OnUniversalStateEntry;
     statescript_logger::s_universal_state_exit_cb = OnUniversalStateExit;
     printf("hooked Component_1 transforms, weapon hardpoint fixes, shot/projectile impact, healthbar & Horizon 1 Stage H1.2+H1.3 hooks\n");

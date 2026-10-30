@@ -209,6 +209,9 @@ void player_spawner::modify_ent(spawn_info info, Entity* ent) {
 	if (filter_bits) {
 		if (info.set_filterbits_controller) {
 			filter_bits->set_filterbits_spectator();
+		} else if (ent == model_ent && !controller_info.set_localent && !info.set_localent) {
+			filter_bits->pre_filter_bits |= 0xC00001;
+			filter_bits->filter_bits |= 0xC00001;
 		} else {
 			filter_bits->pre_filter_bits |= 0x800000;
 			filter_bits->filter_bits |= 0x800000;
