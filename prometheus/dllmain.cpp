@@ -3630,6 +3630,10 @@ static float    s_active_hot_hp_per_100ms = 0.0f;
 static uint64_t s_active_hot_script_id    = 0;
 static bool     s_bastion_repair_active   = false;
 static uint64_t s_bastion_last_tick_ms    = 0;
+static bool     s_winston_beam_active     = false;
+static uint64_t s_winston_beam_last_ms    = 0;
+static bool     s_zarya_beam_active       = false;
+static uint64_t s_zarya_beam_last_ms      = 0;
 static uint64_t s_biotic_field_end_ms     = 0;
 static uint64_t s_biotic_field_last_ms    = 0;
 static uint32_t s_biotic_field_ent_id     = 0;
@@ -4323,6 +4327,8 @@ static void __fastcall TickProjectileManager_hook(void* proj_sys) {
             s_active_hot_end_ms = 0;
             s_active_hot_hp_per_100ms = 0.0f;
             s_bastion_repair_active = false;
+            s_winston_beam_active = false;
+            s_zarya_beam_active = false;
             s_biotic_field_end_ms = 0;
             s_biotic_field_ent_id = 0;
             s_active_impulse_end_ms = 0;
@@ -4367,6 +4373,134 @@ static void __fastcall TickProjectileManager_hook(void* proj_sys) {
         if (s_bastion_repair_active && (now_ms - s_bastion_last_tick_ms) >= 100) {
             s_bastion_last_tick_ms = now_ms;
             ApplyHeroSelfHeal(local_hero, 7.5f, 0x0580000000000153ULL, "BASTION_REPAIR_HOT");
+        }
+
+        // 1c-2. Winston Tesla Cannon (0x05800000000000FE: 60 DPS = 6.0 dmg / 100ms in 8m frontal cone)
+        //       & Zarya Particle Cannon (0x0580000000000241: 95 DPS = 9.5 dmg / 100ms along 15m beam ray)
+        if ((s_winston_beam_active || s_zarya_beam_active) && (GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0) {
+            s_winston_beam_active = false;
+            s_zarya_beam_active = false;
+        }
+        if (s_winston_beam_active && game_ea && (now_ms - s_winston_beam_last_ms) >= 100) {
+            s_winston_beam_last_ms = now_ms;
+            Vector4 fwd{ 0.0f, 0.0f, 1.0f, 0.0f };
+            if (comp15 && !IsBadReadPtr(comp15, sizeof(Component_15_STUCharacterMoverComponent))) {
+                const Vector4& q = comp15->movement_state_1.rotation_quaternion;
+                float pitch = -comp15->movement_state_1.y_lookdir;
+                float cp = cosf(pitch), sp = sinf(pitch);
+                float hx = 2.0f * (q.X * q.Z + q.W * q.Y);
+                float hz = 1.0f - 2.0f * (q.X * q.X + q.Y * q.Y);
+                float hlen = sqrtf(hx * hx + hz * hz);
+                if (hlen > 1e-4f) { hx /= hlen; hz /= hlen; }
+                fwd.X = hx * cp;
+                fwd.Y = sp;
+                fwd.Z = hz * cp;
+            }
+            Vector4 eye_pos = hero_pos;
+            eye_pos.Y += 1.4f;
+            for (Entity* ent : *game_ea) {
+                if (!ent || ent == local_hero || !ent->hasComponent(0x15) || !ent->hasComponent(0x28)) continue;
+                auto* c10 = ent->getById<Component_10_FilterBits>(0x10);
+                if (owner_c10 && c10 && (owner_c10->filter_bits & 0x3C0000ULL) == (c10->filter_bits & 0x3C0000ULL)) continue;
+                auto* c1 = ent->getById<Component_1_SceneRendering>(1);
+                auto* c28 = ent->getById<Component_28_STUHealthComponent>(0x28);
+                if (!c1 || IsBadReadPtr(c1, sizeof(Component_1_SceneRendering)) || !c28 || c28->CalcTotalCurrentHealth() <= 0.0f) continue;
+                if ((*(uint32_t*)((uintptr_t)c1 + 0x1B8) & 0x10000u) == 0) continue;
+
+                Vector4 tgt_center = c1->position;
+                tgt_center.Y += 1.0f;
+                Vector4 d = Sub3(tgt_center, eye_pos);
+                float dist = sqrtf(Dot3(d, d));
+                if (dist > 8.0f) continue;
+                float cos_ang = (dist > 0.1f) ? (Dot3(d, fwd) / dist) : 1.0f;
+                if (dist > 2.0f && cos_ang < 0.45f) continue; // ~63 deg half-angle frontal cone
+
+                constexpr float kWinstonTickDmg = 6.0f; // 60 DPS at 10 Hz
+                float new_hp = ApplyDamageToHealthComponent(c28, kWinstonTickDmg);
+                if (new_hp <= 0.0f) {
+                    *(uint32_t*)((uintptr_t)c1 + 0x1B8) &= ~0x10000u;
+                }
+                *(uint32_t*)((uintptr_t)c28 + 0x14) = 1;
+                s_last_hit_dummy_entid = ent->entity_id;
+                s_last_hit_dummy_ms = now_ms;
+                SyncEntityHealthVarBag(ent);
+                {
+                    std::lock_guard<std::mutex> hit_lock(s_pellet_hit_mutex);
+                    if (s_pending_dmg_pkt_count < 32) {
+                        uint8_t pkt_flags = (uint8_t)(new_hp <= 0.0f ? 2 : 0);
+                        s_pending_dmg_pkts[s_pending_dmg_pkt_count++] = PendingDamagePacket{ ent->entity_id, 6, pkt_flags, true };
+                    }
+                }
+                ShotDiagLogFmt("[WINSTON_TESLA_TICK] hit=0x%X dist=%.2fm -%.1f -> HP %.1f",
+                    ent->entity_id, dist, kWinstonTickDmg, new_hp);
+            }
+        }
+        if (s_zarya_beam_active && game_ea && (now_ms - s_zarya_beam_last_ms) >= 100) {
+            s_zarya_beam_last_ms = now_ms;
+            Vector4 aim_dir{ 0.0f, 0.0f, 1.0f, 0.0f };
+            if (comp15 && !IsBadReadPtr(comp15, sizeof(Component_15_STUCharacterMoverComponent))) {
+                const Vector4& q = comp15->movement_state_1.rotation_quaternion;
+                float pitch = -comp15->movement_state_1.y_lookdir;
+                float cp = cosf(pitch), sp = sinf(pitch);
+                float hx = 2.0f * (q.X * q.Z + q.W * q.Y);
+                float hz = 1.0f - 2.0f * (q.X * q.X + q.Y * q.Y);
+                float hlen = sqrtf(hx * hx + hz * hz);
+                if (hlen > 1e-4f) { hx /= hlen; hz /= hlen; }
+                aim_dir.X = hx * cp;
+                aim_dir.Y = sp;
+                aim_dir.Z = hz * cp;
+            }
+            Vector4 p1 = hero_pos;
+            p1.Y += 1.45f;
+            Vector4 q1 = MulAdd3(p1, aim_dir, 15.5f);
+
+            Entity* best_ent = nullptr;
+            Component_1_SceneRendering* best_c1 = nullptr;
+            Component_28_STUHealthComponent* best_c28 = nullptr;
+            float best_s = 2.0f;
+
+            for (Entity* ent : *game_ea) {
+                if (!ent || ent == local_hero || !ent->hasComponent(0x15) || !ent->hasComponent(0x28)) continue;
+                auto* c10 = ent->getById<Component_10_FilterBits>(0x10);
+                if (owner_c10 && c10 && (owner_c10->filter_bits & 0x3C0000ULL) == (c10->filter_bits & 0x3C0000ULL)) continue;
+                auto* c1 = ent->getById<Component_1_SceneRendering>(1);
+                auto* c28 = ent->getById<Component_28_STUHealthComponent>(0x28);
+                if (!c1 || IsBadReadPtr(c1, sizeof(Component_1_SceneRendering)) || !c28 || c28->CalcTotalCurrentHealth() <= 0.0f) continue;
+                if ((*(uint32_t*)((uintptr_t)c1 + 0x1B8) & 0x10000u) == 0) continue;
+
+                Vector4 p2 = c1->position;
+                p2.Y += 0.3f;
+                Vector4 q2 = c1->position;
+                q2.Y += 1.9f;
+                float s = 0.0f, t = 0.0f;
+                float d2 = ClosestSegSeg(p1, q1, p2, q2, s, t);
+                if (d2 <= (0.95f * 0.95f) && s < best_s) {
+                    best_s = s;
+                    best_ent = ent;
+                    best_c1 = c1;
+                    best_c28 = c28;
+                }
+            }
+            if (best_ent && best_c1 && best_c28) {
+                constexpr float kZaryaTickDmg = 9.5f; // 95 DPS at 10 Hz
+                float new_hp = ApplyDamageToHealthComponent(best_c28, kZaryaTickDmg);
+                if (new_hp <= 0.0f) {
+                    *(uint32_t*)((uintptr_t)best_c1 + 0x1B8) &= ~0x10000u;
+                }
+                *(uint32_t*)((uintptr_t)best_c28 + 0x14) = 1;
+                s_last_hit_dummy_entid = best_ent->entity_id;
+                s_last_hit_dummy_ms = now_ms;
+                SyncEntityHealthVarBag(best_ent);
+                {
+                    std::lock_guard<std::mutex> hit_lock(s_pellet_hit_mutex);
+                    if (s_pending_dmg_pkt_count < 32) {
+                        uint8_t pkt_flags = (uint8_t)(new_hp <= 0.0f ? 2 : 0);
+                        s_pending_dmg_pkts[s_pending_dmg_pkt_count++] = PendingDamagePacket{ best_ent->entity_id, 10, pkt_flags, true };
+                    }
+                }
+                ShotDiagLogFmt("[ZARYA_BEAM_TICK] hit=0x%X dist=%.2fm -%.1f -> HP %.1f",
+                    best_ent->entity_id, best_s * 15.5f, kZaryaTickDmg, new_hp);
+            }
         }
 
         // 1d. Soldier: 76 Biotic Field (0x0580000000000257 / 0x0580000000000258): +4.0 HP per 100ms (40 HP/s) for 5s within 5.5m
@@ -4467,7 +4601,7 @@ static void __fastcall TickProjectileManager_hook(void* proj_sys) {
                     } else if (s_active_dash_sweep_script_id == 0x058000000000007DULL || s_active_dash_sweep_script_id == 0x05800000000000BEULL) {
                         ArmEnemyKnockback(ent, push_dir, 16.0f, 5.5f, 550);
                     } else if (s_active_dash_sweep_script_id == 0x0580000000000109ULL || s_active_dash_sweep_script_id == 0x058000000000010AULL ||
-                               s_active_dash_sweep_script_id == 0x0580000000000038ULL || s_active_dash_sweep_script_id == 0x05800000000000FEULL) {
+                               s_active_dash_sweep_script_id == 0x0580000000000038ULL) {
                         ArmEnemyKnockback(ent, d, 8.0f, 3.5f, 350);
                     }
                     ShotDiagLogFmt("[DASH_SWEEP_DMG] script=0x%llX hit=0x%X dist=%.2fm -%.1f -> HP %.1f",
@@ -5659,7 +5793,7 @@ static uint32_t __fastcall StatescriptState_StartState_hook(StatescriptState* st
                     // Genji Swift Strike (0x05800000000001DB): 50 damage sweep along dash trajectory
                     ArmDashSweepDamage(script_id, 50.0f, 4.0f, 600);
                 } else if (script_id == 0x0580000000000109ULL || script_id == 0x058000000000010AULL ||
-                           script_id == 0x0580000000000038ULL || script_id == 0x05800000000000FEULL) {
+                           script_id == 0x0580000000000038ULL) {
                     // Winston Jump Pack (0x0580000000000109): 50 AoE leap/land damage within 5.5m
                     ArmDashSweepDamage(script_id, 50.0f, 5.5f, 950);
                 } else if (script_id == 0x058000000000047EULL || script_id == 0x058000000000026AULL || script_id == 0x0580000000000B2FULL) {
@@ -5690,7 +5824,19 @@ static uint32_t __fastcall StatescriptState_StartState_hook(StatescriptState* st
                 bool is_self_heal_script = (script_id == 0x0580000000000240ULL ||
                                             script_id == 0x05800000000005FEULL || script_id == 0x0580000000000623ULL ||
                                             script_id == 0x0580000000000153ULL || script_id == 0x058000000000002BULL);
-                if (is_self_heal_script) {
+                // Check if this 0x619D9E95 node is a sustained Primary-Fire beam state:
+                //   - Winston Tesla Cannon:  0x05800000000000FE node[44] (whereas node[81]/node[82] are Primal Rage melee swings)
+                //   - Zarya Particle Cannon: 0x0580000000000241 node[29]
+                bool is_sustained_beam = (script_id == 0x0580000000000241ULL ||
+                                          (script_id == 0x05800000000000FEULL && stu_base->idx_in_nodes == 44));
+                if (is_sustained_beam) {
+                    if (script_id == 0x05800000000000FEULL) {
+                        s_winston_beam_active = true;
+                    } else if (script_id == 0x0580000000000241ULL) {
+                        s_zarya_beam_active = true;
+                    }
+                    SafeTraverseOutputPlug(inst->ss_inner, inst, (STUStatescriptBase*)stu_state, on_hit_plug, 0x138);
+                } else if (is_self_heal_script) {
                     if (script_id == 0x0580000000000240ULL) {
                         ArmHeroHealOverTime(script_id, 300.0f, 1000, "ROADHOG_BREATHER_HOT");
                     } else if (script_id == 0x05800000000005FEULL || script_id == 0x0580000000000623ULL) {
@@ -5714,7 +5860,8 @@ static uint32_t __fastcall StatescriptState_StartState_hook(StatescriptState* st
                     if (range <= 0.2f || range > 25.0f) {
                         if (script_id == 0x0580000000000776ULL) range = 8.0f; // Lucio Soundwave
                         else if (script_id == 0x0580000000000052ULL || script_id == 0x0580000000000044ULL ||
-                                 script_id == 0x0580000000000109ULL || script_id == 0x058000000000003BULL) range = 5.0f;
+                                 script_id == 0x0580000000000109ULL || script_id == 0x058000000000003BULL ||
+                                 script_id == 0x05800000000000FEULL) range = 5.0f;
                         else range = 3.5f;
                     }
 
@@ -5735,9 +5882,9 @@ static uint32_t __fastcall StatescriptState_StartState_hook(StatescriptState* st
                         else if (script_id == 0x05800000000001DBULL || script_id == 0x05800000000001DCULL ||
                                  script_id == 0x0580000000000045ULL || script_id == 0x0580000000000157ULL ||
                                  script_id == 0x0580000000000317ULL || script_id == 0x0580000000000038ULL ||
-                                 script_id == 0x05800000000000FEULL || script_id == 0x0580000000000109ULL ||
+                                 script_id == 0x0580000000000109ULL ||
                                  script_id == 0x058000000000010AULL) dmg = 50.0f; // Swift Strike / Jump Pack
-                        else if (script_id == 0x058000000000003BULL) dmg = 40.0f; // Winston Primal Rage
+                        else if (script_id == 0x058000000000003BULL || script_id == 0x05800000000000FEULL) dmg = 40.0f; // Winston Primal Rage (node[81]/node[82] in 0xFE)
                         else if (script_id == 0x058000000000017AULL || script_id == 0x058000000000047EULL ||
                                  script_id == 0x058000000000026AULL || script_id == 0x0580000000000B2FULL ||
                                  script_id == 0x0580000000000776ULL) dmg = 25.0f; // Flashbang / D.Va Boosters / Lucio Soundwave
@@ -5816,7 +5963,7 @@ static uint32_t __fastcall StatescriptState_StartState_hook(StatescriptState* st
                             Vector4 push_dir{ d.X + fwd.X * 1.5f, 0.0f, d.Z + fwd.Z * 1.5f, 0.0f };
                             if (script_id == 0x0580000000000776ULL) {
                                 ArmEnemyKnockback(ent, push_dir, 15.0f, 5.0f, 500); // Lucio Soundwave
-                            } else if (script_id == 0x058000000000003BULL) {
+                            } else if (script_id == 0x058000000000003BULL || script_id == 0x05800000000000FEULL) {
                                 ArmEnemyKnockback(ent, push_dir, 14.0f, 5.5f, 500); // Winston Primal Rage
                             } else if (script_id == 0x058000000000047EULL || script_id == 0x058000000000026AULL || script_id == 0x0580000000000B2FULL) {
                                 ArmEnemyKnockback(ent, push_dir, 12.0f, 4.5f, 450); // D.Va Boosters
@@ -5830,8 +5977,10 @@ static uint32_t __fastcall StatescriptState_StartState_hook(StatescriptState* st
                         }
                     }
                 }
-                auto sched_finish = (schedule_finish_state_fn)(globals::gameBase + 0xF4A9C0);
-                sched_finish((uintptr_t)state, 1, 120);
+                if (!is_sustained_beam) {
+                    auto sched_finish = (schedule_finish_state_fn)(globals::gameBase + 0xF4A9C0);
+                    sched_finish((uintptr_t)state, 1, 120);
+                }
             } else if (stu_hash == 0xD78490D1u && is_local && owner_ent) {
                 // 0xD78490D1: Impulse / Knockback State (sz = 0x128)
                 auto* comp15 = owner_ent->getById<Component_15_STUCharacterMoverComponent>(0x15);
@@ -6045,7 +6194,7 @@ static void OnUniversalStateEntry(StatescriptSyncMgr* ss, StatescriptInstance* i
             script_id == 0x0580000000000045ULL || script_id == 0x0580000000000157ULL || script_id == 0x0580000000000317ULL) {
             ArmDashSweepDamage(script_id, 50.0f, 4.0f, 650);
         } else if (script_id == 0x0580000000000109ULL || script_id == 0x058000000000010AULL ||
-                   script_id == 0x0580000000000038ULL || script_id == 0x05800000000000FEULL) {
+                   script_id == 0x0580000000000038ULL) {
             ArmDashSweepDamage(script_id, 50.0f, 5.5f, 950);
         } else if (script_id == 0x058000000000047EULL || script_id == 0x058000000000026AULL || script_id == 0x0580000000000B2FULL) {
             if (node_idx == 15 || s_active_dash_sweep_script_id != script_id || GetTickCount64() >= s_active_dash_sweep_end_ms) {
@@ -6061,6 +6210,21 @@ static void OnUniversalStateEntry(StatescriptSyncMgr* ss, StatescriptInstance* i
         if (!s_bastion_repair_active) {
             s_bastion_repair_active = true;
             ShotDiagLogFmt("[BASTION_REPAIR_START] script=0x%llX node=%d (75 HP/s while held)",
+                (unsigned long long)script_id, node_idx);
+        }
+    }
+
+    // 4b. Winston Tesla Cannon (0x05800000000000FE node=30/43/44) & Zarya Particle Cannon (0x0580000000000241 node=84/28/29) sustained beam DoT
+    if (script_id == 0x05800000000000FEULL && (node_idx == 30 || node_idx == 43 || node_idx == 44)) {
+        if (!s_winston_beam_active) {
+            s_winston_beam_active = true;
+            ShotDiagLogFmt("[WINSTON_TESLA_START] script=0x%llX node=%d (60 DPS while held)",
+                (unsigned long long)script_id, node_idx);
+        }
+    } else if (script_id == 0x0580000000000241ULL && (node_idx == 84 || node_idx == 28 || node_idx == 29)) {
+        if (!s_zarya_beam_active) {
+            s_zarya_beam_active = true;
+            ShotDiagLogFmt("[ZARYA_BEAM_START] script=0x%llX node=%d (95 DPS while held)",
                 (unsigned long long)script_id, node_idx);
         }
     }
@@ -6152,6 +6316,19 @@ static void OnUniversalStateExit(StatescriptSyncMgr* ss, StatescriptInstance* in
         if (s_bastion_repair_active) {
             s_bastion_repair_active = false;
             ShotDiagLogFmt("[BASTION_REPAIR_END] script=0x%llX node=%d", (unsigned long long)script_id, node_idx);
+        }
+    }
+
+    // Stop Winston Tesla Cannon & Zarya Particle Cannon sustained beam DoT when beam states exit
+    if (script_id == 0x05800000000000FEULL && (node_idx == 30 || node_idx == 43 || node_idx == 44)) {
+        if (s_winston_beam_active) {
+            s_winston_beam_active = false;
+            ShotDiagLogFmt("[WINSTON_TESLA_END] script=0x%llX node=%d", (unsigned long long)script_id, node_idx);
+        }
+    } else if (script_id == 0x0580000000000241ULL && (node_idx == 84 || node_idx == 28 || node_idx == 29)) {
+        if (s_zarya_beam_active) {
+            s_zarya_beam_active = false;
+            ShotDiagLogFmt("[ZARYA_BEAM_END] script=0x%llX node=%d", (unsigned long long)script_id, node_idx);
         }
     }
 
