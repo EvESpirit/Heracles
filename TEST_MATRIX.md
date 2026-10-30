@@ -44,7 +44,7 @@
 | Mei | Primary Fire (Left Click) | Pass |
 | Mei | Secondary Fire (Right Click) | Pass |
 | Mei | Cryo-Freeze | Pass |
-| Mei | Ice Wall | Partial Pass (the exact middle block of the ice wall is seemingly missing - the 4 other ones are there and correctly sized) |
+| Mei | Ice Wall | Pass |
 | Mei | Ultimate | Fail (Snowflake despawns on contact with level geometry and never triggers the freezing field) |
 | Torbjörn | Primary Fire (Left Click) | Partial Fail (both weapons are used at once and cannot be switched between, causing left click to alternate between firing the gun and swinging the hammer) |
 | Torbjörn | Secondary Fire (Right Click) | Pass |

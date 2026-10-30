@@ -3118,6 +3118,9 @@ void __fastcall UpdateHealthbarVisibility_hook(uintptr_t sys46) {
                     *(int32_t*)(pkt + 0x70) = 62500; // ~1000s duration_ticks so cur_tick + 62500 >= prev_ts at +0xCA79AF
                     *(uint8_t*)(pkt + 0x74) = local_pkts[i].flags;
                     on_net_dmg(sys46, 0, pkt);
+                    if (Entity* hit_target_ent = ea->getEntById(local_pkts[i].target_entid)) {
+                        SyncEntityHealthVarBag(hit_target_ent);
+                    }
                     // Phase 7 Stage 3B: Accumulate LocalPlayer Ultimate Charge via native Component_23 VarBag pipeline
                     if (local_pkts[i].allow_ult_charge) {
                         AccumulateAttackerUltimateCharge(ea, local_mdl_id, local_pkts[i].damage_int);
@@ -3888,6 +3891,30 @@ static void SeedBarrierVarBag(StatescriptVar_VarBag* vb, float sub_hp) {
     vb->SetVar({ StatescriptVar_ENTITY_VARBAG, 0x0D80000000000319 }, p_one);
     vb->SetVar({ 0x0D8000000000031A }, p_one);
     vb->SetVar({ StatescriptVar_ENTITY_VARBAG, 0x0D8000000000031A }, p_one);
+    // Mei Ice Wall Pillar (0x0580000000000636) script parameters normally copied from 0x0580000000000622 by 0xF9EF59A6 (+0xD79C90)
+    StatescriptPrimitive p_wall_dur(4.40f);
+    StatescriptPrimitive p_wall_rise_dur(0.20f);
+    StatescriptPrimitive p_wall_spd(3.75f);
+    StatescriptPrimitive p_wall_h(1.50f);
+    StatescriptPrimitive p_wall_t(0.50f);
+    vb->SetVar({ 0x0D8000000000048D }, p_wall_dur);
+    vb->SetVar({ StatescriptVar_ENTITY_VARBAG, 0x0D8000000000048D }, p_wall_dur);
+    vb->SetVar({ 0x0D800000000000D7 }, p_wall_dur);
+    vb->SetVar({ StatescriptVar_ENTITY_VARBAG, 0x0D800000000000D7 }, p_wall_dur);
+    vb->SetVar({ 0x0D80000000000399 }, p_wall_rise_dur);
+    vb->SetVar({ StatescriptVar_ENTITY_VARBAG, 0x0D80000000000399 }, p_wall_rise_dur);
+    vb->SetVar({ 0x0D80000000001894 }, p_wall_spd);
+    vb->SetVar({ StatescriptVar_ENTITY_VARBAG, 0x0D80000000001894 }, p_wall_spd);
+    vb->SetVar({ 0x0D80000000001955 }, p_byte0);
+    vb->SetVar({ StatescriptVar_ENTITY_VARBAG, 0x0D80000000001955 }, p_byte0);
+    vb->SetVar({ 0x0D80000000001882 }, p_wall_h);
+    vb->SetVar({ StatescriptVar_ENTITY_VARBAG, 0x0D80000000001882 }, p_wall_h);
+    vb->SetVar({ 0x0D800000000018B7 }, p_wall_h);
+    vb->SetVar({ StatescriptVar_ENTITY_VARBAG, 0x0D800000000018B7 }, p_wall_h);
+    vb->SetVar({ 0x0D800000000018B8 }, p_wall_t);
+    vb->SetVar({ StatescriptVar_ENTITY_VARBAG, 0x0D800000000018B8 }, p_wall_t);
+    vb->SetVar({ 0x0D8000000000029E }, p_wall_t);
+    vb->SetVar({ StatescriptVar_ENTITY_VARBAG, 0x0D8000000000029E }, p_wall_t);
 }
 
 static void SetSyncMgrClientAuthoritative(StatescriptSyncMgr* mgr, float sub_hp = 600.0f, bool* io_entries_traversed = nullptr, bool seed_bags = false) {
@@ -3895,12 +3922,22 @@ static void SetSyncMgrClientAuthoritative(StatescriptSyncMgr* mgr, float sub_hp 
     __try {
         *(uint8_t*)((uintptr_t)mgr + 0x4D2) = 0; // is_aim_ent = 0 (sub-entities have aim_varbag == NULL at +0xEA0)
         *(uint8_t*)((uintptr_t)mgr + 0x4D3) = 1; // is_aim_ent_assigned = 1 (prevents +0xD13700 from setting +0x4D2 = 1)
+        *(uint8_t*)((uintptr_t)mgr + 0x374) = 1; // flag_374 = 1 (server-authoritative instance flag for loadScript & TickSyncMgrInner)
         *(uint8_t*)((uintptr_t)mgr + 0x375) = 1;
+        if (mgr->field_360 <= 0) mgr->field_360 = 16; // 16ms per tick (62.5Hz) for cf_timestamp (+0x2D0) wait timers
+        mgr->ontick_updates_enabled = 1;              // +0x368 = 1 so TickInner (+0xF44EF0) runs +0xF45680 state updates
+        if (mgr->increasing_counter1 <= 0) {
+            mgr->increasing_counter1 = 1;
+            mgr->cf_timestamp = mgr->field_360;
+            mgr->increasing_counter3 = (mgr->field_360 * 2) - 1;
+        }
         uintptr_t vt = SafeReadVal<uintptr_t>((uintptr_t)mgr);
         if (vt) {
             auto fn220 = SafeReadVal<void(__fastcall*)(StatescriptSyncMgr*, uint8_t)>(vt + 0x220);
             if (fn220) fn220(mgr, 1);
         }
+        bool do_traverse = (io_entries_traversed && !*io_entries_traversed);
+        bool any_traversed = false;
         if (mgr->g3_arrWithIds.ptr && mgr->g3_arrWithIds.num > 0 && mgr->g3_arrWithIds.num < 64) {
             for (int k = 0; k < mgr->g3_arrWithIds.num; ++k) {
                 StatescriptInstance* sub_ss = mgr->g3_arrWithIds.ptr[k].instance;
@@ -3909,14 +3946,27 @@ static void SetSyncMgrClientAuthoritative(StatescriptSyncMgr* mgr, float sub_hp 
                     if (seed_bags) {
                         SeedBarrierVarBag(sub_ss->rid_instance_varbag, sub_hp);
                     }
-                    if (io_entries_traversed && !*io_entries_traversed && sub_ss->graph && !IsBadReadPtr(sub_ss->graph, sizeof(STUStatescriptGraph))) {
-                        *io_entries_traversed = true;
+                    if (sub_ss->state_impl_list.ptr && sub_ss->state_impl_list.num > 0 && sub_ss->state_impl_list.num < 128) {
+                        for (int si = 0; si < sub_ss->state_impl_list.num; ++si) {
+                            StatescriptState* st = sub_ss->state_impl_list.ptr[si];
+                            if (st && !IsBadReadPtr(st, sizeof(StatescriptState)) && st->field_80 == 0 && (st->state_flags & 0x20) != 0) {
+                                st->state_flags &= ~0x20;
+                            }
+                        }
+                    }
+                    if (do_traverse && sub_ss->graph && !IsBadReadPtr(sub_ss->graph, sizeof(STUStatescriptGraph))) {
+                        any_traversed = true;
                         SeedBarrierVarBag(sub_ss->rid_instance_varbag, sub_hp);
+                        uint64_t sub_script_id = SafeReadVal<uint64_t>((uintptr_t)sub_ss + 0x150);
                         int ncnt = sub_ss->graph->m_nodes.count();
                         STUStatescriptBase** nlist = sub_ss->graph->m_nodes.list();
                         if (nlist && ncnt > 0 && ncnt < 256) {
-                            const uint32_t entry_passes[3] = { 0xBE49A4C2u, 0x2F937AE3u, 0x46C48944u };
+                            const uint32_t entry_passes[3] = { 0xBE49A4C2u, 0x46C48944u, 0x2F937AE3u };
                             for (uint32_t target_hash : entry_passes) {
+                                // In Mei Ice Wall Pillar (0x0580000000000636), 0xBE49A4C2 (Entry:GameMsg) is the shatter/break message handler,
+                                // while 0x46C48944 (STUStatescriptEntryPlayScript -> populates 0x399=4.40f & 0x1894=3.75f) and
+                                // 0x2F937AE3 (Entry:OnEntityCreated -> node[15] -> node[19] 0x7FB4BF64 STUStatescriptStateAnim) are the start entrypoints!
+                                if (sub_script_id == 0x0580000000000636ULL && target_hash == 0xBE49A4C2u) continue;
                                 for (int ni = 0; ni < ncnt; ++ni) {
                                     STUStatescriptBase* nd = nlist[ni];
                                     if (!nd || IsBadReadPtr(nd, 0x80)) continue;
@@ -3924,15 +3974,52 @@ static void SetSyncMgrClientAuthoritative(StatescriptSyncMgr* mgr, float sub_hp 
                                         ? nd->graph_node.base.vfptr->GetSTUInfo() : nullptr;
                                     uint32_t nhash = (info && !IsBadReadPtr(info, sizeof(STUInfo))) ? info->name_hash : 0;
                                     if (nhash == target_hash) {
-                                        auto* out_plug = SafeReadVal<STUStatescriptOutputPlug*>((uintptr_t)nd + 0x78);
-                                        if (out_plug) SafeTraverseOutputPlug(mgr, sub_ss, nd, out_plug, 0x78);
+                                        if (nhash == 0x46C48944u) {
+                                            // Populate STUStatescriptEntryPlayScript (+0x80 STUBullshitListFull m_params, +0x90 m_out_Sender)
+                                            if (Entity* local_hero = GetLocalHeroModelEnt()) {
+                                                auto* out_sender = SafeReadVal<STUConfigVarDynamic*>((uintptr_t)nd + 0x90);
+                                                if (out_sender) {
+                                                    WriteDynamicVarPrim(sub_ss, out_sender, StatescriptPrimitive(StatescriptPrimitive_ENTITY, (__int64)local_hero->entity_id));
+                                                }
+                                            }
+                                            auto* p_bs = (STUBullshitListFull<uintptr_t>*)((uintptr_t)nd + 0x80);
+                                            int p_cnt = p_bs->count();
+                                            uintptr_t* p_arr = p_bs->list();
+                                            if (p_arr && p_cnt > 0 && p_cnt < 16 && !IsBadReadPtr((const void*)p_arr, (size_t)p_cnt * sizeof(uintptr_t))) {
+                                                for (int pi = 0; pi < p_cnt; ++pi) {
+                                                    uintptr_t pelem = p_arr[pi];
+                                                    if (!pelem || IsBadReadPtr((const void*)pelem, 0x20)) continue;
+                                                    uint64_t param_id = SafeReadVal<uint64_t>(pelem + 0x10);
+                                                    auto* out_var = SafeReadVal<STUConfigVarDynamic*>(pelem + 0x18);
+                                                    if (!out_var) continue;
+                                                    if (param_id == 0x0A40000000000327ULL) {
+                                                        WriteDynamicVarPrim(sub_ss, out_var, StatescriptPrimitive(StatescriptPrimitive_BYTE, 0));
+                                                    } else {
+                                                        float pval = 4.40f;
+                                                        if (param_id == 0x0A4000000000030EULL) pval = 0.20f;
+                                                        else if (param_id == 0x0A40000000000322ULL) pval = 3.75f;
+                                                        WriteDynamicVarPrim(sub_ss, out_var, StatescriptPrimitive(pval));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        sub_ss->ExecuteNode(ni);
                                     }
                                 }
+                            }
+                            if (sub_script_id == 0x0580000000000636ULL && ncnt > 22) {
+                                // Directly start node[19] (0x7FB4BF64 STUStatescriptStateAnim reading 0x399=4.40f & 0x1894=3.75f)
+                                // and node[22] (0x4698E4B6 setting 0x18C5 = 1) on spawn so the pillar extends immediately!
+                                sub_ss->ExecuteNode(19);
+                                sub_ss->ExecuteNode(22);
                             }
                         }
                     }
                 }
             }
+        }
+        if (do_traverse && any_traversed && io_entries_traversed) {
+            *io_entries_traversed = true;
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
@@ -4052,7 +4139,7 @@ static float ResolveShotBaseDamage(Entity* shooter, Entity* proj_ent) {
     case 0x02E0000000000008ULL: return 120.0f; // Pharah: Rocket Launcher
     case 0x02E0000000000009ULL: return 3.0f;   // Winston: Tesla Cannon tick
     case 0x02E000000000000AULL: return 13.0f;  // Widowmaker: Widow's Kiss (SMG / unscoped)
-    case 0x02E0000000000015ULL: return 20.0f;  // Bastion: Configuration Recon / Sentry
+    case 0x02E0000000000015ULL: return (proj_ent && proj_ent != shooter) ? 205.0f : 20.0f; // Bastion: Tank Cannon shell (205) / Recon & Sentry (20)
     case 0x02E0000000000016ULL: return 25.0f;  // Symmetra: Photon Projector
     case 0x02E0000000000020ULL: return 45.0f;  // Zenyatta: Orb of Destruction
     case 0x02E0000000000029ULL: return 28.0f;  // Genji: Shuriken
@@ -4471,8 +4558,18 @@ static void __fastcall TickProjectileManager_hook(void* proj_sys) {
         for (int i = 0; i < s_created_sub_entity_count; ) {
             CreatedSubEntityEntry& sub = s_created_sub_entities[i];
             Entity* sub_ent = sub.ent_id ? game_ea->getEntById(sub.ent_id) : nullptr;
-            if (!sub_ent || (sub.expire_ms > 0 && now_ms >= sub.expire_ms)) {
-                if (sub_ent && sub.expire_ms > 0 && now_ms >= sub.expire_ms && sub_ent != local_hero) {
+            bool hp_depleted = false;
+            if (sub_ent) {
+                if (auto* sub_c28 = sub_ent->getById<Component_28_STUHealthComponent>(0x28)) {
+                    if (!IsBadReadPtr(sub_c28, sizeof(Component_28_STUHealthComponent)) &&
+                        sub_c28->CalcTotalMaxHealth() > 0.0f &&
+                        sub_c28->CalcTotalCurrentHealth() <= 0.0f) {
+                        hp_depleted = true;
+                    }
+                }
+            }
+            if (!sub_ent || hp_depleted || (sub.expire_ms > 0 && now_ms >= sub.expire_ms)) {
+                if (sub_ent && (hp_depleted || (sub.expire_ms > 0 && now_ms >= sub.expire_ms)) && sub_ent != local_hero) {
                     HideAndExpireSubEntity(game_ea, sub_ent, local_hero);
                 }
                 s_created_sub_entities[i] = s_created_sub_entities[--s_created_sub_entity_count];
@@ -4564,7 +4661,7 @@ static void __fastcall TickProjectileManager_hook(void* proj_sys) {
             if (sub.script_id != 0x0580000000000258ULL) {
                 if (auto* sub_c23 = sub_ent->getById<Component_23_Statescript>(0x23)) {
                     if (!IsBadReadPtr(sub_c23, sizeof(Component_23_Statescript))) {
-                        float sub_hp = (sub.res_id == 0x0400000000000223ULL) ? 1000.0f : 600.0f;
+                        float sub_hp = (sub.res_id == 0x0400000000000223ULL) ? 1000.0f : ((sub.res_id == 0x0400000000000932ULL) ? 500.0f : 600.0f);
                         SafeTickSyncMgr(&sub_c23->ss_inner, sub_hp, &sub.entries_traversed);
                     }
                 }
@@ -5001,46 +5098,53 @@ static Entity* SpawnStatescriptSubEntity(StatescriptInstance* inst, STUStatescri
             nc10->FilterBitsMakeFinal();
         }
     }
-    if (auto* nc1f = new_ent->getById<Component_1F_Backref>(0x1F)) {
-        nc1f->backref_entid = (ea && ea->local_entid) ? ea->local_entid : owner_ent->entity_id;
-    }
-    float sub_hp = (res_id == 0x0400000000000223ULL) ? 1000.0f : 600.0f;
-    if (auto* nc28 = new_ent->getById<Component_28_STUHealthComponent>(0x28)) {
-        if (!IsBadReadPtr(nc28, sizeof(Component_28_STUHealthComponent))) {
-            // Barrier & shield entities (0x1C3, 0x223) have 0 static health parts on disk because the server adds their health pool dynamically.
-            // Seed normal_health[0] so CalcTotalCurrentHealth()/CalcTotalMaxHealth(), 0x99D0CF4A barrier crack shader, and 0x85C28A9A see 100% HP!
-            if (nc28->CalcTotalMaxHealth() <= 0.0f) {
-                nc28->base.is_mirrored = 1;
-                nc28->normal_health[0].part_enabled    = 1;
-                nc28->normal_health[0].max_health      = sub_hp;
-                nc28->normal_health[0].curr_health     = sub_hp;
-                nc28->normal_health[0].field_C         = 0;
-                nc28->normal_health[0].field_10        = 1;
-                nc28->normal_health[0].some_other_flag = 1;
-                nc28->normal_health[0].field_12        = 0;
+    auto init_sub_ent_health_and_scripts = [&](Entity* target_ent) {
+        if (!target_ent) return;
+        if (auto* nc1f = target_ent->getById<Component_1F_Backref>(0x1F)) {
+            nc1f->backref_entid = (ea && ea->local_entid) ? ea->local_entid : owner_ent->entity_id;
+        }
+        float sub_hp = (res_id == 0x0400000000000223ULL) ? 1000.0f : ((res_id == 0x0400000000000932ULL) ? 500.0f : 600.0f);
+        if (auto* nc28 = target_ent->getById<Component_28_STUHealthComponent>(0x28)) {
+            if (!IsBadReadPtr(nc28, sizeof(Component_28_STUHealthComponent))) {
+                // Barrier, shield & ice-wall pillar entities (0x1C3, 0x223, 0x932) have 0 static health parts on disk because the server adds their health pool dynamically.
+                // Seed normal_health[0] BEFORE loading any sub-entity script so CalcTotalCurrentHealth()/CalcTotalMaxHealth(), 0x99D0CF4A, and 0x85C28A9A see 100% HP!
+                if (nc28->CalcTotalMaxHealth() <= 0.0f) {
+                    nc28->base.is_mirrored = 1;
+                    nc28->normal_health[0].part_enabled    = 1;
+                    nc28->normal_health[0].max_health      = sub_hp;
+                    nc28->normal_health[0].curr_health     = sub_hp;
+                    nc28->normal_health[0].field_C         = 0;
+                    nc28->normal_health[0].field_10        = 1;
+                    nc28->normal_health[0].some_other_flag = 1;
+                    nc28->normal_health[0].field_12        = 0;
+                }
+                SyncEntityHealthVarBag(target_ent);
             }
-            SyncEntityHealthVarBag(new_ent);
         }
-    }
-    if (auto* nc23 = new_ent->getById<Component_23_Statescript>(0x23)) {
-        if (res_id == 0x0400000000000932ULL) {
-            nc23->loadScript(0x0580000000000636ULL);
+        if (auto* nc23 = target_ent->getById<Component_23_Statescript>(0x23)) {
+            SeedBarrierVarBag(nc23->ss_inner.rid_entity_varbag, sub_hp);
+            SetEntityVarBagFloatNative(nc23, 0x0D800000000000FDULL, sub_hp);
+            SetEntityVarBagFloatNative(nc23, 0x0D8000000000024AULL, sub_hp);
+            SetEntityVarBagFloatNative(nc23, 0x0D800000000006C4ULL, sub_hp);
+            SetEntityVarBagFloatNative(nc23, 0x0D800000000006C9ULL, sub_hp);
+            SetEntityVarBagFloatNative(nc23, 0x0D80000000000805ULL, sub_hp);
+            SetEntityVarBagFloatNative(nc23, 0x0D80000000000151ULL, sub_hp);
+            SetEntityVarBagFloatNative(nc23, 0x0D800000000006F9ULL, 1.0f);
+            SetEntityVarBagFloatNative(nc23, 0x0D80000000000317ULL, 1.0f);
+            SetEntityVarBagFloatNative(nc23, 0x0D80000000000318ULL, 1.0f);
+            SetEntityVarBagFloatNative(nc23, 0x0D80000000000319ULL, 1.0f);
+            SetEntityVarBagFloatNative(nc23, 0x0D8000000000031AULL, 1.0f);
+            SetEntityVarBagFloatNative(nc23, 0x0D8000000000048DULL, 4.40f);
+            SetSyncMgrClientAuthoritative(&nc23->ss_inner, sub_hp, nullptr, true);
+            if (res_id == 0x0400000000000932ULL) {
+                nc23->loadScript(0x0580000000000636ULL);
+                SeedBarrierVarBag(nc23->ss_inner.rid_entity_varbag, sub_hp);
+                SetSyncMgrClientAuthoritative(&nc23->ss_inner, sub_hp, nullptr, true);
+            }
+            RefreshEntityShaderProviders(target_ent);
         }
-        SeedBarrierVarBag(nc23->ss_inner.rid_entity_varbag, sub_hp);
-        SetEntityVarBagFloatNative(nc23, 0x0D800000000000FDULL, sub_hp);
-        SetEntityVarBagFloatNative(nc23, 0x0D8000000000024AULL, sub_hp);
-        SetEntityVarBagFloatNative(nc23, 0x0D800000000006C4ULL, sub_hp);
-        SetEntityVarBagFloatNative(nc23, 0x0D800000000006C9ULL, sub_hp);
-        SetEntityVarBagFloatNative(nc23, 0x0D80000000000805ULL, sub_hp);
-        SetEntityVarBagFloatNative(nc23, 0x0D80000000000151ULL, sub_hp);
-        SetEntityVarBagFloatNative(nc23, 0x0D800000000006F9ULL, 1.0f);
-        SetEntityVarBagFloatNative(nc23, 0x0D80000000000317ULL, 1.0f);
-        SetEntityVarBagFloatNative(nc23, 0x0D80000000000318ULL, 1.0f);
-        SetEntityVarBagFloatNative(nc23, 0x0D80000000000319ULL, 1.0f);
-        SetEntityVarBagFloatNative(nc23, 0x0D8000000000031AULL, 1.0f);
-        SetSyncMgrClientAuthoritative(&nc23->ss_inner, sub_hp, nullptr, true);
-        RefreshEntityShaderProviders(new_ent);
-    }
+    };
+    init_sub_ent_health_and_scripts(new_ent);
 
     if (out_cvd && !IsBadReadPtr(out_cvd, sizeof(STUConfigVarDynamic))) {
         StatescriptPrimitive eprim(StatescriptPrimitive_ENTITY, (__int64)new_ent->entity_id);
@@ -5061,7 +5165,7 @@ static Entity* SpawnStatescriptSubEntity(StatescriptInstance* inst, STUStatescri
         entry.has_gravity = false;
         entry.lock_stationary = false;
 
-        if (is_node_0e3 || script_id == 0x0580000000000101ULL || res_id == 0x04000000000002BAULL || res_id == 0x04000000000007C0ULL) {
+        if (script_id == 0x0580000000000101ULL || res_id == 0x04000000000002BAULL || res_id == 0x04000000000007C0ULL) {
             // Hanzo Dragonstrike: travels along aim direction at 20 m/s for 6s
             entry.vel = Vector4{ fwd.X * 20.0f, sinf(pitch) * 20.0f, fwd.Z * 20.0f, 0.0f };
             entry.expire_ms = now_ms + 6000;
@@ -5117,20 +5221,7 @@ static Entity* SpawnStatescriptSubEntity(StatescriptInstance* inst, STUStatescri
                     nc10->FilterBitsMakeFinal();
                 }
             }
-            if (auto* nc1f = pillar_ent->getById<Component_1F_Backref>(0x1F)) {
-                nc1f->backref_entid = owner_ent->entity_id;
-            }
-            if (auto* nc23 = pillar_ent->getById<Component_23_Statescript>(0x23)) {
-                nc23->loadScript(0x0580000000000636ULL);
-                if (nc23->ss_inner.g3_arrWithIds.ptr && nc23->ss_inner.g3_arrWithIds.num > 0 && nc23->ss_inner.g3_arrWithIds.num <= 64) {
-                    for (int i = 0; i < nc23->ss_inner.g3_arrWithIds.num; ++i) {
-                        StatescriptInstance* sub_ss = nc23->ss_inner.g3_arrWithIds.ptr[i].instance;
-                        if (sub_ss && !IsBadReadPtr(sub_ss, sizeof(StatescriptInstance))) {
-                            sub_ss->execution_flags = (sub_ss->execution_flags | 0x400000u) & ~0x1000u;
-                        }
-                    }
-                }
-            }
+            init_sub_ent_health_and_scripts(pillar_ent);
             if (s_created_sub_entity_count < 64) {
                 CreatedSubEntityEntry p_entry{};
                 p_entry.ent_id = pillar_ent->entity_id;
@@ -5248,11 +5339,25 @@ static uint8_t __fastcall StatescriptAction_ExecuteAndContinue_hook(
                             allow_destroy = false;
                             break;
                         }
-                        if (s_created_sub_entities[i].script_id == 0x0580000000000258ULL &&
+                        if ((s_created_sub_entities[i].script_id == 0x0580000000000258ULL ||
+                             s_created_sub_entities[i].script_id == 0x0580000000000622ULL ||
+                             s_created_sub_entities[i].res_id == 0x0400000000000932ULL) &&
                             s_created_sub_entities[i].expire_ms > 0 &&
-                            destroy_now_ms + 500 < s_created_sub_entities[i].expire_ms) {
-                            allow_destroy = false;
-                            break;
+                            destroy_now_ms + 400 < s_created_sub_entities[i].expire_ms) {
+                            bool still_alive = true;
+                            if (Entity* check_ent = ea->getEntById(del_id)) {
+                                if (auto* check_c28 = check_ent->getById<Component_28_STUHealthComponent>(0x28)) {
+                                    if (!IsBadReadPtr(check_c28, sizeof(Component_28_STUHealthComponent)) &&
+                                        check_c28->CalcTotalMaxHealth() > 0.0f &&
+                                        check_c28->CalcTotalCurrentHealth() <= 0.0f) {
+                                        still_alive = false;
+                                    }
+                                }
+                            }
+                            if (still_alive) {
+                                allow_destroy = false;
+                                break;
+                            }
                         }
                         if (allow_destroy) {
                             s_created_sub_entities[i] = s_created_sub_entities[--s_created_sub_entity_count];
@@ -5459,6 +5564,26 @@ static uint8_t __fastcall StatescriptAction_ExecuteAndContinue_hook(
 //   * 0x4CCED352 (STUStatescriptStateCreateEntity — Reinhardt/Winston/Zarya Barriers & Deployables)
 //   * 0x0E3689F3 (Hanzo Dragonstrike Entity Spawn State)
 //   * 0x3A846155 & 0x74CB0002 (Junkrat RIP-Tire 0x0580000000000232 Possession & Detonation)
+static void TryApplyStatescriptStateAnim(StatescriptState* state, uint64_t script_id, uint32_t ent_id) {
+    if (!state || IsBadReadPtr(state, 0x100)) return;
+    __try {
+        int32_t anim_h = *(int32_t*)((uintptr_t)state + 0xD8);
+        if (anim_h == -1) {
+            uint8_t anim_params[0x40] = {};
+            auto build_anim_params = (void(__fastcall*)(StatescriptState*, void*))(globals::gameBase + 0x10A5550);
+            auto apply_anim = (void(__fastcall*)(StatescriptState*, void*))(globals::gameBase + 0x10A4F20);
+            build_anim_params(state, anim_params);
+            apply_anim(state, anim_params);
+            *(uint16_t*)((uintptr_t)state + 0xF0) = *(uint16_t*)((uintptr_t)state + 0x44) & 7;
+            anim_h = *(int32_t*)((uintptr_t)state + 0xD8);
+            float p18 = *(float*)(anim_params + 0x18);
+            float p1C = *(float*)(anim_params + 0x1C);
+            ShotDiagLogFmt("[STATE_ANIM_START] script=0x%llX ent=0x%X handle=%d rate=%.2f len=%.2f\n",
+                (unsigned long long)script_id, ent_id, anim_h, p18, p1C);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
 typedef uint32_t(__fastcall* ss_state_start_fn)(StatescriptState* state, uint64_t a2);
 static ss_state_start_fn StatescriptState_StartState_orig = nullptr;
 static uint32_t __fastcall StatescriptState_StartState_hook(StatescriptState* state, uint64_t a2) {
@@ -5482,10 +5607,21 @@ static uint32_t __fastcall StatescriptState_StartState_hook(StatescriptState* st
     if (pre_stu_hash == 0x4CCED352u || pre_stu_hash == 0x0E3689F3u) {
         // Spawn the barrier/deployable sub-entity and populate m_outVar (0x0D80000000000026) BEFORE StartState_orig fires OnStart -> PlayScript (0xF9EF59A6)!
         SpawnStatescriptSubEntity(inst, (STUStatescriptBase*)pre_stu_state, pre_stu_hash);
-    } else if (pre_stu_hash == 0xC17B255Du || pre_stu_hash == 0x85C28A9Au || pre_stu_hash == 0x68CB1DF9u) {
+    } else if (pre_stu_hash == 0xC17B255Du || pre_stu_hash == 0x85C28A9Au || pre_stu_hash == 0x68CB1DF9u ||
+               pre_stu_hash == 0x99D0CF4Au || pre_stu_hash == 0xCD396790u || pre_stu_hash == 0x65F158DAu ||
+               pre_stu_hash == 0x7FB4BF64u) {
+        if (pre_stu_hash == 0x7FB4BF64u && !IsBadReadPtr(state, 0x100)) {
+            // STUStatescriptStateAnim (+0xD99C60 vt+0x128) skips BuildAnimParams (+0x10A5550) & ApplyAnim (+0x10A4F20)
+            // when (state->field_44 & 7) == state->word_F0 (0 == 0 on client when no network bitstream ran).
+            // Pre-seed word_F0 = 8 (same sentinel used by +0x10A4EFB on stop) so 0 != 8!
+            *(uint16_t*)((uintptr_t)state + 0xF0) = 8;
+        }
         uint64_t pre_script_id = SafeReadVal<uint64_t>((uintptr_t)inst + 0x150);
-        if (pre_script_id == 0x05800000000000FCULL || pre_script_id == 0x0580000000000156ULL || pre_script_id == 0x0580000000000096ULL) {
-            float sub_hp = (pre_script_id == 0x0580000000000096ULL) ? 2000.0f : (pre_script_id == 0x0580000000000156ULL ? 1000.0f : 600.0f);
+        if (pre_script_id == 0x05800000000000FCULL || pre_script_id == 0x0580000000000156ULL ||
+            pre_script_id == 0x0580000000000096ULL || pre_script_id == 0x0580000000000636ULL) {
+            float sub_hp = (pre_script_id == 0x0580000000000096ULL) ? 2000.0f :
+                           (pre_script_id == 0x0580000000000156ULL ? 1000.0f :
+                           (pre_script_id == 0x0580000000000636ULL ? 500.0f : 600.0f));
             SeedBarrierVarBag(inst->rid_instance_varbag, sub_hp);
             if (inst->ss_inner && !IsBadReadPtr(inst->ss_inner, sizeof(StatescriptSyncMgr))) {
                 SeedBarrierVarBag(inst->ss_inner->rid_entity_varbag, sub_hp);
@@ -5509,6 +5645,12 @@ static uint32_t __fastcall StatescriptState_StartState_hook(StatescriptState* st
             uint32_t stu_hash = (info && !IsBadReadPtr(info, sizeof(STUInfo))) ? info->name_hash : 0;
             uint64_t script_id = SafeReadVal<uint64_t>((uintptr_t)inst + 0x150);
             bool is_local = (owner_ent && owner_ent == GetLocalHeroModelEnt());
+
+            if (stu_hash == 0x7FB4BF64u) {
+                // On the client binary, PreStart_160 (+0x10A4930) skips ApplyAnim (+0x10A4F20) because inst->vfptr[+0x188] returns 1.
+                // If anim_handle ([state + 0xD8]) is still -1 after StartState_orig, invoke BuildAnimParams (+0x10A5550) & ApplyAnim (+0x10A4F20).
+                TryApplyStatescriptStateAnim(state, script_id, owner_ent ? owner_ent->entity_id : 0);
+            }
 
             // 1. Arm moving dash/leap damage sweep & McCree Roll ammo refill on ability state entry
             if (is_local && owner_ent) {
@@ -6029,14 +6171,45 @@ static void OnUniversalStateExit(StatescriptSyncMgr* ss, StatescriptInstance* in
     }
 }
 
-// 10. +0xD739A0 (IsGraphNodeClientOnly):
+// 10. +0xD739A0 (IsGraphNodeClientOnly), +0xD73D10 (CheckSomeClientOnlyFlags),
+//     +0xD73DF0 (E_IsReferencedStateClientOnly), & +0xD73E90 (GetClientOnlyStateByMStateIndex):
 // Strictly gated by IsHeroOrSubEntScript(inst) so main menu, map scripts, loading screens, and doors are 100% untouched.
 // For the LocalPlayer Hero Model (and its weapons/deployables), allows server-tagged ability nodes (0x4E83BC01, 0x04CC5359,
-// 0x1BB99C36, 0x4CCED352, 0x0E3689F3) to be entered without mutating shared CASC STUStatescriptGraph memory.
+// 0x1BB99C36, 0x4CCED352, 0x0E3689F3, 0x65F158DA wait timers, 0x7FB4BF64 anim states) to be entered, scheduled (+0xF47A50 / +0xF4A9C0),
+// and timer-expired without mutating shared CASC STUStatescriptGraph memory.
 typedef uint8_t(__fastcall* is_node_client_only_fn)(StatescriptInstance* inst, STUStatescriptBase* node);
 static is_node_client_only_fn IsGraphNodeClientOnly_orig = nullptr;
 static uint8_t __fastcall IsGraphNodeClientOnly_hook(StatescriptInstance* inst, STUStatescriptBase* node) {
     uint8_t res = IsGraphNodeClientOnly_orig(inst, node);
+    if (res == 0 && IsHeroOrSubEntScript(inst)) {
+        return 1;
+    }
+    return res;
+}
+
+static is_node_client_only_fn CheckSomeClientOnlyFlags_orig = nullptr;
+static uint8_t __fastcall CheckSomeClientOnlyFlags_hook(StatescriptInstance* inst, STUStatescriptBase* node) {
+    uint8_t res = CheckSomeClientOnlyFlags_orig(inst, node);
+    if (res == 0 && IsHeroOrSubEntScript(inst)) {
+        return 1;
+    }
+    return res;
+}
+
+typedef uint8_t(__fastcall* e_is_ref_state_client_only_fn)(StatescriptInstance* inst, StatescriptNotification_Base* notif);
+static e_is_ref_state_client_only_fn E_IsReferencedStateClientOnly_orig = nullptr;
+static uint8_t __fastcall E_IsReferencedStateClientOnly_hook(StatescriptInstance* inst, StatescriptNotification_Base* notif) {
+    uint8_t res = E_IsReferencedStateClientOnly_orig(inst, notif);
+    if (res == 0 && IsHeroOrSubEntScript(inst)) {
+        return 1;
+    }
+    return res;
+}
+
+typedef uint8_t(__fastcall* get_client_only_state_by_idx_fn)(StatescriptInstance* inst, int idx_in_nodes);
+static get_client_only_state_by_idx_fn GetClientOnlyStateByMStateIndex_orig = nullptr;
+static uint8_t __fastcall GetClientOnlyStateByMStateIndex_hook(StatescriptInstance* inst, int idx_in_nodes) {
+    uint8_t res = GetClientOnlyStateByMStateIndex_orig(inst, idx_in_nodes);
     if (res == 0 && IsHeroOrSubEntScript(inst)) {
         return 1;
     }
@@ -7490,6 +7663,12 @@ static void AppendVarBagSummary(std::string& out, const char* prefix, Entity* en
                             SafeReadVal<uint64_t>((uintptr_t)st + 0xB0),
                             SafeReadVal<uint64_t>((uintptr_t)st + 0xB8),
                             (int)SafeReadVal<uint8_t>((uintptr_t)st + 0xC0));
+                    } else if (s_hash == 0x7FB4BF64u) {
+                        mtx_tag += std::format(" `anim_h(+0xD8)={} wF0={} fD0=0x{:X} fE0=0x{:X}`",
+                            SafeReadVal<int32_t>((uintptr_t)st + 0xD8),
+                            (int)SafeReadVal<uint16_t>((uintptr_t)st + 0xF0),
+                            SafeReadVal<uint64_t>((uintptr_t)st + 0xD0),
+                            SafeReadVal<uint64_t>((uintptr_t)st + 0xE0));
                     }
                     out.append(std::format("        * `state_impl[{}]`: `m_st={}` `node={}` `stu=0x{:08X}({})` `cO={}` `sO={}` `flags(+0x40)=0x{:X}` `f44={}` `f80={}`{} `vt=+0x{:X}`{} (`170={}`,`178={}`,`188={}`,`190={}`,`260={}`,`110={}`)\n",
                         si, st->idx_in_m_states, node_idx, s_hash, s_name,
@@ -8284,6 +8463,12 @@ void __cdecl StartHook(void*) {
     MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xf495c0)));
     MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xd739a0), IsGraphNodeClientOnly_hook, (PVOID*)&IsGraphNodeClientOnly_orig));
     MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xd739a0)));
+    MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xd73d10), CheckSomeClientOnlyFlags_hook, (PVOID*)&CheckSomeClientOnlyFlags_orig));
+    MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xd73d10)));
+    MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xd73df0), E_IsReferencedStateClientOnly_hook, (PVOID*)&E_IsReferencedStateClientOnly_orig));
+    MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xd73df0)));
+    MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xd73e90), GetClientOnlyStateByMStateIndex_hook, (PVOID*)&GetClientOnlyStateByMStateIndex_orig));
+    MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xd73e90)));
     MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xf4d1d0), CanAcquireAbilityMutex_hook, (PVOID*)&CanAcquireAbilityMutex_orig));
     MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xf4d1d0)));
     MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0x1096500), PlacementState_TickRay_hook, (PVOID*)&PlacementState_TickRay_orig));
