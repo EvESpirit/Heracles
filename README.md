@@ -35,7 +35,7 @@ Hey and welcome, thanks for stopping by!
 
 # 1. Usage
 
-If you haven't already, download the Overwatch Beta build we target from [archive.org](https://archive.org/details/overwatch-beta-0-8-0-24919) and extract the files somewhere.
+If you haven't already, download the Overwatch Beta build we target from [Hidden Palace](https://hiddenpalace.org/Overwatch_(Oct_27,_2015_prototype)) and extract the files somewhere.
 * ⚠️ Make sure that you don't download any malicious executable and verify that `GameClientApp.exe` is signed by Blizzard. The signature will get broken after applying that patch - but musn't be before.
 * You can optionally remove the `BlizzardError` directory.
 
