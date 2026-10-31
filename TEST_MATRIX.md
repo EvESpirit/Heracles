@@ -85,7 +85,7 @@
 | Lúcio | Ultimate | Fail (does not grant overhealth to neither Lucio nor his nearby allies, healing was not tested but it's likely also non-functional) |
 | Mercy | Primary Fire (Left Click - Heal Beam) | Fail (pre-connection staff VFX activates, but it never targets a friendly unit) |
 | Mercy | Secondary Fire (Right Click - Damage Boost) | Fail (never targets a friendly unit for the same reason as left click) |
-| Mercy | Guardian Angel | Fail (does not see the friendly dummy as a target - same goes for healing and damage boost from the staff - also she's holding both the blaster and the staff at the same time, but only the staff works, also cannot switch between weapons) |
+| Mercy | Guardian Angel | Pass |
 | Mercy | Ultimate | Untestable (due to not being able to target friendly dummies with a healing beam nor being able to switch to the blaster to kill enemy dummies) |
 | Symmetra | Primary Fire (Left Click) | Fail (seemingly does nothing except spawn the gun VFX) |
 | Symmetra | Secondary Fire (Right Click) | Pass |
@@ -94,6 +94,6 @@
 | Symmetra | Ultimate | Fail (despawns on deploy) |
 | Zenyatta | Primary Fire (Left Click) | Pass |
 | Zenyatta | Secondary Fire (Right Click) | Pass |
-| Zenyatta | Orb of Harmony | Fail (will not activate to target friendlies that are being aimed at even up close) |
-| Zenyatta | Orb of Discord | Fail (will not activate to target enemies that are being aimed at even up close) |
-| Zenyatta | Ultimate | Partial Pass (seems to heal, and animations/VFX work - but not over time, at least not in the way trance should heal over time - likewise no apparent healing applies on friendly dummies) |
+| Zenyatta | Orb of Harmony | Pass |
+| Zenyatta | Orb of Discord | Pass |
+| Zenyatta | Ultimate | Partial Pass (animations/VFX work, but doesn't apply healing to allies) |
