@@ -1,4 +1,3 @@
-
 # Heracles <!-- omit in toc -->
 
 Hey and welcome, thanks for stopping by!
@@ -158,31 +157,30 @@ For further reference for heroes specifically, please check out the TEST_MATRIX.
 
 ## What works now
 
-* **Weapons shoot, reload, and show muzzle flashes:** Primary and secondary fire, ammo consumption, reloading, and 1P barrel muzzle flashes (mostly) work across the cast. There are still issues - like dual-weapon heroes - but the core logic works.
+* **Weapons shoot, reload, and show muzzle flashes:** Primary and secondary fire, ammo consumption, reloading, and 1P barrel muzzle flashes (mostly) work across the cast. There are still issues - like dual-weapon heroes - but the core logic works. Damage nor damage type may yet be reflective of the actual projectile or hitscan used, nor is it very likely to reflect actual damage values - this is an area of active development and improvements and is likely to stabilize to original Beta values and functionality very soon.
 * **Spawning is reliable:** Spawning uses a deferred state machine that waits for Component `0x23` to finish loading before attaching weapons, so you no longer spawn with missing guns. Spawning natively, without the Player Spawner DeLuxe, has also been thoroughly debugged and should function correctly now.
-* **D.Va spawns in her Mech:** Spawning D.Va now puts her directly in her Mech (with 100 HP + 400 Armor) instead of floating around as Pilot D.Va.
+* **D.Va spawns in her Mech:** Spawning D.Va now puts her directly in her Mech (with 100 HP + 400 Armor) instead of floating around as Pilot D.Va. However, her ult and general de-meching is still broken, resulting in odd behavior and ocassional crashes.
 * **Pressing `H` to swap heroes works anywhere:** You can press `H` anywhere on any map to open the Hero Select screen and swap heroes in-place at your current position. This is a placeholder for native spawnroom detection.
 * **Doors, Capture Points, and Payloads stay in place:** Blocking Component `0x12`'s empty-buffer `(0,0,0)` overwrites keeps all map props, payloads, and doors at their proper map coordinates.
 * **Spawn doors slide open and closed:** You can open and close map spawn doors natively (with animations, sound, and collision) from the Player Spawner DeLuxe or the first Diagnostics window.
 * **Target Dummies & Full Combat Loop:** You can spawn Enemy or Friendly bots in Player Spawner DeLuxe. Shooting them now hits their actual skeletal bone hitboxes (with headshots, armor reduction, blood/spark VFX, flinch animations, and hurt grunts), shows their overhead enemy healthbar, awards `0% -> 100%` Ultimate charge, and triggers ragdoll knockouts, 3D death screams, red kill skulls, and the `"ELIMINATED [HERO]"` banner on kill.
-* **Hero Abilities & Ultimates:** Many of the abilities across the roster already function correctly and reliably. The remaining issues cluster around a couple of very specific problems that generalize fixes across the cluster (targeted abilities, dual-weapon heroes, certain shield interactions and visuals etc.). This is being actively worked on.
+* **Hero Abilities & Ultimates:** Many of the abilities across the roster already function correctly and reliably. The remaining issues cluster around a couple of very specific problems that generalize fixes across the cluster (targeted abilities, dual-weapon heroes, certain shield interactions and visuals etc.). This is being actively worked on. Please refer to the TEST_MATRIX.md - this is being updated as testing progresses in step with development.
 
 ## Still broken / WIP
 
-* **Barrier crack visuals (WIP):** Winston's Barrier Projector and Bastion's Frontal Shield spawn, follow, and despawn properly, but their health-ratio shader parameters are still being fixed right now so they don't look cracked immediately on spawn.
-* **Main Menu matchmaking buttons:** Main menu play buttons (as well as several other pre-menu items) only send JAM messages to a Battle.net server. Use the top bar workflow (`DP Load` -> `Map`) to load into a map.
-* **Gamemode objectives:** Capture point progress rings and payload movement along tracks still need offline gamemode script orchestration, but function visually and, partially, internally as well.
+* **Main Menu matchmaking buttons:** Main menu play buttons (as well as several other pre-menu items) only send JAM messages to a Battle.net server. Use the top bar workflow (`DP Load` -> `Map`) to load into a map. This will be hooked and hopefully usable at some point - low priority.
+* **Gamemode objectives:** Capture point progress rings and payload movement along tracks still need offline gamemode script orchestration, but function visually and, partially internally as well.
 * **"Press H to select Hero" banner:** Controlled by a server flag and will probably stay visible on the HUD after spawning for the time being. Sorry.
 * **Communication wheel & dynamic voice lines:** Tracer's spawn voiceline and 3D victim death screams work, but the full server-side communication wheel and contextual voice rules are still a TODO. I think I have most of the architecture nailed down, it just needs some love and several afternoons of work.
-* **Map unloading crashes the game:** Just use the **Restart** button in the top bar when switching maps for now - or restart the game entirely.
+* **Map unloading crashes the game:** Just use the **Restart** button in the top bar when switching maps for now - or restart the game entirely. Note that map switching *does* ocassionally work - it's just not supported at the moment. This will hopefully change in the future.
 * **Window resizing:** Resizing the game window messes with viewmodels (a bug in the 0.8 beta itself that may or may not be patch-able when everything else is functional). Borderless Windowed mode works best.
 
 # 4. Tips & Tricks
 
 * **Quick-start in 4 clicks:** Click **`DP Load`** in the top bar -> pick a map under **`Map`** -> open **Game -> Player Spawner DeLuxe** -> pick a hero and click **`Spawn`** (and click **`Open Spawn Doors`** so you aren't locked in spawn yelling door stuck).
 * **Hide the debug UI:** Press `~`  to toggle all ImGui windows on/off so you can play with a clean screen.
-* **Swap heroes with `H`:** Once you've spawned a hero, just press **`H`** at any time to open the native Hero Select screen and switch heroes on the fly.
-* **Spawn Target Dummies:** In **Player Spawner DeLuxe**, click **`Spawn Jeff Kaplan`** to drop a target enemy dummy in front of you to test weapons, headshots, knockbacks, and Ultimates, or **`Spawn Friendly Dummy (Team 0)`** to test ally-based abilities.
+* **Swap heroes with `H`:** Once you've spawned a hero, just press **`H`** at any time to open the native Hero Select screen and switch heroes on the fly. *Optionally, you can just select a hero normally from the in-game menu after you've loaded a map externally. It should work. If you encounter issues, simply spawn with the Player Spawner DeLuxe as described above.*
+* **Spawn Target Dummies:** In **Player Spawner DeLuxe**, click **`Spawn Jeff Kaplan`** to drop a target enemy dummy in front of you to test weapons, headshots, knockbacks, and Ultimates, or **`Spawn Friendly Dummy (Team 0)`** to test ally-based abilities. They don't do anything except just stand there waiting to get shot or blown up, but are very useful for development and general testing.
 * **Teleport & Timescale:** Use the **Up / Down arrow keys** to teleport yourself up or down. Use the **Left / Right arrow keys** to slow down or speed up the physics timescale. This is necessary on... most maps. On Hanamura, specifically just Genji falls through the floor when you try to spawn him. I still don't know why lol.
 * **World Map:** Press **`M`** in-game to toggle the overhead map overlay.
 * **FreeLookView:** Check out the `FreeLookView` checkbox in Player Spawner DeLuxe to fly around the map with WASD + Shift without needing a hero.
