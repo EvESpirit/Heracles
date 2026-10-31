@@ -52,6 +52,19 @@ namespace STU_NAME {
 	const uint STUConfigVarExpression = 0xcc3a08f4;
 	const uint STUStatescriptState = 0xa7213568;
 	const uint STUStatescriptAction = 0x2ecefc8b;
+	const uint STUStatescriptActionSendGameMessage = 0x4e83bc01;
+	const uint STUStatescriptStateTargetLockOn = 0x498b421a;
+	const uint STUStatescriptStateTargetScannerUI = 0x725967aa;
+	const uint STUStatescriptStateTetherOrbMonitor = 0xe831bef1;
+	const uint STUStatescriptStateFireTargetedProjectile = 0xf8ec9531;
+	const uint STUConfigVarAITargetEntity = 0xcef466a3;
+	const uint STUConfigVarHasAITarget = 0x40ad92be;
+	const uint STUStatescriptStateWeaponVolley = 0x860ee5fc;
+	const uint STUStatescriptStateEffectPlay = 0x6e81f6d4;
+	const uint STUStatescriptStatePlacement = 0x160c4f1d;
+	const uint STUStatescriptStateFindGround = 0x72509d3b;
+	const uint STUStatescriptStateMeiIceWallStart = 0x12aa4f0f;
+	const uint STUStatescriptStateMeiIceWallPillar = 0x614c3a0a;
 
 	namespace Primitive {
 		const uint32 teMtx43A = 0x6fb9880b;

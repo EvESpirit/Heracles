@@ -87,4 +87,9 @@ public:
 	//returns key: controller - value: model
 	std::pair<Entity*, Entity*> spawn();
 	void tick_deferred_spawn();
+
+	// Applies native lock-on filter bit 0x1 to queued non-local dummy models ~1s after spawn (after overhead UI creation).
+	// Called every game tick from UpdateHealthbarVisibility_hook and from tick_deferred_spawn().
+	static void queue_lockon_bit(uint32 model_entid);
+	static void tick_pending_lockon_bits();
 };

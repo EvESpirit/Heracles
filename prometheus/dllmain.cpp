@@ -22,6 +22,7 @@
 #include <nlohmann/json.hpp>
 #include <d3d11.h>
 #include "pe.h"
+#include "player_spawner.h"
 #include "imgui_impl_dx11.h"
 #include "imgui_impl_win32.h"
 #include "imgui.h"
@@ -3006,6 +3007,7 @@ static void __fastcall GetEntityDisplayName_hook(Entity* ent, uint8_t sanitize_f
 void __fastcall UpdateHealthbarVisibility_hook(uintptr_t sys46) {
     s_last_sys46 = sys46;
     EntityAdminBase* ea = sys46 ? SafeReadVal<EntityAdminBase*>(sys46 + 0x08) : nullptr;
+    player_spawner::tick_pending_lockon_bits(); // delayed native lock-on bit 0x1 on spawned dummies
     Entity* target_dummy = nullptr;
     Component_28_STUHealthComponent* target_c28 = nullptr;
     Component_2F_LocalPlayer* local_c2f = nullptr;
@@ -7846,7 +7848,8 @@ static const char* ResolveSSNodeName(uint32_t hash) {
     case 0xB2301AC1: return "Act:PlaySound";
     case 0x4935CA8D: return "Act:CamFX";
     case 0x1CA9A2AC: return "Act:Rumble";
-    case 0x4E83BC01: return "SRV_Act:SetVar";
+    case 0x4E83BC01: return "Act:SendGameMsg(SRV)";
+    case 0x4698E4B6: return "Act:SetVar";
     case 0x04CC5359: return "SRV_Act:DmgHeal";
     case 0x5C46D801: return "SRV_Act:DestroyEnt";
     case 0x1BB99C36: return "SRV_Act:CreateEntA";
@@ -7892,6 +7895,14 @@ static const char* ResolveSSNodeName(uint32_t hash) {
     case 0xD0B42497: return "Cond:JunctionGate";
     case 0x837E8660: return "Act:StopState";
     case 0xEC502A81: return "CV:Expression";
+    case 0x498B421A: return "State:TargetLockOn";
+    case 0x725967AA: return "State:TargetScannerUI";
+    case 0xE831BEF1: return "State:TetherOrbMonitor";
+    case 0xF8EC9531: return "State:FireTargetedProj";
+    case 0xCEF466A3: return "CV:AITargetEnt";
+    case 0x40AD92BE: return "CV:HasAITarget";
+    case 0x65F158DA: return "State:WaitAnim";
+    case 0x7FB4BF64: return "State:DoorWait/Sweep";
     default: break;
     }
     auto it = allmighty_hash_lib::hashes.find(hash);

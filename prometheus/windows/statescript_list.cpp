@@ -115,6 +115,19 @@ static void ensure_known_stu_hashes() {
 	add(0x4cced352, "STUStatescriptStateCreateEntity");
 	add(0x0e3689f3, "STUStatescriptActionCreateEntity");
 	add(0xf9ef59a6, "STUStatescriptActionPlayScript");
+	add(0x4e83bc01, "STUStatescriptActionSendGameMessage");
+	add(0x498b421a, "STUStatescriptStateTargetLockOn");
+	add(0x725967aa, "STUStatescriptStateTargetScannerUI");
+	add(0xe831bef1, "STUStatescriptStateTetherOrbMonitor");
+	add(0xf8ec9531, "STUStatescriptStateFireTargetedProjectile");
+	add(0xcef466a3, "STUConfigVarAITargetEntity");
+	add(0x40ad92be, "STUConfigVarHasAITarget");
+	add(0x860ee5fc, "STUStatescriptStateWeaponVolley");
+	add(0x6e81f6d4, "STUStatescriptStateEffectPlay");
+	add(0x160c4f1d, "STUStatescriptStatePlacement");
+	add(0x72509d3b, "STUStatescriptStateFindGround");
+	add(0x12aa4f0f, "STUStatescriptStateMeiIceWallStart");
+	add(0x614c3a0a, "STUStatescriptStateMeiIceWallPillar");
 }
 
 static void dump_varbag_entries(std::ofstream& out, StatescriptVar_VarBag* vb, const std::string& prefix) {

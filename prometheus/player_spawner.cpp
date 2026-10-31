@@ -5,6 +5,40 @@
 #include "StatescriptVar.h"
 #include "MovementState.h"
 #include <cstring>
+#include <mutex>
+
+// ---- Delayed native lock-on filter bit (0x1) for non-local dummy models ----
+// Bit 0x1 must be applied AFTER the overhead nameplate/healthbar UI has been created for the dummy (see modify_ent).
+namespace {
+	struct PendingLockonBit { uint32 entid; uint64_t due_ms; };
+	std::mutex s_lockon_bit_mtx;
+	std::vector<PendingLockonBit> s_pending_lockon_bits;
+	constexpr uint64_t LOCKON_BIT_DELAY_MS = 1000;
+}
+
+void player_spawner::queue_lockon_bit(uint32 model_entid) {
+	std::lock_guard<std::mutex> lk(s_lockon_bit_mtx);
+	s_pending_lockon_bits.push_back({ model_entid, GetTickCount64() + LOCKON_BIT_DELAY_MS });
+}
+
+void player_spawner::tick_pending_lockon_bits() {
+	std::lock_guard<std::mutex> lk(s_lockon_bit_mtx);
+	if (s_pending_lockon_bits.empty()) return;
+	auto* ea = GameEntityAdmin();
+	if (!ea) return;
+	uint64_t now = GetTickCount64();
+	for (size_t i = 0; i < s_pending_lockon_bits.size();) {
+		const PendingLockonBit p = s_pending_lockon_bits[i];
+		if (now < p.due_ms) { ++i; continue; }
+		if (Entity* ent = ea->getEntById(p.entid)) {
+			if (auto* c10 = ent->getById<Component_10_FilterBits>(0x10)) {
+				c10->pre_filter_bits |= 0x1;
+				c10->FilterBitsMakeFinal();
+			}
+		}
+		s_pending_lockon_bits.erase(s_pending_lockon_bits.begin() + i);
+	}
+}
 
 void Component_28_STUHealthComponent::InitHeroHealthPools(uint64_t heroid, uint64_t model_res_id) {
 	base.is_mirrored = 1;
@@ -209,12 +243,17 @@ void player_spawner::modify_ent(spawn_info info, Entity* ent) {
 	if (filter_bits) {
 		if (info.set_filterbits_controller) {
 			filter_bits->set_filterbits_spectator();
-		} else if (ent == model_ent && !controller_info.set_localent && !info.set_localent) {
-			filter_bits->pre_filter_bits |= 0xC00001;
-			filter_bits->filter_bits |= 0xC00001;
 		} else {
+			// Non-local dummy models get the same 0x800000 base as the LocalPlayer. Filter bit 0x1 (native lock-on
+			// candidate bit for 0x725967AA / 0x498B421A, e.g. Zen Harmony/Discord) is applied ~1s LATER via
+			// queue_lockon_bit(): if 0x1 is present while the overhead nameplate/healthbar UI is created, that UI is
+			// never created; toggling 0x1 afterwards affects lock-on live without touching the UI (verified in-game).
+			// NEVER set 0x400000 on dummies: it makes them non-hostile allies and disables shot collision (d91fb68 regression).
 			filter_bits->pre_filter_bits |= 0x800000;
 			filter_bits->filter_bits |= 0x800000;
+			if (ent == model_ent && !controller_info.set_localent && !info.set_localent) {
+				queue_lockon_bit(ent->entity_id);
+			}
 		}
 		if (info.team != -1) {
 			filter_bits->set_team(info.team);
@@ -397,6 +436,7 @@ std::pair<Entity*, Entity*> player_spawner::spawn() {
 }
 
 void player_spawner::tick_deferred_spawn() {
+	tick_pending_lockon_bits();
 	if (spawn_state != DeferredSpawnState::WAITING_FOR_COMPONENTS && spawn_state != DeferredSpawnState::APPLYING_POST_SPAWN_INIT) {
 		return;
 	}

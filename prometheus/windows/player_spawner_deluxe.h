@@ -633,6 +633,15 @@ class player_spawner_deluxe : public window {
 								}
 							}
 							ImGui::SameLine();
+							// DEBUG: live-toggle filter bit 0x1 (native lock-on candidate bit; auto-applied ~1s after spawn).
+							// Toggling only affects lock-on; overhead UI is decided at UI creation time.
+							if (ImGui::SmallButton((c10 && (c10->pre_filter_bits & 0x1)) ? "Bit1:ON" : "Bit1:off")) {
+								if (c10) {
+									c10->pre_filter_bits ^= 0x1;
+									c10->FilterBitsMakeFinal();
+								}
+							}
+							ImGui::SameLine();
 							if (ImGui::SmallButton("Inspect")) {
 								entity_window::get_latest_or_create(this)->nav_to_ent(ent);
 							}
