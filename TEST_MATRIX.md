@@ -18,7 +18,7 @@
 | Reaper | Primary Fire (Left Click) | Pass |
 | Reaper | Shadow Step | Fail (after activation, Reaper performs the animation that directly precedes him teleporting to the chosen location and instead teleports right back where he started teleporting from) |
 | Reaper | Wraith Form | Pass |
-| Reaper | Ultimate | Pass |
+| Reaper | Ultimate | Partial Pass (VFX work, but only deals a single burst of damage instead of a continuous AoE DoT around Reaper) |
 | Soldier 76 | Primary Fire (Left Click) | Pass |
 | Soldier 76 | Helix Grenades (Right Click) | Pass |
 | Soldier 76 | Sprint | Pass |
