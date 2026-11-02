@@ -83,7 +83,7 @@
 | Lúcio | Crossfade | Fail (doesn't heal or speed boost) |
 | Lúcio | Amp It Up | Fail (doesn't heal more nor speed boost more) |
 | Lúcio | Ultimate | Fail (does not grant overhealth to neither Lucio nor his nearby allies, healing was not tested but it's likely also non-functional) |
-| Mercy | Primary Fire (Left Click - Heal Beam) | Fail (pre-connection staff VFX activates, but it never targets a friendly unit) |
+| Mercy | Primary Fire (Left Click - Heal Beam) | Pass |
 | Mercy | Secondary Fire (Right Click - Damage Boost) | Pass |
 | Mercy | Guardian Angel | Pass |
 | Mercy | Ultimate | Untestable (due to not being able to target friendly dummies with a healing beam nor being able to switch to the blaster to kill enemy dummies) |
