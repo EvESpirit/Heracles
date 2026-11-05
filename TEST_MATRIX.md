@@ -86,7 +86,7 @@
 | Mercy | Primary Fire (Left Click - Heal Beam) | Pass |
 | Mercy | Secondary Fire (Right Click - Damage Boost) | Pass |
 | Mercy | Guardian Angel | Pass |
-| Mercy | Ultimate | Untestable (due to not being able to target friendly dummies with a healing beam nor being able to switch to the blaster to kill enemy dummies) |
+| Mercy | Ultimate | Fail (does not resurrect teammates) |
 | Symmetra | Primary Fire (Left Click) | Fail (seemingly does nothing except spawn the gun VFX) |
 | Symmetra | Secondary Fire (Right Click) | Pass |
 | Symmetra | Photon Shield | Unknown (Unable to Deploy) |
