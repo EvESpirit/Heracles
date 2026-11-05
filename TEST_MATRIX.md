@@ -1,4 +1,4 @@
-| Hero | Ability | Status |
+﻿| Hero | Ability | Status |
 | :--- | :--- | :--- |
 | Genji | Primary Fire (Left Click) | Pass |
 | Genji | Secondary Fire (Right Click) | Pass |
@@ -46,10 +46,10 @@
 | Mei | Cryo-Freeze | Pass |
 | Mei | Ice Wall | Pass |
 | Mei | Ultimate | Fail (Snowflake despawns on contact with level geometry and never triggers the freezing field) |
-| Torbjörn | Primary Fire (Left Click) | Partial Fail (both weapons are used at once and cannot be switched between, causing left click to alternate between firing the gun and swinging the hammer) |
+| Torbjörn | Primary Fire (Left Click) | Pass |
 | Torbjörn | Secondary Fire (Right Click) | Pass |
 | Torbjörn | Armor Pack | Fail (despawns on deployment after it touches the ground or a wall simmilar to Widowmaker's mine) |
-| Torbjörn | Build Turret | Partial Fail (turret base deploys, but we cannot left click on it with the hammer to build it up for scrap - this may or may not coincide with a bug where both the hammer and Torb's gun are seemingly in his hands at the same time ever since he spawns - with an inability to switch between them, same as Mercy can't switch between the staff and the blaster - on Torb this manifests in, when the user presses the left mouse button, the gun firing one shot, then torb swings the hammer, then another shot, another hammer blow, etc. - right click with the gun works as expected though) |
+| Torbjörn | Build Turret | Partial Fail (turret base deploys, but we cannot left click on it with the hammer to build it up for scrap) |
 | Torbjörn | Ultimate | Pass |
 | Widowmaker | Primary Fire (Left Click) | Pass |
 | Widowmaker | Secondary Fire / Scope (Right Click) | Partial Pass (left click and right click work as expected, but each shot deals the same amount of damage regardless of the amount of power charged while holding right click) |

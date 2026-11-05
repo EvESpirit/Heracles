@@ -4456,6 +4456,401 @@ static void HideAndExpireSubEntity(EntityAdminBase* ea, Entity* sub_ent, Entity*
     }
 }
 
+static uint64_t s_last_weapon_scroll_ms = 0;
+static int s_pending_weapon_slot = 0;
+static int s_pending_weapon_cycle_dir = 0;
+static const char* s_pending_weapon_reason = nullptr;
+
+static int DiscoverHeroWeaponSlots(Component_23_Statescript* c23, StatescriptInstance* out_slots[4]) {
+    for (int i = 0; i < 4; ++i) out_slots[i] = nullptr;
+    if (!c23 || IsBadReadPtr(c23, sizeof(Component_23_Statescript))) return 0;
+    if (!c23->ss_inner.g3_arrWithIds.ptr || c23->ss_inner.g3_arrWithIds.num <= 0 || c23->ss_inner.g3_arrWithIds.num > 64) return 0;
+
+    int max_slot = 0;
+    for (int i = 0; i < c23->ss_inner.g3_arrWithIds.num; ++i) {
+        StatescriptInstance* sub = c23->ss_inner.g3_arrWithIds.ptr[i].instance;
+        if (!sub || IsBadReadPtr(sub, sizeof(StatescriptInstance))) continue;
+        if (!sub->graph || IsBadReadPtr(sub->graph, sizeof(STUStatescriptGraph))) continue;
+        if (!sub->graph->m_nodes.list() || sub->graph->m_nodes.count() < 4) continue;
+        if (!sub->state_impl_list.ptr || sub->state_impl_list.num <= 0) continue;
+        uint64_t sid = SafeReadVal<uint64_t>((uintptr_t)sub + 0x150);
+        int slot = 0;
+        if (sub->rid_instance_varbag && !IsBadReadPtr(sub->rid_instance_varbag, sizeof(StatescriptVar_VarBag))) {
+            slot = ReadVarBagInt32(sub->rid_instance_varbag, 0x0D8000000000001CLL);
+        }
+        if (slot <= 0) {
+            // Known 2-weapon hero scripts (Mercy Staff=1 / Blaster=2, Torbjorn Rivet Gun=1 / Forge Hammer=2)
+            if (sid == 0x058000000000006BULL || sid == 0x0580000000000102ULL) slot = 1;
+            else if (sid == 0x058000000000006DULL || sid == 0x05800000000000F3ULL) slot = 2;
+            if (slot > 0) {
+                StatescriptPrimitive scv(StatescriptPrimitive_INT, (int64_t)slot);
+                StatescriptVar_VarBag* inst_bags[3] = { sub->rid_instance_varbag, sub->second_inst_varbag, sub->third_inst_varbag };
+                for (StatescriptVar_VarBag* vb : inst_bags) {
+                    if (vb && !IsBadReadPtr(vb, sizeof(StatescriptVar_VarBag))) {
+                        vb->SetVar({ 0x0D8000000000001CLL }, scv);
+                        NotifyVarInBag(&c23->ss_inner, sub, vb, 0x0D8000000000001CLL, scv);
+                    }
+                }
+            }
+        }
+        if (slot >= 1 && slot <= 3) {
+            out_slots[slot] = sub;
+            if (slot > max_slot) max_slot = slot;
+        }
+    }
+    return max_slot;
+}
+
+static uint32_t GetGraphNodeSTUHash(STUStatescriptBase* node) {
+    if (!node || IsBadReadPtr(node, sizeof(STUStatescriptBase))) return 0;
+    if (!node->graph_node.base.vfptr || IsBadReadPtr(node->graph_node.base.vfptr, sizeof(STUBase_vt))) return 0;
+    STUInfo* info = node->graph_node.base.vfptr->GetSTUInfo();
+    if (!info || IsBadReadPtr(info, sizeof(STUInfo))) return 0;
+    return info->name_hash;
+}
+
+static void AnalyzeWeaponScriptGraph(
+    StatescriptInstance* w_inst,
+    std::vector<int>& out_top_switches,
+    std::vector<int>& out_direct_true_states,
+    bool out_in_equip_subgraph[256])
+{
+    out_top_switches.clear();
+    out_direct_true_states.clear();
+    memset(out_in_equip_subgraph, 0, 256);
+    if (!w_inst || !w_inst->graph || IsBadReadPtr(w_inst->graph, sizeof(STUStatescriptGraph))) return;
+
+    int ncnt = w_inst->graph->m_nodes.count();
+    auto** nodes = w_inst->graph->m_nodes.list();
+    if (ncnt <= 0 || !nodes || IsBadReadPtr(nodes, sizeof(void*) * (size_t)(ncnt < 256 ? ncnt : 256))) return;
+    if (ncnt > 255) ncnt = 255;
+
+    bool is_permanent_ui_or_top[256] = {};
+    auto add_unique = [](std::vector<int>& vec, int val) {
+        for (int v : vec) if (v == val) return;
+        vec.push_back(val);
+    };
+
+    // 1. Identify permanent HUD/UI states and top-level states started at spawn by Entry:GameMsg (0x2F937AE3)
+    for (int ni = 0; ni < ncnt; ++ni) {
+        STUStatescriptBase* node = nodes[ni];
+        uint32_t nhash = GetGraphNodeSTUHash(node);
+        if (nhash == 0xC2A01675u || nhash == 0x2168E38Fu || nhash == 0xC739BAACu || nhash == 0x4AB09851u) {
+            is_permanent_ui_or_top[ni] = true;
+        }
+        if (nhash == 0x2F937AE3u) {
+            std::vector<STUStatescriptBase*> frontier;
+            frontier.push_back(node);
+            bool visited_act[256] = {};
+            visited_act[ni] = true;
+            for (size_t fi = 0; fi < frontier.size() && fi < 32; ++fi) {
+                STUStatescriptBase* cur = frontier[fi];
+                auto pmap = cur->get_output_plugs();
+                for (auto& pe : pmap) {
+                    for (auto* plug : pe.second) {
+                        if (!plug || IsBadReadPtr(plug, sizeof(STUGraphPlug))) continue;
+                        for (auto* lnk : plug->m_links) {
+                            if (!lnk || IsBadReadPtr(lnk, sizeof(STUGraphLink))) continue;
+                            if (!lnk->m_inputPlug || IsBadReadPtr(lnk->m_inputPlug, sizeof(STUStatescriptInputPlug))) continue;
+                            STUStatescriptBase* tgt = lnk->m_inputPlug->plug_base.m_parentNode;
+                            if (!tgt || IsBadReadPtr(tgt, sizeof(STUStatescriptBase))) continue;
+                            int tidx = tgt->idx_in_nodes;
+                            if (tidx < 0 || tidx >= ncnt) continue;
+                            if (tgt->m_isState) {
+                                uint32_t thash = GetGraphNodeSTUHash(tgt);
+                                if (thash == 0xE811ECBBu || thash == 0xC2A01675u || thash == 0x2168E38Fu ||
+                                    thash == 0xC739BAACu || thash == 0x4AB09851u) {
+                                    is_permanent_ui_or_top[tidx] = true;
+                                    if (thash == 0xE811ECBBu) {
+                                        add_unique(out_top_switches, tidx);
+                                    }
+                                }
+                            } else if (!visited_act[tidx]) {
+                                visited_act[tidx] = true;
+                                frontier.push_back(tgt);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Find the primary weapon-equip 0xE811ECBB (Cond:BoolSwitch) state whose +0x118 (m_onTruePlug) links to node[1] (0x6E81F6D4)
+    int equip_sw = -1;
+    for (int ni = 0; ni < ncnt; ++ni) {
+        STUStatescriptBase* node = nodes[ni];
+        if (GetGraphNodeSTUHash(node) != 0xE811ECBBu) continue;
+        STUGraphPlug* true_plug = SafeReadVal<STUGraphPlug*>((uintptr_t)node + 0x118);
+        if (!true_plug || IsBadReadPtr(true_plug, sizeof(STUGraphPlug))) continue;
+        for (auto* lnk : true_plug->m_links) {
+            if (!lnk || IsBadReadPtr(lnk, sizeof(STUGraphLink))) continue;
+            if (!lnk->m_inputPlug || IsBadReadPtr(lnk->m_inputPlug, sizeof(STUStatescriptInputPlug))) continue;
+            STUStatescriptBase* tgt = lnk->m_inputPlug->plug_base.m_parentNode;
+            if (tgt && !IsBadReadPtr(tgt, sizeof(STUStatescriptBase)) && tgt->idx_in_nodes == 1) {
+                equip_sw = ni;
+                break;
+            }
+        }
+        if (equip_sw >= 0) break;
+    }
+    if (equip_sw < 0 && 2 < ncnt && GetGraphNodeSTUHash(nodes[2]) == 0xE811ECBBu) {
+        equip_sw = 2;
+    }
+    if (equip_sw >= 0) {
+        is_permanent_ui_or_top[equip_sw] = true;
+        add_unique(out_top_switches, equip_sw);
+
+        // Collect direct state targets on equip_sw's +0x118 (m_onTruePlug), putting node[1] first
+        add_unique(out_direct_true_states, 1);
+        STUGraphPlug* true_plug = SafeReadVal<STUGraphPlug*>((uintptr_t)nodes[equip_sw] + 0x118);
+        if (true_plug && !IsBadReadPtr(true_plug, sizeof(STUGraphPlug))) {
+            std::vector<STUStatescriptBase*> act_q;
+            bool visited_act[256] = {};
+            for (auto* lnk : true_plug->m_links) {
+                if (!lnk || IsBadReadPtr(lnk, sizeof(STUGraphLink))) continue;
+                if (!lnk->m_inputPlug || IsBadReadPtr(lnk->m_inputPlug, sizeof(STUStatescriptInputPlug))) continue;
+                STUStatescriptBase* tgt = lnk->m_inputPlug->plug_base.m_parentNode;
+                if (!tgt || IsBadReadPtr(tgt, sizeof(STUStatescriptBase))) continue;
+                int tidx = tgt->idx_in_nodes;
+                if (tidx < 0 || tidx >= ncnt) continue;
+                if (tgt->m_isState) {
+                    add_unique(out_direct_true_states, tidx);
+                } else if (!visited_act[tidx]) {
+                    visited_act[tidx] = true;
+                    act_q.push_back(tgt);
+                }
+            }
+            for (size_t ai = 0; ai < act_q.size() && ai < 16; ++ai) {
+                auto pmap = act_q[ai]->get_output_plugs();
+                for (auto& pe : pmap) {
+                    for (auto* plug : pe.second) {
+                        if (!plug || IsBadReadPtr(plug, sizeof(STUGraphPlug))) continue;
+                        for (auto* lnk : plug->m_links) {
+                            if (!lnk || IsBadReadPtr(lnk, sizeof(STUGraphLink))) continue;
+                            if (!lnk->m_inputPlug || IsBadReadPtr(lnk->m_inputPlug, sizeof(STUStatescriptInputPlug))) continue;
+                            STUStatescriptBase* tgt = lnk->m_inputPlug->plug_base.m_parentNode;
+                            if (!tgt || IsBadReadPtr(tgt, sizeof(STUStatescriptBase))) continue;
+                            int tidx = tgt->idx_in_nodes;
+                            if (tidx < 0 || tidx >= ncnt) continue;
+                            if (tgt->m_isState) {
+                                add_unique(out_direct_true_states, tidx);
+                            } else if (!visited_act[tidx]) {
+                                visited_act[tidx] = true;
+                                act_q.push_back(tgt);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else if (1 < ncnt) {
+        add_unique(out_direct_true_states, 1);
+    }
+
+    // 3. BFS from out_direct_true_states across all output plugs to mark the entire equipped-weapon subgraph
+    std::vector<int> bfs_q;
+    bool bfs_vis[256] = {};
+    for (int sidx : out_direct_true_states) {
+        if (sidx >= 0 && sidx < ncnt && !is_permanent_ui_or_top[sidx]) {
+            bfs_vis[sidx] = true;
+            out_in_equip_subgraph[sidx] = true;
+            bfs_q.push_back(sidx);
+        }
+    }
+    for (size_t qi = 0; qi < bfs_q.size(); ++qi) {
+        STUStatescriptBase* cur = nodes[bfs_q[qi]];
+        if (!cur || IsBadReadPtr(cur, sizeof(STUStatescriptBase))) continue;
+        auto pmap = cur->get_output_plugs();
+        for (auto& pe : pmap) {
+            for (auto* plug : pe.second) {
+                if (!plug || IsBadReadPtr(plug, sizeof(STUGraphPlug))) continue;
+                for (auto* lnk : plug->m_links) {
+                    if (!lnk || IsBadReadPtr(lnk, sizeof(STUGraphLink))) continue;
+                    if (!lnk->m_inputPlug || IsBadReadPtr(lnk->m_inputPlug, sizeof(STUStatescriptInputPlug))) continue;
+                    STUStatescriptBase* tgt = lnk->m_inputPlug->plug_base.m_parentNode;
+                    if (!tgt || IsBadReadPtr(tgt, sizeof(STUStatescriptBase))) continue;
+                    int tidx = tgt->idx_in_nodes;
+                    if (tidx < 0 || tidx >= ncnt || is_permanent_ui_or_top[tidx] || bfs_vis[tidx]) continue;
+                    bfs_vis[tidx] = true;
+                    if (tgt->m_isState) {
+                        out_in_equip_subgraph[tidx] = true;
+                    }
+                    bfs_q.push_back(tidx);
+                }
+            }
+        }
+    }
+
+    // Also ensure any InputButton (0xFF77458C), WeaponVolley (0x860EE5FC), MeleeSweep (0x619D9E95), or Effect (0x6E81F6D4)
+    // state in the weapon script is marked in out_in_equip_subgraph so an unequipped weapon can never fire or swing
+    for (int ni = 0; ni < ncnt; ++ni) {
+        if (is_permanent_ui_or_top[ni]) continue;
+        uint32_t nhash = GetGraphNodeSTUHash(nodes[ni]);
+        if (nhash == 0xFF77458Cu || nhash == 0x860EE5FCu || nhash == 0x619D9E95u || nhash == 0x6E81F6D4u) {
+            out_in_equip_subgraph[ni] = true;
+        }
+    }
+}
+
+static bool SwitchHeroWeaponSlot(Entity* hero_ent, int target_slot, const char* reason) {
+    if (!hero_ent || IsBadReadPtr(hero_ent, sizeof(Entity))) return false;
+    auto* c23 = hero_ent->getById<Component_23_Statescript>(0x23);
+    if (!c23 || IsBadReadPtr(c23, sizeof(Component_23_Statescript))) return false;
+    if (!c23->ss_inner.rid_entity_varbag || IsBadReadPtr(c23->ss_inner.rid_entity_varbag, sizeof(StatescriptVar_VarBag))) return false;
+
+    StatescriptInstance* slots[4] = { nullptr, nullptr, nullptr, nullptr };
+    int num_weapons = DiscoverHeroWeaponSlots(c23, slots);
+    if (num_weapons < 2) return false;
+    if (target_slot < 1) target_slot = 1;
+    if (target_slot > num_weapons) target_slot = num_weapons;
+
+    std::vector<int> top_switches[4];
+    std::vector<int> direct_true_states[4];
+    bool in_equip_subgraph[4][256] = {};
+
+    bool any_started = false;
+    for (int s = 1; s <= num_weapons; ++s) {
+        if (!slots[s] || !slots[s]->graph || IsBadReadPtr(slots[s]->graph, sizeof(STUStatescriptGraph))) return false;
+        AnalyzeWeaponScriptGraph(slots[s], top_switches[s], direct_true_states[s], in_equip_subgraph[s]);
+        if (!statescript_logger::GetScriptNodeState(slots[s], 1).is_finish_state ||
+            !statescript_logger::GetScriptNodeState(slots[s], 2).is_finish_state) {
+            any_started = true;
+        }
+    }
+    if (!any_started) return false;
+
+    int cur_1f = ReadVarBagInt32(c23->ss_inner.rid_entity_varbag, 0x0D8000000000001FLL);
+    bool need_state_fixup = (cur_1f != target_slot);
+    for (int s = 1; s <= num_weapons; ++s) {
+        if (s == target_slot) {
+            for (int nidx : direct_true_states[s]) {
+                if (statescript_logger::GetScriptNodeState(slots[s], nidx).is_finish_state) {
+                    need_state_fixup = true;
+                    break;
+                }
+            }
+        } else {
+            int ncnt = slots[s]->graph->m_nodes.count();
+            if (ncnt > 255) ncnt = 255;
+            for (int ni = 0; ni < ncnt; ++ni) {
+                if (in_equip_subgraph[s][ni] && !statescript_logger::GetScriptNodeState(slots[s], ni).is_finish_state) {
+                    need_state_fixup = true;
+                    break;
+                }
+            }
+        }
+    }
+    if (!need_state_fixup) return false;
+
+    // 1. Stop ALL active states in the unequipped weapons' equip subgraph FIRST (before starting eq_inst's node[1])
+    //    so all InputButton (0xFF77458C), WeaponVolley (0x860EE5FC), MeleeSweep (0x619D9E95), and intermediate
+    //    subgraph states stop, and stopping node[1] (0x6E81F6D4) last despawns the old 1P weapon entity from
+    //    comp23 + 0x1458 slot 1 before the newly equipped weapon spawns into slot 1.
+    //    Permanent HUD/UI states (0xC2A01675, 0x2168E38F, 0xC739BAAC, 0x4AB09851, and Entry:GameMsg-started 0xE811ECBB)
+    //    are never in in_equip_subgraph and remain untouched.
+    std::string stopped_str;
+    for (int s = 1; s <= num_weapons; ++s) {
+        if (s == target_slot || !slots[s]) continue;
+        StatescriptInstance* w_inst = slots[s];
+        uint64_t sid = SafeReadVal<uint64_t>((uintptr_t)w_inst + 0x150);
+        if (sid == 0x058000000000006BULL) {
+            s_mercy_heal_beam_active = false;
+            s_mercy_boost_beam_active = false;
+            s_mercy_beam_target_entid = 0;
+        }
+        int scnt = w_inst->state_impl_list.num;
+        auto** slist = w_inst->state_impl_list.ptr;
+        if (scnt > 0 && slist && !IsBadReadPtr(slist, sizeof(void*) * (size_t)scnt)) {
+            for (int si = scnt - 1; si >= 0; --si) {
+                StatescriptState* st = slist[si];
+                if (!st || IsBadReadPtr(st, sizeof(StatescriptState))) continue;
+                STUStatescriptState* stu_st = w_inst->graph->STUFromState(st);
+                if (!stu_st || IsBadReadPtr(stu_st, sizeof(STUStatescriptBase))) continue;
+                int nidx = ((STUStatescriptBase*)stu_st)->idx_in_nodes;
+                if (nidx <= 1 || nidx >= 256 || !in_equip_subgraph[s][nidx]) continue;
+                if (!statescript_logger::GetScriptNodeState(w_inst, nidx).is_finish_state) {
+                    w_inst->StartStopState(nidx, false);
+                    stopped_str += std::format("{} ", nidx);
+                }
+            }
+        }
+        if (!statescript_logger::GetScriptNodeState(w_inst, 1).is_finish_state) {
+            w_inst->StartStopState(1, false);
+            stopped_str += "1 ";
+        }
+    }
+
+    // 2. Keep top-level 0xE811ECBB Cond:BoolSwitch states (node[2], etc.) ACTIVE on all weapon slots
+    for (int s = 1; s <= num_weapons; ++s) {
+        if (!slots[s]) continue;
+        for (int sw_idx : top_switches[s]) {
+            if (statescript_logger::GetScriptNodeState(slots[s], sw_idx).is_finish_state) {
+                slots[s]->StartStopState(sw_idx, true);
+            }
+        }
+    }
+
+    // 3. Update 0x1E (desired slot) and 0x1F (active slot) and notify subscribed HUD/weapon states (0xC2A01675 +0xD1CE40, 0xE811ECBB +0xF55420)
+    StatescriptInstance* eq_inst = slots[target_slot];
+    if (eq_inst) {
+        StatescriptPrimitive p_slot(StatescriptPrimitive_INT, (int64_t)target_slot);
+        c23->ss_inner.rid_entity_varbag->SetVar({ 0x0D8000000000001ELL }, p_slot);
+        c23->ss_inner.rid_entity_varbag->SetVar({ StatescriptVar_ENTITY_VARBAG, 0x0D8000000000001ELL }, p_slot);
+        NotifyVarInBag(&c23->ss_inner, eq_inst, c23->ss_inner.rid_entity_varbag, 0x0D8000000000001ELL, p_slot);
+        c23->ss_inner.rid_entity_varbag->SetVar({ 0x0D8000000000001FLL }, p_slot);
+        c23->ss_inner.rid_entity_varbag->SetVar({ StatescriptVar_ENTITY_VARBAG, 0x0D8000000000001FLL }, p_slot);
+        NotifyVarInBag(&c23->ss_inner, eq_inst, c23->ss_inner.rid_entity_varbag, 0x0D8000000000001FLL, p_slot);
+
+        // 4. Start ONLY the equipped weapon's direct node[2] +0x118 (m_onTruePlug) target states (never hardcoding node[3]!)
+        uint64_t eq_sid = SafeReadVal<uint64_t>((uintptr_t)eq_inst + 0x150);
+        std::string started_str;
+        for (int nidx : direct_true_states[target_slot]) {
+            if (nidx >= 0 && nidx < eq_inst->graph->m_nodes.count() &&
+                statescript_logger::GetScriptNodeState(eq_inst, nidx).is_finish_state) {
+                eq_inst->StartStopState(nidx, true);
+                started_str += std::format("{} ", nidx);
+            }
+        }
+
+        // Write 0x31 directly via SetVar WITHOUT NotifyVarInBag (calling NotifyVarInBag on 0x31 while node[1] 0x6E81F6D4
+        // has [state+0xBC] > 0 triggers +0xD85DA0 -> +0xD85E30 -> +0xD86F30 which despawns the 1P weapon entity!)
+        uint32_t wpn_h = ((uint32_t)(uint16_t)eq_inst->instance_id << 16) | 1u;
+        StatescriptPrimitive p_wpn(StatescriptPrimitive_INTVEC4, (int64_t)(uint64_t)wpn_h);
+        c23->ss_inner.rid_entity_varbag->SetVar({ 0x0D80000000000031LL }, p_wpn);
+        c23->ss_inner.rid_entity_varbag->SetVar({ StatescriptVar_ENTITY_VARBAG, 0x0D80000000000031LL }, p_wpn);
+        c23->ss_inner.needs_process_e = 1;
+
+        ShotDiagLogFmt("[WEAPON_SWITCH (%s)] slot=%d->%d/%d script=0x%llX inst=%d h=0x%X stopped=[%s] started=[%s]",
+            reason ? reason : "SWITCH", cur_1f, target_slot, num_weapons,
+            (unsigned long long)eq_sid,
+            (int)eq_inst->instance_id, wpn_h,
+            stopped_str.c_str(), started_str.c_str());
+    }
+    return true;
+}
+
+static bool CycleHeroWeaponSlot(Entity* hero_ent, int dir, const char* reason) {
+    if (!hero_ent || IsBadReadPtr(hero_ent, sizeof(Entity))) return false;
+    auto* c23 = hero_ent->getById<Component_23_Statescript>(0x23);
+    if (!c23 || IsBadReadPtr(c23, sizeof(Component_23_Statescript))) return false;
+    if (!c23->ss_inner.rid_entity_varbag || IsBadReadPtr(c23->ss_inner.rid_entity_varbag, sizeof(StatescriptVar_VarBag))) return false;
+
+    StatescriptInstance* slots[4] = { nullptr, nullptr, nullptr, nullptr };
+    int num_weapons = DiscoverHeroWeaponSlots(c23, slots);
+    if (num_weapons < 2) return false;
+
+    uint64_t now_ms = GetTickCount64();
+    if (now_ms - s_last_weapon_scroll_ms < 150) return false;
+    s_last_weapon_scroll_ms = now_ms;
+
+    int cur_slot = ReadVarBagInt32(c23->ss_inner.rid_entity_varbag, 0x0D8000000000001FLL);
+    if (cur_slot < 1 || cur_slot > num_weapons) cur_slot = 1;
+    int next_slot = (dir >= 0) ? ((cur_slot % num_weapons) + 1)
+                               : (((cur_slot - 2 + num_weapons) % num_weapons) + 1);
+    return SwitchHeroWeaponSlot(hero_ent, next_slot, reason);
+}
+
 using TickProjectileManagerFn = void(__fastcall*)(void* proj_sys);
 static TickProjectileManagerFn TickProjectileManager_orig = nullptr;
 static void __fastcall TickProjectileManager_hook(void* proj_sys) {
@@ -4489,6 +4884,58 @@ static void __fastcall TickProjectileManager_hook(void* proj_sys) {
             s_active_dash_sweep_end_ms = 0;
             s_riptire_ent_id = 0;
             s_riptire_end_ms = 0;
+            s_pending_weapon_slot = 1;
+            s_pending_weapon_cycle_dir = 0;
+            s_pending_weapon_reason = "HERO_INIT";
+        }
+        {
+            static bool s_prev_key_1 = false;
+            static bool s_prev_key_2 = false;
+            bool key_1_down = (GetAsyncKeyState('1') & 0x8000) != 0;
+            bool key_2_down = (GetAsyncKeyState('2') & 0x8000) != 0;
+            if ((key_1_down && !s_prev_key_1) || (key_2_down && !s_prev_key_2)) {
+                DWORD fg_pid = 0;
+                if (HWND fg_wnd = GetForegroundWindow()) {
+                    GetWindowThreadProcessId(fg_wnd, &fg_pid);
+                }
+                if (fg_pid == GetCurrentProcessId()) {
+                    if (key_1_down && !s_prev_key_1) {
+                        s_pending_weapon_slot = 1;
+                        s_pending_weapon_reason = "KEY_1";
+                    } else if (key_2_down && !s_prev_key_2) {
+                        s_pending_weapon_slot = 2;
+                        s_pending_weapon_reason = "KEY_2";
+                    }
+                }
+            }
+            s_prev_key_1 = key_1_down;
+            s_prev_key_2 = key_2_down;
+        }
+        if (s_pending_weapon_cycle_dir != 0) {
+            int dir = s_pending_weapon_cycle_dir;
+            const char* rsn = s_pending_weapon_reason;
+            s_pending_weapon_cycle_dir = 0;
+            s_pending_weapon_reason = nullptr;
+            CycleHeroWeaponSlot(local_hero, dir, rsn);
+        } else if (s_pending_weapon_slot > 0) {
+            int slot_req = s_pending_weapon_slot;
+            const char* rsn = s_pending_weapon_reason;
+            s_pending_weapon_slot = 0;
+            s_pending_weapon_reason = nullptr;
+            SwitchHeroWeaponSlot(local_hero, slot_req, rsn);
+        } else if (auto* c23 = local_hero->getById<Component_23_Statescript>(0x23)) {
+            if (!IsBadReadPtr(c23, sizeof(Component_23_Statescript)) && c23->ss_inner.rid_entity_varbag &&
+                !IsBadReadPtr(c23->ss_inner.rid_entity_varbag, sizeof(StatescriptVar_VarBag))) {
+                StatescriptInstance* w_slots[4] = { nullptr, nullptr, nullptr, nullptr };
+                if (DiscoverHeroWeaponSlots(c23, w_slots) >= 2 && w_slots[1] && w_slots[2]) {
+                    bool s1_on = !statescript_logger::GetScriptNodeState(w_slots[1], 1).is_finish_state;
+                    bool s2_on = !statescript_logger::GetScriptNodeState(w_slots[2], 1).is_finish_state;
+                    int cur_1f = ReadVarBagInt32(c23->ss_inner.rid_entity_varbag, 0x0D8000000000001FLL);
+                    if ((s1_on && s2_on) || cur_1f <= 0) {
+                        SwitchHeroWeaponSlot(local_hero, (cur_1f >= 1 && cur_1f <= 2) ? cur_1f : 1, "SPAWN_AUTO_SYNC");
+                    }
+                }
+            }
         }
         auto* comp15 = local_hero->getById<Component_15_STUCharacterMoverComponent>(0x15);
         auto* comp01 = local_hero->getById<Component_1_SceneRendering>(1);
@@ -4738,7 +5185,7 @@ static void __fastcall TickProjectileManager_hook(void* proj_sys) {
                         // Mercy Caduceus Staff (0x058000000000006B):
                         // - Visual beam tether (node[37] 0xC0A88BB0 STUStatescriptStateBeamEffect, unlinked in client graph)
                         // - 50 HP/s (+5.0 HP / 100ms) heal while Heal Beam Lock (node[8] / node[18]) is active on target in 0x0D800000000001D4
-                        if (inst_6B) {
+                        if (inst_6B && !statescript_logger::GetScriptNodeState(inst_6B, 1).is_finish_state) {
                             uint32_t vb_mercy_tgt = GetMercyLockedTarget(inst_6B);
                             bool beam_fx_active = !statescript_logger::GetScriptNodeState(inst_6B, 37).is_finish_state;
                             bool heal_lock_active = s_mercy_heal_beam_active || !statescript_logger::GetScriptNodeState(inst_6B, 8).is_finish_state;
@@ -5716,6 +6163,21 @@ static uint8_t __fastcall StatescriptAction_ExecuteAndContinue_hook(
                  script_id == 0x05800000000001F0ULL || script_id == 0x058000000000022FULL) && owner_ent) {
                 RefillHeroWeaponAmmo(owner_ent);
             }
+        } else if (stu_hash == 0x17C9F80Bu) {
+            // 0x17C9F80B: Server-stripped Weapon Selection Action in 0x0580000000000015 (STUWeaponComponent::m_managerScript)
+            //   - node[19]: Initial weapon selection on spawn (selects slot 1)
+            //   - node[12]: Next Weapon (Scroll Wheel 0x5F)
+            //   - node[13]: Prev Weapon (Scroll Wheel 0x5E)
+            if (script_id == 0x0580000000000015ULL && owner_ent && owner_ent == GetLocalHeroModelEnt()) {
+                int nidx = stu_node->idx_in_nodes;
+                if (nidx == 19) {
+                    s_pending_weapon_slot = 1;
+                    s_pending_weapon_reason = "ACT_17C9F80B_INIT";
+                } else {
+                    s_pending_weapon_cycle_dir = (nidx == 13) ? -1 : 1;
+                    s_pending_weapon_reason = (nidx == 13) ? "SCROLL_PREV" : "SCROLL_NEXT";
+                }
+            }
         } else if (stu_hash == 0x1BB99C36u || stu_hash == 0x0E3689F3u) {
             SpawnStatescriptSubEntity(inst, stu_node, stu_hash);
         } else if (stu_hash == 0x5C46D801u) {
@@ -6085,6 +6547,34 @@ static uint32_t __fastcall StatescriptState_StartState_hook(StatescriptState* st
         }
     }
 
+    // Pre-seed multi-weapon slot variables (0x1C in instance VarBag, 0x1E/0x1F = 1 in entity VarBag) BEFORE
+    // node[2] (0xE811ECBB Cond:BoolSwitch) or 0xC2A01675 (HUD weapon indicator) evaluates on initial spawn!
+    {
+        uint64_t pre_sid = SafeReadVal<uint64_t>((uintptr_t)inst + 0x150);
+        if (pre_sid == 0x058000000000006BULL || pre_sid == 0x058000000000006DULL ||
+            pre_sid == 0x0580000000000102ULL || pre_sid == 0x05800000000000F3ULL ||
+            pre_sid == 0x0580000000000015ULL) {
+            int w_slot = (pre_sid == 0x058000000000006BULL || pre_sid == 0x0580000000000102ULL) ? 1 :
+                         ((pre_sid == 0x058000000000006DULL || pre_sid == 0x05800000000000F3ULL) ? 2 : 0);
+            if (w_slot > 0 && inst->rid_instance_varbag && !IsBadReadPtr(inst->rid_instance_varbag, sizeof(StatescriptVar_VarBag))) {
+                if (ReadVarBagInt32(inst->rid_instance_varbag, 0x0D8000000000001CLL) != w_slot) {
+                    StatescriptPrimitive scv(StatescriptPrimitive_INT, (int64_t)w_slot);
+                    inst->rid_instance_varbag->SetVar({ 0x0D8000000000001CLL }, scv);
+                }
+            }
+            if (inst->ss_inner && inst->ss_inner->rid_entity_varbag &&
+                !IsBadReadPtr(inst->ss_inner->rid_entity_varbag, sizeof(StatescriptVar_VarBag))) {
+                if (ReadVarBagInt32(inst->ss_inner->rid_entity_varbag, 0x0D8000000000001FLL) <= 0) {
+                    StatescriptPrimitive p1(StatescriptPrimitive_INT, 1LL);
+                    inst->ss_inner->rid_entity_varbag->SetVar({ 0x0D8000000000001ELL }, p1);
+                    inst->ss_inner->rid_entity_varbag->SetVar({ StatescriptVar_ENTITY_VARBAG, 0x0D8000000000001ELL }, p1);
+                    inst->ss_inner->rid_entity_varbag->SetVar({ 0x0D8000000000001FLL }, p1);
+                    inst->ss_inner->rid_entity_varbag->SetVar({ StatescriptVar_ENTITY_VARBAG, 0x0D8000000000001FLL }, p1);
+                }
+            }
+        }
+    }
+
     uint32_t saved_exec_flags = inst->execution_flags;
     inst->execution_flags = (inst->execution_flags | 0x400008u) & ~0x1000u;
 
@@ -6199,7 +6689,8 @@ static uint32_t __fastcall StatescriptState_StartState_hook(StatescriptState* st
                     }
                     if (dmg <= 0.0f) {
                         if (script_id == 0x0580000000000052ULL || script_id == 0x0580000000000041ULL ||
-                            script_id == 0x058000000000007DULL || script_id == 0x05800000000000BEULL) dmg = 75.0f; // Reinhardt / Torb Hammer / Charge
+                            script_id == 0x05800000000000F3ULL ||
+                            script_id == 0x058000000000007DULL || script_id == 0x05800000000000BEULL) dmg = 75.0f; // Reinhardt / Torb Hammer (0xF3) / Charge
                         else if (script_id == 0x0580000000000044ULL) dmg = 120.0f; // Genji Dragonblade
                         else if (script_id == 0x05800000000001DBULL || script_id == 0x05800000000001DCULL ||
                                  script_id == 0x0580000000000045ULL || script_id == 0x0580000000000157ULL ||
@@ -6289,8 +6780,8 @@ static uint32_t __fastcall StatescriptState_StartState_hook(StatescriptState* st
                                 ArmEnemyKnockback(ent, push_dir, 14.0f, 5.5f, 500); // Winston Primal Rage
                             } else if (script_id == 0x058000000000047EULL || script_id == 0x058000000000026AULL || script_id == 0x0580000000000B2FULL) {
                                 ArmEnemyKnockback(ent, push_dir, 12.0f, 4.5f, 450); // D.Va Boosters
-                            } else if (script_id == 0x0580000000000052ULL || script_id == 0x0580000000000041ULL) {
-                                ArmEnemyKnockback(ent, push_dir, 5.5f, 2.0f, 250); // Reinhardt / Torb Hammer
+                            } else if (script_id == 0x0580000000000052ULL || script_id == 0x0580000000000041ULL || script_id == 0x05800000000000F3ULL) {
+                                ArmEnemyKnockback(ent, push_dir, 5.5f, 2.0f, 250); // Reinhardt / Torb Hammer (0xF3)
                             }
                             ShotDiagLogFmt("[MELEE_SWEEP (0x619D9E95)] script=0x%llX hit=0x%X dist=%.2fm -%.1f -> HP %.1f",
                                 (unsigned long long)script_id, ent->entity_id, dist, dmg, new_hp);
@@ -6502,6 +6993,27 @@ static void OnUniversalStateEntry(StatescriptSyncMgr* ss, StatescriptInstance* i
 
     if (!is_local || !owner_ent) return;
 
+    // 1b. Multi-Weapon Manager Script (0x0580000000000015 STUWeaponComponent::m_managerScript):
+    //   - On initial entry (node[14], node[20], node[43]) after node[37]/node[38] reset 0x1E=0 & 0x1F=0, select Weapon 1.
+    //   - On weapon-switch request state (node[21], node[33], node[30]), commit desired slot 0x0D8000000000001E to 0x0D8000000000001F.
+    if (script_id == 0x0580000000000015ULL) {
+        if (node_idx == 14 || node_idx == 20 || node_idx == 43) {
+            if (inst->ss_inner && inst->ss_inner->rid_entity_varbag &&
+                ReadVarBagInt32(inst->ss_inner->rid_entity_varbag, 0x0D8000000000001FLL) <= 0) {
+                s_pending_weapon_slot = 1;
+                s_pending_weapon_reason = "SS_0x15_INIT";
+            }
+        } else if (node_idx == 21 || node_idx == 33 || node_idx == 30) {
+            if (inst->ss_inner && inst->ss_inner->rid_entity_varbag) {
+                int desired_slot = ReadVarBagInt32(inst->ss_inner->rid_entity_varbag, 0x0D8000000000001ELL);
+                if (desired_slot >= 1) {
+                    s_pending_weapon_slot = desired_slot;
+                    s_pending_weapon_reason = "SS_0x15_KEY";
+                }
+            }
+        }
+    }
+
     // 2. McCree Combat Roll (0x05800000000001E9 / 0x05800000000001F0): immediate 6/6 Peacekeeper ammo refill
     if (script_id == 0x05800000000001E9ULL || script_id == 0x05800000000001F0ULL) {
         if (node_idx == 22 || stu_hash == 0x2A0FB7E6u || stu_hash == 0xD78490D1u) {
@@ -6567,19 +7079,20 @@ static void OnUniversalStateEntry(StatescriptSyncMgr* ss, StatescriptInstance* i
         s_zen_harmony_hot_active = (s_zen_harmony_target_entid != 0);
         ShotDiagLogFmt("[ZEN_HARMONY_START (0xE831BEF1)] script=0x%llX node=%d target=0x%X (30 HP/s)",
             (unsigned long long)script_id, node_idx, s_zen_harmony_target_entid);
-    } else if (script_id == 0x058000000000006BULL || script_id == 0x058000000000006DULL) {
-        // Mercy Caduceus Staff (0x6B, inst=-8 -> 0xFFF80001) & Caduceus Blaster (0x6D, inst=-9 -> 0xFFF70001):
-        // Keep Component_23 VarBag 0x0D80000000000031 synced to the active weapon script's child_slot handle
-        // before 0xFFBFA88D (node[34]/node[35]) / 0xC0A88BB0 (node[37]) resolves the weapon entity via +0xD562E0.
+    } else if (script_id == 0x058000000000006BULL || script_id == 0x058000000000006DULL ||
+               script_id == 0x0580000000000102ULL || script_id == 0x05800000000000F3ULL) {
+        // Multi-weapon heroes (Mercy 0x6B/0x6D, Torbjorn 0x102/0xF3):
+        // Keep Component_23 VarBag 0x0D80000000000031 synced to the currently equipped weapon script's child_slot handle
+        // before +0xD451A0 (LookupBarrelMuzzleEntity) or +0xD562E0 (Mercy beam origin) resolves the 1P weapon entity.
         if (inst->ss_inner && inst->ss_inner->rid_entity_varbag &&
             !IsBadReadPtr(inst->ss_inner->rid_entity_varbag, sizeof(StatescriptVar_VarBag)) &&
+            !statescript_logger::GetScriptNodeState(inst, 1).is_finish_state &&
             node_idx != 0 && node_idx != 1 && node_idx != 2 && node_idx != 58 && node_idx != 105 && node_idx != 116) {
             uint32_t wpn_h = ((uint32_t)(uint16_t)inst->instance_id << 16) | 1u;
             if ((uint32_t)ReadVarBagInt32(inst->ss_inner->rid_entity_varbag, 0x0D80000000000031LL) != wpn_h) {
                 StatescriptPrimitive p_wpn(StatescriptPrimitive_INTVEC4, (int64_t)(uint64_t)wpn_h);
                 inst->ss_inner->rid_entity_varbag->SetVar({ 0x0D80000000000031LL }, p_wpn);
                 inst->ss_inner->rid_entity_varbag->SetVar({ StatescriptVar_ENTITY_VARBAG, 0x0D80000000000031LL }, p_wpn);
-                NotifyVarInBag(inst->ss_inner, inst, inst->ss_inner->rid_entity_varbag, 0x0D80000000000031LL, p_wpn);
             }
         }
         if (script_id == 0x058000000000006BULL) {
@@ -8133,6 +8646,18 @@ static const char* ResolveSSNodeName(uint32_t hash) {
     case 0x40AD92BE: return "CV:HasAITarget";
     case 0x65F158DA: return "State:WaitAnim";
     case 0x7FB4BF64: return "State:DoorWait/Sweep";
+    case 0xFF77458C: return "State:InputButton";
+    case 0x2168E38F: return "State:BeamTargetUI";
+    case 0xC739BAAC: return "State:BeamReticleUI";
+    case 0x4AB09851: return "State:HeroHUDMonitor";
+    case 0x970EC198: return "State:VarRampTimer";
+    case 0xB1032DAF: return "Cond:IfBranch";
+    case 0xEB923A6A: return "Act:PlayHardpointAnim";
+    case 0x5046363D: return "Act:AnimLayerTag";
+    case 0x381D6654: return "State:AnimTag";
+    case 0xA7213568: return "State:SubgraphGroup";
+    case 0x26367267: return "State:MultiSwitch";
+    case 0x44E7F474: return "State:WeaponFireFX";
     default: break;
     }
     auto it = allmighty_hash_lib::hashes.find(hash);
