@@ -35,6 +35,9 @@ void player_spawner::tick_pending_lockon_bits() {
 				c10->pre_filter_bits |= 0x1;
 				c10->FilterBitsMakeFinal();
 			}
+			if (auto* c1 = ent->getById<Component_1_SceneRendering>(1)) {
+				c1->SetVisible();
+			}
 		}
 		s_pending_lockon_bits.erase(s_pending_lockon_bits.begin() + i);
 	}
@@ -233,7 +236,19 @@ void player_spawner::modify_ent(spawn_info info, Entity* ent) {
 	if (player_info) {
 		player_info->hero_select_enabled = true;
 		player_info->hero_was_selected = true;
-		player_info->m_slot = 3;
+		if (info.set_localent || controller_info.set_localent) {
+			player_info->m_slot = 3;
+		} else {
+			static int s_dummy_slot_counter = 0;
+			static uint32 s_last_slot_ctrl_id = 0;
+			uint32 cur_ctrl_id = controller_ent ? controller_ent->entity_id : ent->entity_id;
+			if (cur_ctrl_id != 0 && cur_ctrl_id != s_last_slot_ctrl_id) {
+				s_last_slot_ctrl_id = cur_ctrl_id;
+				s_dummy_slot_counter++;
+			}
+			const uint8_t kDummySlots[5] = { 1, 2, 4, 5, 6 };
+			player_info->m_slot = kDummySlots[s_dummy_slot_counter % 5];
+		}
 		player_info->selected_heroid = info.heroid;
 		player_info->unconformed_selected_heroid = info.heroid;
 		player_info->localplayer_heroselected = true;
@@ -259,6 +274,11 @@ void player_spawner::modify_ent(spawn_info info, Entity* ent) {
 			filter_bits->set_team(info.team);
 		}
 		filter_bits->FilterBitsMakeFinal();
+		if (!info.set_filterbits_controller && ent == model_ent) {
+			if (auto* c1 = ent->getById<Component_1_SceneRendering>(1)) {
+				c1->SetVisible();
+			}
+		}
 	}
 
 	Component_23_Statescript* statescript = ent->getById<Component_23_Statescript>(0x23);
@@ -314,7 +334,7 @@ void player_spawner::modify_ent(spawn_info info, Entity* ent) {
 				if (is_local_model) {
 					inst->execution_flags = (inst->execution_flags | 0x400009u | 0x200000u) & ~0x1004u;
 				} else {
-					inst->execution_flags = (inst->execution_flags | 0x400009u) & ~(0x1004u | 0x200000u);
+					inst->execution_flags = (inst->execution_flags | 0x400001u) & ~(0x100Cu | 0x200000u);
 				}
 				inst->vfptr->RedoCheckIsAimEnt(inst);
 			}
@@ -410,6 +430,8 @@ std::pair<Entity*, Entity*> player_spawner::spawn() {
 	if (!use_deferred_spawn) {
 		modify_ent(controller_info, controller_ent);
 		modify_ent(model_info, model_ent);
+		auto on_backref_assigned = (void(__fastcall*)(Entity*, uint*))(globals::gameBase + 0xd07830);
+		on_backref_assigned(model_ent, &controller_ent->entity_id);
 		return { controller_ent, model_ent };
 	}
 
@@ -431,6 +453,7 @@ std::pair<Entity*, Entity*> player_spawner::spawn() {
 	diag_varbag_ready = false;
 	diag_instance_count = 0;
 	spawn_state = DeferredSpawnState::WAITING_FOR_COMPONENTS;
+	tick_deferred_spawn();
 
 	return { controller_ent, model_ent };
 }
@@ -508,6 +531,7 @@ void player_spawner::tick_deferred_spawn() {
 		this->model_ent = m_ent;
 
 		modify_ent(pending_controller_info, c_ent);
+		modify_ent(pending_model_info, m_ent);
 
 		if (c_ent && m_ent) {
 			Component_1F_Backref* petref = m_ent->getById<Component_1F_Backref>(0x1F);
@@ -516,23 +540,33 @@ void player_spawner::tick_deferred_spawn() {
 				petref->backref_entid = backref_ent->entity_id;
 				petref->backref_global_entid = backref_ent->entity_global_id;
 			}
-			if (pending_controller_info.set_localent && c_ent->getById<Component_2F_LocalPlayer>(0x2F) != nullptr) {
-				auto tell_statescript_this_is_localent = (void(__fastcall*)(Entity*, uint*))(globals::gameBase + 0xd07830);
-				tell_statescript_this_is_localent(m_ent, &c_ent->entity_id);
-			}
+			// +0xD07830 (OnEntityBackrefAssigned): checks Component_2F internally (+0xD078F6) for LocalPlayer,
+			// and for all entities (including non-local dummies) calls +0x1070370(comp23, &c_ent->entity_id)
+			// (Component_23::OnBackrefAssigned) at +0xD07C1B, setting has_player_entbackref = 1 and notifying
+			// 0x058000000000004B via vt+0x270 to spawn child script 0x05800000000001C7 (WorldUI3D / HealthbarViewModel / Nameplate)!
+			auto on_backref_assigned = (void(__fastcall*)(Entity*, uint*))(globals::gameBase + 0xd07830);
+			on_backref_assigned(m_ent, &c_ent->entity_id);
 		}
-
-		modify_ent(pending_model_info, m_ent);
 
 		auto* c23 = m_ent->getById<Component_23_Statescript>(0x23);
 		if (c23) {
+			bool has_1c7 = false;
+			for (auto* inst : c23->ss_inner.g1_instanceArr) {
+				if (inst && inst->script_id == 0x05800000000001C7ULL) {
+					has_1c7 = true;
+					break;
+				}
+			}
+			if (!has_1c7) {
+				c23->loadScript(0x05800000000001C7ULL);
+			}
 			bool is_local_model = (pending_controller_info.set_localent || (c_ent && ea->local_entid == c_ent->entity_id));
 			for (auto* inst : c23->ss_inner.g1_instanceArr) {
 				if (inst) {
 					if (is_local_model) {
 						inst->execution_flags = (inst->execution_flags | 0x400009u | 0x200000u) & ~0x1004u;
 					} else {
-						inst->execution_flags = (inst->execution_flags | 0x400009u) & ~(0x1004u | 0x200000u);
+						inst->execution_flags = (inst->execution_flags | 0x400001u) & ~(0x100Cu | 0x200000u);
 					}
 					inst->vfptr->RedoCheckIsAimEnt(inst);
 				}

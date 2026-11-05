@@ -3186,14 +3186,19 @@ void __fastcall UpdateHealthbarVisibility_hook(uintptr_t sys46) {
             }
 
             bool any_show_hb = false;
+            Entity* local_ctrl_ent = ea->getEntById(ea->local_entid);
+            auto* local_c10 = local_ctrl_ent ? local_ctrl_ent->getById<Component_10_FilterBits>(0x10) : nullptr;
             for (Entity* ent : *ea) {
                 if (!ent || ent->entity_id == ea->local_entid || ent->entity_id == local_mdl_id) continue;
                 if (!ent->hasComponent(0x15) || !ent->hasComponent(0x28)) continue;
                 auto* c28 = ent->getById<Component_28_STUHealthComponent>(0x28);
                 if (!c28) continue;
+                auto* ent_c10 = ent->getById<Component_10_FilterBits>(0x10);
+                bool is_friendly_dummy = (local_c10 && ent_c10 &&
+                    (local_c10->filter_bits & 0x3C0000ULL) == (ent_c10->filter_bits & 0x3C0000ULL));
                 float ent_cur_hp = c28->CalcTotalCurrentHealth();
                 float ent_max_hp = c28->CalcTotalMaxHealth();
-                bool ent_show_hb = (ent_cur_hp > 0.0f && ent_max_hp > 0.0f && ent_cur_hp < ent_max_hp);
+                bool ent_show_hb = (ent_cur_hp > 0.0f && ent_max_hp > 0.0f && (is_friendly_dummy || ent_cur_hp < ent_max_hp));
                 if (ent_show_hb) {
                     any_show_hb = true;
                     bool in_ring = false;
@@ -3237,7 +3242,7 @@ void __fastcall UpdateHealthbarVisibility_hook(uintptr_t sys46) {
                     *(uint32_t*)(entry + 0x00) = 0;
                     *(uint32_t*)(entry + 0x04) = 0;
                 }
-                local_c2f->field_17F0 = 0;
+                local_c2f->field_17F0 = -1;
                 local_c2f->field_17F4 = 0;
                 *(uint8_t*)(sys46 + 0x99) = 1;
             }
@@ -3248,7 +3253,9 @@ void __fastcall UpdateHealthbarVisibility_hook(uintptr_t sys46) {
 
     if (ea && ea->local_entid && local_c2f) {
         uint32_t local_mdl_id = 0;
-        if (Entity* local_ctrl = ea->getEntById(ea->local_entid)) {
+        Entity* local_ctrl = ea->getEntById(ea->local_entid);
+        auto* local_c10 = local_ctrl ? local_ctrl->getById<Component_10_FilterBits>(0x10) : nullptr;
+        if (local_ctrl) {
             if (auto* c20 = local_ctrl->getById<Component_20_ModelReference>(0x20)) {
                 local_mdl_id = c20->cam_attach_entid ? c20->cam_attach_entid : c20->aim_entid;
             }
@@ -3258,9 +3265,12 @@ void __fastcall UpdateHealthbarVisibility_hook(uintptr_t sys46) {
             if (!ent->hasComponent(0x15) || !ent->hasComponent(0x28)) continue;
             auto* c28 = ent->getById<Component_28_STUHealthComponent>(0x28);
             if (!c28) continue;
+            auto* ent_c10 = ent->getById<Component_10_FilterBits>(0x10);
+            bool is_friendly_dummy = (local_c10 && ent_c10 &&
+                (local_c10->filter_bits & 0x3C0000ULL) == (ent_c10->filter_bits & 0x3C0000ULL));
             float ent_cur_hp = c28->CalcTotalCurrentHealth();
             float ent_max_hp = c28->CalcTotalMaxHealth();
-            if (ent_cur_hp > 0.0f && ent_max_hp > 0.0f && ent_cur_hp < ent_max_hp) {
+            if (ent_cur_hp > 0.0f && ent_max_hp > 0.0f && (is_friendly_dummy || ent_cur_hp < ent_max_hp)) {
                 *(uint8_t*)((uintptr_t)c28 + 0x485) = 1;
             }
             NotifyTrackedHealthbarViewModels(ent->entity_id, c28, ent_cur_hp);
@@ -3647,6 +3657,9 @@ static uint64_t s_zen_harmony_last_ms      = 0;
 static uint32_t s_zen_harmony_target_entid = 0;
 static uint32_t s_zen_harmony_cfg_low32    = 0;
 static uint32_t s_zen_discord_cfg_low32    = 0;
+static bool     s_mercy_heal_beam_active   = false;
+static bool     s_mercy_boost_beam_active  = false;
+static uint32_t s_mercy_beam_target_entid  = 0;
 static uint64_t s_biotic_field_end_ms     = 0;
 static uint64_t s_biotic_field_last_ms    = 0;
 static uint32_t s_biotic_field_ent_id     = 0;
@@ -3684,7 +3697,7 @@ static uint32_t ResolveAimConeTargetForScript(Entity* owner_ent, uint64_t script
     //  0 = Unknown targeting_cfg_low32 (prefer entity closest to crosshair in aim cone)
     int team_pref = 0;
     if (script_id == 0x05800000000002F3ULL || script_id == 0x058000000000006BULL ||
-        script_id == 0x0580000000000045ULL || script_id == 0x0580000000000246ULL ||
+        script_id == 0x058000000000006EULL || script_id == 0x0580000000000246ULL ||
         script_id == 0x05800000000000ABULL ||
         (s_zen_harmony_cfg_low32 != 0 && targeting_cfg_low32 == s_zen_harmony_cfg_low32)) {
         team_pref = +1;
@@ -3837,10 +3850,53 @@ static int32_t ReadVarBagInt32(StatescriptVar_VarBag* vb, __int64 target_rid) {
         if (IsBadReadPtr(bucket.arr_ptr, sizeof(StatescriptVar_VarBag::VarBag_Item) * bucket.item_count)) continue;
         for (int i = 0; i < bucket.item_count; ++i) {
             if (bucket.arr_ptr[i].rid_id == target_rid && bucket.arr_ptr[i].ptr &&
-                !IsBadReadPtr(bucket.arr_ptr[i].ptr, sizeof(StatescriptVar_Primitive))) {
-                auto* pvar = (StatescriptVar_Primitive*)bucket.arr_ptr[i].ptr;
-                return (int32_t)pvar->global_var.value;
+                !IsBadReadPtr(bucket.arr_ptr[i].ptr, sizeof(StatescriptVar_Base))) {
+                StatescriptVar_Base* rid = bucket.arr_ptr[i].ptr;
+                if (rid->stu_base.vfptr && !IsBadReadPtr(rid->stu_base.vfptr, sizeof(RID_Base_vt)) &&
+                    rid->stu_base.vfptr->GetValue_StackState) {
+                    StatescriptPrimitive prim{};
+                    __try {
+                        rid->stu_base.vfptr->GetValue_StackState(rid, &prim);
+                    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+                    if (prim.type != 0 && prim.value != 0) {
+                        return (int32_t)prim.value;
+                    }
+                }
+                if (rid->is_cvd() && !IsBadReadPtr(rid, sizeof(StatescriptVar_Primitive))) {
+                    auto* pvar = (StatescriptVar_Primitive*)rid;
+                    return (int32_t)pvar->global_var.value;
+                }
             }
+        }
+    }
+    return 0;
+}
+
+static uint32_t GetMercyLockedTarget(StatescriptInstance* inst_6B) {
+    if (!inst_6B || IsBadReadPtr(inst_6B, sizeof(StatescriptInstance))) return 0;
+    // In 0x058000000000006B:
+    // - node[8]  (0x498B421A Heal Beam Lock)    is m_states[6]
+    // - node[20] (0x498B421A Damage Boost Lock) is m_states[12]
+    // Both store the locked target entity ID at [state + 0x1A4] (0xFFFFFFFF when unlocked).
+    const int lock_state_indices[2] = { 6, 12 };
+    bool any_lock_state_active = false;
+    if (inst_6B->state_impl_list.ptr && inst_6B->state_impl_list.num > 12 &&
+        !IsBadReadPtr(inst_6B->state_impl_list.ptr, sizeof(StatescriptState*) * inst_6B->state_impl_list.num)) {
+        for (int sidx : lock_state_indices) {
+            StatescriptState* st = inst_6B->state_impl_list.ptr[sidx];
+            if (st && !IsBadReadPtr(st, 0x1B0) && (st->state_flags & 1) != 0) {
+                any_lock_state_active = true;
+                uint32_t tid = SafeReadVal<uint32_t>((uintptr_t)st + 0x1A4, 0);
+                if (tid != 0 && tid != 0xFFFFFFFFu && (tid & 0xF0000000u) == 0x80000000u) {
+                    return tid;
+                }
+            }
+        }
+    }
+    if (any_lock_state_active && inst_6B->rid_instance_varbag) {
+        uint32_t vb_tid = (uint32_t)ReadVarBagInt32(inst_6B->rid_instance_varbag, 0x0D800000000001D4LL);
+        if (vb_tid != 0 && vb_tid != 0xFFFFFFFFu && (vb_tid & 0xF0000000u) == 0x80000000u) {
+            return vb_tid;
         }
     }
     return 0;
@@ -4424,6 +4480,9 @@ static void __fastcall TickProjectileManager_hook(void* proj_sys) {
             s_zarya_beam_active = false;
             s_zen_harmony_hot_active = false;
             s_zen_harmony_target_entid = 0;
+            s_mercy_heal_beam_active = false;
+            s_mercy_boost_beam_active = false;
+            s_mercy_beam_target_entid = 0;
             s_biotic_field_end_ms = 0;
             s_biotic_field_ent_id = 0;
             s_active_impulse_end_ms = 0;
@@ -4607,6 +4666,7 @@ static void __fastcall TickProjectileManager_hook(void* proj_sys) {
                     StatescriptInstance* inst_176 = nullptr;
                     StatescriptInstance* inst_18D = nullptr;
                     StatescriptInstance* inst_2F3 = nullptr;
+                    StatescriptInstance* inst_6B  = nullptr;
                     for (int i = 0; i < c23->ss_inner.g3_arrWithIds.num; ++i) {
                         StatescriptInstance* sub = c23->ss_inner.g3_arrWithIds.ptr[i].instance;
                         if (!sub || IsBadReadPtr(sub, sizeof(StatescriptInstance))) continue;
@@ -4614,8 +4674,9 @@ static void __fastcall TickProjectileManager_hook(void* proj_sys) {
                         if (sid == 0x0580000000000176ULL) inst_176 = sub;
                         else if (sid == 0x058000000000018DULL) inst_18D = sub;
                         else if (sid == 0x05800000000002F3ULL) inst_2F3 = sub;
+                        else if (sid == 0x058000000000006BULL) inst_6B  = sub;
                     }
-                    if (inst_176 || inst_18D || inst_2F3) {
+                    if (inst_176 || inst_18D || inst_2F3 || inst_6B) {
                         s_zen_harmony_last_ms = now_ms;
 
                         // Auto-discover 0x0D60... targeting_cfg_low32 for Harmony (0x2F3) and Discord (0x176) once
@@ -4671,6 +4732,68 @@ static void __fastcall TickProjectileManager_hook(void* proj_sys) {
                             } else {
                                 s_zen_harmony_hot_active = false;
                                 s_zen_harmony_target_entid = 0;
+                            }
+                        }
+
+                        // Mercy Caduceus Staff (0x058000000000006B):
+                        // - Visual beam tether (node[37] 0xC0A88BB0 STUStatescriptStateBeamEffect, unlinked in client graph)
+                        // - 50 HP/s (+5.0 HP / 100ms) heal while Heal Beam Lock (node[8] / node[18]) is active on target in 0x0D800000000001D4
+                        if (inst_6B) {
+                            uint32_t vb_mercy_tgt = GetMercyLockedTarget(inst_6B);
+                            bool beam_fx_active = !statescript_logger::GetScriptNodeState(inst_6B, 37).is_finish_state;
+                            bool heal_lock_active = s_mercy_heal_beam_active || !statescript_logger::GetScriptNodeState(inst_6B, 8).is_finish_state;
+
+                            if (vb_mercy_tgt != 0) {
+                                s_mercy_beam_target_entid = vb_mercy_tgt;
+                                if (c23->ss_inner.rid_entity_varbag && !IsBadReadPtr(c23->ss_inner.rid_entity_varbag, sizeof(StatescriptVar_VarBag))) {
+                                    uint32_t staff_h = ((uint32_t)(uint16_t)inst_6B->instance_id << 16) | 1u;
+                                    if (!beam_fx_active || (uint32_t)ReadVarBagInt32(c23->ss_inner.rid_entity_varbag, 0x0D80000000000031LL) != staff_h) {
+                                        // +0xD811AE / +0xD807B8 / +0xD7E14E require StatescriptPrimitive_INTVEC4 (type=7)
+                                        // and unsigned 64-bit handle (0x00000000FFF80001) to match [slot + 0x168] in +0xD560B0.
+                                        StatescriptPrimitive p_wpn(StatescriptPrimitive_INTVEC4, (int64_t)(uint64_t)staff_h);
+                                        c23->ss_inner.rid_entity_varbag->SetVar({ 0x0D80000000000031LL }, p_wpn);
+                                        c23->ss_inner.rid_entity_varbag->SetVar({ StatescriptVar_ENTITY_VARBAG, 0x0D80000000000031LL }, p_wpn);
+                                        NotifyVarInBag(&c23->ss_inner, inst_6B, c23->ss_inner.rid_entity_varbag, 0x0D80000000000031LL, p_wpn);
+                                    }
+                                }
+                                if (!beam_fx_active) {
+                                    // Populate node[37]'s (0xC0A88BB0) missing weapon-slot handle (+0x110) and start-hardpoint (+0x118)
+                                    // STUConfigVar* pointers from node[34] (0xFFBFA88D) so +0xD80F20 / +0xD80620 attaches the beam
+                                    // to the Caduceus Staff tip hardpoint (0x8FE4A55C) instead of Mercy's body.
+                                    if (inst_6B->graph && !IsBadReadPtr(inst_6B->graph, sizeof(STUStatescriptGraph))) {
+                                        STUStatescriptBase** narr = inst_6B->graph->m_nodes.list();
+                                        if (narr && inst_6B->graph->m_nodes.count() > 37 && narr[34] && narr[37]) {
+                                            uintptr_t n34 = (uintptr_t)narr[34];
+                                            uintptr_t n37 = (uintptr_t)narr[37];
+                                            if (*(uintptr_t*)(n37 + 0x110) == 0 && *(uintptr_t*)(n34 + 0x110) != 0)
+                                                *(uintptr_t*)(n37 + 0x110) = *(uintptr_t*)(n34 + 0x110);
+                                            if (*(uintptr_t*)(n37 + 0x118) == 0 && *(uintptr_t*)(n34 + 0x118) != 0)
+                                                *(uintptr_t*)(n37 + 0x118) = *(uintptr_t*)(n34 + 0x118);
+                                            // Clear node[37]'s fallback +1.0m Y offset (+0x120 = 0xDBF9195C {0, 1.0, 0})
+                                            // so +0xD81440 / +0xD80150 attaches directly at the staff tip hardpoint instead of 1m above it.
+                                            if (*(uintptr_t*)(n37 + 0x120) != 0)
+                                                *(uintptr_t*)(n37 + 0x120) = 0;
+                                        }
+                                    }
+                                    inst_6B->StartStopState(37, true);
+                                    ShotDiagLogFmt("[MERCY_BEAM_FX_START] node=37(0xC0A88BB0) target=0x%X heal=%d",
+                                        vb_mercy_tgt, heal_lock_active ? 1 : 0);
+                                }
+                                if (heal_lock_active) {
+                                    Entity* tgt = game_ea->getEntById(vb_mercy_tgt);
+                                    auto* tc28 = tgt ? tgt->getById<Component_28_STUHealthComponent>(0x28) : nullptr;
+                                    if (tgt && tc28 && tc28->CalcTotalCurrentHealth() > 0.0f) {
+                                        ApplyHeroSelfHeal(tgt, 5.0f, 0x058000000000006BULL, "MERCY_HEAL_BEAM");
+                                    }
+                                }
+                            } else {
+                                s_mercy_heal_beam_active = false;
+                                s_mercy_boost_beam_active = false;
+                                s_mercy_beam_target_entid = 0;
+                                if (beam_fx_active) {
+                                    inst_6B->StartStopState(37, false);
+                                    ShotDiagLogFmt("[MERCY_BEAM_FX_STOP] node=37(0xC0A88BB0)");
+                                }
                             }
                         }
                     }
@@ -5242,6 +5365,15 @@ static bool IsHeroOrSubEntScript(StatescriptInstance* inst) {
         }
     }
     return false;
+}
+
+static bool IsAnyHeroOrSubEntScript(StatescriptInstance* inst) {
+    if (IsHeroOrSubEntScript(inst)) return true;
+    if (!inst || IsBadReadPtr(inst, sizeof(StatescriptInstance))) return false;
+    Entity* owner_ent = (inst->ss_inner && !IsBadReadPtr(inst->ss_inner, sizeof(StatescriptSyncMgr)) && inst->ss_inner->component_ref)
+        ? inst->ss_inner->component_ref->base.entity_backref : nullptr;
+    if (!owner_ent || IsBadReadPtr(owner_ent, sizeof(Entity))) return false;
+    return (owner_ent->hasComponent(0x15) && owner_ent->hasComponent(0x28));
 }
 
 static Entity* SpawnStandaloneSubEntity(EntityAdminBase* ea, uint64_t res_id, const Vector4& pos, const Vector4& rot) {
@@ -5898,6 +6030,9 @@ static uint32_t __fastcall StatescriptState_StartState_hook(StatescriptState* st
     StatescriptInstance* inst = (state && !IsBadReadPtr(state, 0x80))
         ? (StatescriptInstance*)SafeReadVal<uintptr_t>((uintptr_t)state + 0x78) : nullptr;
     if (!IsHeroOrSubEntScript(inst)) {
+        if (IsAnyHeroOrSubEntScript(inst)) {
+            inst->execution_flags = (inst->execution_flags | 0x400001u) & ~(0x100Cu | 0x200000u);
+        }
         return StatescriptState_StartState_orig(state, a2);
     }
     Entity* owner_ent = (inst->ss_inner && !IsBadReadPtr(inst->ss_inner, sizeof(StatescriptSyncMgr)) && inst->ss_inner->component_ref)
@@ -6168,7 +6303,7 @@ static uint32_t __fastcall StatescriptState_StartState_hook(StatescriptState* st
                     auto sched_finish = (schedule_finish_state_fn)(globals::gameBase + 0xF4A9C0);
                     sched_finish((uintptr_t)state, 1, 120);
                 }
-            } else if (stu_hash == 0xD78490D1u && is_local && owner_ent) {
+            } else if (stu_hash == 0xD78490D1u && is_local && owner_ent && script_id != 0x058000000000006BULL) {
                 // 0xD78490D1: Impulse / Knockback State (sz = 0x128)
                 auto* comp15 = owner_ent->getById<Component_15_STUCharacterMoverComponent>(0x15);
                 if (comp15 && !IsBadReadPtr(comp15, sizeof(Component_15_STUCharacterMoverComponent))) {
@@ -6432,6 +6567,36 @@ static void OnUniversalStateEntry(StatescriptSyncMgr* ss, StatescriptInstance* i
         s_zen_harmony_hot_active = (s_zen_harmony_target_entid != 0);
         ShotDiagLogFmt("[ZEN_HARMONY_START (0xE831BEF1)] script=0x%llX node=%d target=0x%X (30 HP/s)",
             (unsigned long long)script_id, node_idx, s_zen_harmony_target_entid);
+    } else if (script_id == 0x058000000000006BULL || script_id == 0x058000000000006DULL) {
+        // Mercy Caduceus Staff (0x6B, inst=-8 -> 0xFFF80001) & Caduceus Blaster (0x6D, inst=-9 -> 0xFFF70001):
+        // Keep Component_23 VarBag 0x0D80000000000031 synced to the active weapon script's child_slot handle
+        // before 0xFFBFA88D (node[34]/node[35]) / 0xC0A88BB0 (node[37]) resolves the weapon entity via +0xD562E0.
+        if (inst->ss_inner && inst->ss_inner->rid_entity_varbag &&
+            !IsBadReadPtr(inst->ss_inner->rid_entity_varbag, sizeof(StatescriptVar_VarBag)) &&
+            node_idx != 0 && node_idx != 1 && node_idx != 2 && node_idx != 58 && node_idx != 105 && node_idx != 116) {
+            uint32_t wpn_h = ((uint32_t)(uint16_t)inst->instance_id << 16) | 1u;
+            if ((uint32_t)ReadVarBagInt32(inst->ss_inner->rid_entity_varbag, 0x0D80000000000031LL) != wpn_h) {
+                StatescriptPrimitive p_wpn(StatescriptPrimitive_INTVEC4, (int64_t)(uint64_t)wpn_h);
+                inst->ss_inner->rid_entity_varbag->SetVar({ 0x0D80000000000031LL }, p_wpn);
+                inst->ss_inner->rid_entity_varbag->SetVar({ StatescriptVar_ENTITY_VARBAG, 0x0D80000000000031LL }, p_wpn);
+                NotifyVarInBag(inst->ss_inner, inst, inst->ss_inner->rid_entity_varbag, 0x0D80000000000031LL, p_wpn);
+            }
+        }
+        if (script_id == 0x058000000000006BULL) {
+            if (node_idx == 8 || node_idx == 18 || node_idx == 90) {
+                uint32_t tgt_id = GetMercyLockedTarget(inst);
+                if (tgt_id != 0) s_mercy_beam_target_entid = tgt_id;
+                s_mercy_heal_beam_active = true;
+                s_mercy_boost_beam_active = false;
+                ShotDiagLogFmt("[MERCY_HEAL_LOCK_START] node=%d target=0x%X (50 HP/s)", node_idx, s_mercy_beam_target_entid);
+            } else if (node_idx == 20 || node_idx == 26 || node_idx == 89) {
+                uint32_t tgt_id = GetMercyLockedTarget(inst);
+                if (tgt_id != 0) s_mercy_beam_target_entid = tgt_id;
+                s_mercy_boost_beam_active = true;
+                s_mercy_heal_beam_active = false;
+                ShotDiagLogFmt("[MERCY_BOOST_LOCK_START] node=%d target=0x%X", node_idx, s_mercy_beam_target_entid);
+            }
+        }
     }
 
     // 5. Soldier: 76 Biotic Field (0x0580000000000257 node=6 WeaponVolley 0x860EE5FC)
@@ -6540,6 +6705,42 @@ static void OnUniversalStateExit(StatescriptSyncMgr* ss, StatescriptInstance* in
             s_zen_harmony_hot_active = false;
             ShotDiagLogFmt("[ZEN_HARMONY_END] script=0x%llX node=%d", (unsigned long long)script_id, node_idx);
         }
+    } else if (script_id == 0x058000000000006BULL) {
+        bool is_heal_exit  = (node_idx == 8 || node_idx == 18 || node_idx == 90);
+        bool is_boost_exit = (node_idx == 20 || node_idx == 26 || node_idx == 89);
+        if (is_heal_exit) {
+            if (s_mercy_heal_beam_active) {
+                s_mercy_heal_beam_active = false;
+                ShotDiagLogFmt("[MERCY_HEAL_LOCK_END] node=%d", node_idx);
+            }
+        } else if (is_boost_exit) {
+            if (s_mercy_boost_beam_active) {
+                s_mercy_boost_beam_active = false;
+                ShotDiagLogFmt("[MERCY_BOOST_LOCK_END] node=%d", node_idx);
+            }
+        }
+        if (is_heal_exit || is_boost_exit) {
+            // Check if the opposite lock state (m_states[12] for node[20], m_states[6] for node[8]) is active:
+            int other_sidx = is_heal_exit ? 12 : 6;
+            bool other_lock_active = false;
+            if (inst->state_impl_list.ptr && inst->state_impl_list.num > other_sidx &&
+                !IsBadReadPtr(inst->state_impl_list.ptr, sizeof(StatescriptState*) * inst->state_impl_list.num)) {
+                StatescriptState* ost = inst->state_impl_list.ptr[other_sidx];
+                if (ost && !IsBadReadPtr(ost, 0x1B0) && (ost->state_flags & 1) != 0) {
+                    uint32_t otid = SafeReadVal<uint32_t>((uintptr_t)ost + 0x1A4, 0);
+                    if (otid != 0 && otid != 0xFFFFFFFFu && (otid & 0xF0000000u) == 0x80000000u) {
+                        other_lock_active = true;
+                    }
+                }
+            }
+            if (!other_lock_active) {
+                s_mercy_beam_target_entid = 0;
+                if (!statescript_logger::GetScriptNodeState(inst, 37).is_finish_state) {
+                    inst->StartStopState(37, false);
+                    ShotDiagLogFmt("[MERCY_BEAM_FX_STOP_IMMEDIATE] on exit of node=%d", node_idx);
+                }
+            }
+        }
     }
 
     // Stop D.Va Boosters sweep when flight state node=15 or node=19 exits early (cancelled by player)
@@ -6558,6 +6759,35 @@ static void OnUniversalStateExit(StatescriptSyncMgr* ss, StatescriptInstance* in
     }
 }
 
+// 9c. +0xD81440 (BeamEffectState_UpdateAttachment, vt+0x138 on +0x15DCF10 STUStatescriptStateBeamEffect 0xC0A88BB0):
+// When Mercy's Caduceus Staff (0x058000000000006B) releases a beam lock, node[80] (0xE4D667E6) clears 0x0D800000000001D4
+// to 0/0xFFFFFFFF in InstVarBag, which triggers vt+0x138 (+0xD81440) on node[37]. If +0xD81440 runs when target entity r13
+// is NULL (+0xD8177A), it detaches the beam endpoint from the ally and snaps it to world origin (0, 1, 0) before breaking.
+// Intercepting +0xD81440 when 0x058000000000006B has no valid target immediately stops node[37] without detaching to (0, 1, 0).
+typedef void(__fastcall* beam_effect_update_attach_fn)(StatescriptState* state);
+static beam_effect_update_attach_fn BeamEffectState_UpdateAttachment_orig = nullptr;
+static void __fastcall BeamEffectState_UpdateAttachment_hook(StatescriptState* state) {
+    if (state && !IsBadReadPtr(state, 0x80)) {
+        auto* inst = (StatescriptInstance*)SafeReadVal<uintptr_t>((uintptr_t)state + 0x78);
+        if (inst && !IsBadReadPtr(inst, sizeof(StatescriptInstance))) {
+            uint64_t script_id = SafeReadVal<uint64_t>((uintptr_t)inst + 0x150);
+            if (script_id == 0x058000000000006BULL) {
+                uint32_t locked_tid = GetMercyLockedTarget(inst);
+                uint32_t vb_tid = inst->rid_instance_varbag
+                    ? (uint32_t)ReadVarBagInt32(inst->rid_instance_varbag, 0x0D800000000001D4LL) : 0;
+                bool valid_vb = (vb_tid != 0 && vb_tid != 0xFFFFFFFFu && (vb_tid & 0xF0000000u) == 0x80000000u);
+                if (locked_tid == 0 || !valid_vb) {
+                    if (!statescript_logger::GetScriptNodeState(inst, 37).is_finish_state) {
+                        inst->StartStopState(37, false);
+                    }
+                    return;
+                }
+            }
+        }
+    }
+    BeamEffectState_UpdateAttachment_orig(state);
+}
+
 // 10. +0xD739A0 (IsGraphNodeClientOnly), +0xD73D10 (CheckSomeClientOnlyFlags),
 //     +0xD73DF0 (E_IsReferencedStateClientOnly), & +0xD73E90 (GetClientOnlyStateByMStateIndex):
 // Strictly gated by IsHeroOrSubEntScript(inst) so main menu, map scripts, loading screens, and doors are 100% untouched.
@@ -6568,7 +6798,7 @@ typedef uint8_t(__fastcall* is_node_client_only_fn)(StatescriptInstance* inst, S
 static is_node_client_only_fn IsGraphNodeClientOnly_orig = nullptr;
 static uint8_t __fastcall IsGraphNodeClientOnly_hook(StatescriptInstance* inst, STUStatescriptBase* node) {
     uint8_t res = IsGraphNodeClientOnly_orig(inst, node);
-    if (res == 0 && IsHeroOrSubEntScript(inst)) {
+    if (res == 0 && IsAnyHeroOrSubEntScript(inst)) {
         return 1;
     }
     return res;
@@ -6577,7 +6807,7 @@ static uint8_t __fastcall IsGraphNodeClientOnly_hook(StatescriptInstance* inst, 
 static is_node_client_only_fn CheckSomeClientOnlyFlags_orig = nullptr;
 static uint8_t __fastcall CheckSomeClientOnlyFlags_hook(StatescriptInstance* inst, STUStatescriptBase* node) {
     uint8_t res = CheckSomeClientOnlyFlags_orig(inst, node);
-    if (res == 0 && IsHeroOrSubEntScript(inst)) {
+    if (res == 0 && IsAnyHeroOrSubEntScript(inst)) {
         return 1;
     }
     return res;
@@ -6587,7 +6817,7 @@ typedef uint8_t(__fastcall* e_is_ref_state_client_only_fn)(StatescriptInstance* 
 static e_is_ref_state_client_only_fn E_IsReferencedStateClientOnly_orig = nullptr;
 static uint8_t __fastcall E_IsReferencedStateClientOnly_hook(StatescriptInstance* inst, StatescriptNotification_Base* notif) {
     uint8_t res = E_IsReferencedStateClientOnly_orig(inst, notif);
-    if (res == 0 && IsHeroOrSubEntScript(inst)) {
+    if (res == 0 && IsAnyHeroOrSubEntScript(inst)) {
         return 1;
     }
     return res;
@@ -6597,7 +6827,7 @@ typedef uint8_t(__fastcall* get_client_only_state_by_idx_fn)(StatescriptInstance
 static get_client_only_state_by_idx_fn GetClientOnlyStateByMStateIndex_orig = nullptr;
 static uint8_t __fastcall GetClientOnlyStateByMStateIndex_hook(StatescriptInstance* inst, int idx_in_nodes) {
     uint8_t res = GetClientOnlyStateByMStateIndex_orig(inst, idx_in_nodes);
-    if (res == 0 && IsHeroOrSubEntScript(inst)) {
+    if (res == 0 && IsAnyHeroOrSubEntScript(inst)) {
         return 1;
     }
     return res;
@@ -9034,6 +9264,8 @@ void __cdecl StartHook(void*) {
     MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xd74620)));
     MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0x107ec60), MoreAIStuff_hook, (PVOID*)&MoreAIStuff_orig));
     MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0x107ec60)));
+    MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xd81440), BeamEffectState_UpdateAttachment_hook, (PVOID*)&BeamEffectState_UpdateAttachment_orig));
+    MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xd81440)));
     statescript_logger::s_universal_state_entry_cb = OnUniversalStateEntry;
     statescript_logger::s_universal_state_exit_cb = OnUniversalStateExit;
     printf("hooked Component_1 transforms, weapon hardpoint fixes, shot/projectile impact, healthbar & Horizon 1 Stage H1.2+H1.3 hooks\n");
