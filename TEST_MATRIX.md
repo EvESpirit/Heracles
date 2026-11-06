@@ -87,7 +87,7 @@
 | Mercy | Secondary Fire (Right Click - Damage Boost) | Pass |
 | Mercy | Guardian Angel | Pass |
 | Mercy | Ultimate | Fail (does not resurrect teammates) |
-| Symmetra | Primary Fire (Left Click) | Fail (seemingly does nothing except spawn the gun VFX) |
+| Symmetra | Primary Fire (Left Click) | Fail (seemingly does nothing except spawn the gun VFX + outwards-pushing force field within the gun vfx range) |
 | Symmetra | Secondary Fire (Right Click) | Pass |
 | Symmetra | Photon Shield | Unknown (Unable to Deploy) |
 | Symmetra | Sentry Turret | Partial Fail (despite the visualization before the sentry is placed, it always places it on the nearest floor underneath whatever wall we aim at) |
