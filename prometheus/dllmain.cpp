@@ -48,6 +48,7 @@
 #include "stu_resources.h"
 #include "entity_admin.h"
 #include "MovementState.h"
+#include "Viewmodel.h"
 #include <array>
 
 //Who needs a build system?
@@ -348,6 +349,8 @@ HRESULT __stdcall PresentHook(IDXGISwapChain* pSwapChain, UINT SyncInterval, UIN
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
+
+        CombatReplication::RenderOverlay();
 
         if (!ui_invisible)
             window_manager::render();
@@ -2388,6 +2391,7 @@ struct PendingDamagePacket {
     int32_t damage_int;
     uint8_t flags; // Bit 0 (0x01) = Critical Hit, Bit 1 (0x02) = Kill
     bool allow_ult_charge;
+    uint64_t ability_script_id = 0;
 };
 static PendingDamagePacket s_pending_dmg_pkts[32] = {};
 static int s_pending_dmg_pkt_count = 0;
@@ -2411,6 +2415,13 @@ static uint64_t s_last_crit_capsule_tag = 0;
 static uint64_t s_last_crit_ms = 0;
 static uint32_t s_pending_snapshot_entid = 0;
 static uintptr_t s_last_sys46 = 0;
+static std::string s_last_elim_trace;
+static int s_auto_kill_dump_ticks = 0;
+static bool s_auto_dumped_first_kill = false;
+static int s_auto_0hp_dump_ticks = 0;
+static uint32_t s_auto_dumped_0hp_mdl = 0;
+static Entity* SafeResolveHudEntity(EntityAdminBase* game_ea);
+static bool SafeIsActivityLogState(StatescriptState* st);
 
 // +0x1023E80: IsCriticalHitCapsule(Component_28_STUHealthComponent* c28, uint64_t capsule_tag)
 // Called by the hit audio/impact worker +0xCB9F60 at +0xCBA214 to decide whether to play the critical hit "dink" sound
@@ -3004,6 +3015,699 @@ static void __fastcall GetEntityDisplayName_hook(Entity* ent, uint8_t sanitize_f
     }
 }
 
+namespace CombatReplication {
+
+struct ActiveKillfeedItem {
+    uint32_t    seq                 = 0;
+    uint64_t    created_ms          = 0;
+    uint32_t    duration_ms         = DEFAULT_KILLFEED_DURATION_MS;
+    std::string killer_name;
+    std::string victim_name;
+    std::string ability_label;
+    bool        killer_is_friendly  = true;
+    bool        victim_is_friendly  = false;
+    bool        is_self_or_env      = false;
+    uint8_t     kill_flags          = 0;
+};
+
+static std::mutex                              s_combat_rep_mutex;
+static std::vector<ServerKillfeedCommand>      s_pending_killfeed_cmds;
+static std::vector<ServerEntityDeathCommand>   s_pending_death_cmds;
+static std::vector<ServerEntityRespawnCommand> s_pending_respawn_cmds;
+static std::vector<ActiveKillfeedItem>         s_active_killfeed_items;
+static uint32_t                                s_next_local_seq            = 1;
+static uint32_t                                s_last_killfeed_seq         = 0;
+static uint32_t                                s_last_death_seq            = 0;
+static uint32_t                                s_last_respawn_seq          = 0;
+static bool                                    s_has_initial_local_spawn   = false;
+static Vector4                                 s_initial_local_spawn_pos   = {};
+static Vector4                                 s_initial_local_spawn_rot   = { 0.0f, 0.0f, 0.0f, 1.0f };
+static int                                     s_initial_local_spawn_team  = 1;
+
+static std::string ToUpperAscii(std::string s) {
+    for (char& c : s) {
+        if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+    }
+    return s;
+}
+
+static const char* ResolveAbilityKillLabel(uint64_t script_id, uint8_t& inout_flags) {
+    switch (script_id) {
+        case 0x0580000000000025ULL: inout_flags |= KILL_FLAG_ULTIMATE; return "PULSE BOMB";
+        case 0x0580000000000232ULL: inout_flags |= KILL_FLAG_ULTIMATE; return "RIP-TIRE";
+        case 0x05800000000000CDULL: inout_flags |= KILL_FLAG_ULTIMATE; return "DEATH BLOSSOM";
+        case 0x0580000000000044ULL: inout_flags |= KILL_FLAG_ULTIMATE; return "DRAGONBLADE";
+        case 0x0580000000000101ULL:
+        case 0x058000000000016BULL: inout_flags |= KILL_FLAG_ULTIMATE; return "DRAGONSTRIKE";
+        case 0x0580000000000633ULL:
+        case 0x058000000000064AULL: inout_flags |= KILL_FLAG_ULTIMATE; return "BLIZZARD";
+        case 0x0580000000000051ULL: inout_flags |= KILL_FLAG_ULTIMATE; return "EARTHSHATTER";
+        case 0x058000000000003BULL: inout_flags |= KILL_FLAG_ULTIMATE; return "PRIMAL RAGE";
+        case 0x0580000000000116ULL: inout_flags |= KILL_FLAG_ULTIMATE; return "BARRAGE";
+        case 0x058000000000024AULL: inout_flags |= KILL_FLAG_ULTIMATE; return "SELF-DESTRUCT";
+        case 0x05800000000001F5ULL: inout_flags |= KILL_FLAG_ULTIMATE; return "DEADEYE";
+        case 0x058000000000023EULL: inout_flags |= KILL_FLAG_ULTIMATE; return "WHOLE HOG";
+        case 0x058000000000024CULL: inout_flags |= KILL_FLAG_ULTIMATE; return "GRAVITON SURGE";
+        case 0x0580000000000072ULL: return "HELIX ROCKETS";
+        case 0x05800000000001DBULL:
+        case 0x05800000000001DCULL:
+        case 0x0580000000000045ULL:
+        case 0x0580000000000157ULL:
+        case 0x0580000000000317ULL: return "SWIFT STRIKE";
+        case 0x0580000000000109ULL:
+        case 0x058000000000010AULL:
+        case 0x0580000000000038ULL: return "JUMP PACK";
+        case 0x058000000000007DULL:
+        case 0x05800000000000BEULL: return "CHARGE";
+        case 0x0580000000000053ULL: return "FIRE STRIKE";
+        case 0x058000000000047EULL:
+        case 0x058000000000026AULL:
+        case 0x0580000000000B2FULL: return "BOOSTERS";
+        case 0x058000000000017AULL: return "FLASHBANG";
+        case 0x0580000000000249ULL: return "CHAIN HOOK";
+        case 0x058000000000021EULL: return "CONCUSSION MINE";
+        case 0x0580000000000222ULL: return "STEEL TRAP";
+        case 0x0580000000000090ULL: return "VENOM MINE";
+        case 0x0580000000000776ULL: return "SOUNDWAVE";
+        case 0x05800000000000F4ULL: return "TURRET";
+        case 0x058000000000017EULL: return "SENTRY TURRET";
+        case 0x0580000000000043ULL: return "MELEE";
+        default:                    return "";
+    }
+}
+
+static std::string ResolveEntityOrHeroDisplayName(EntityAdminBase* ea, uint32_t entid, uint64_t heroid_override, const char* explicit_name) {
+    if (explicit_name && explicit_name[0] != '\0') {
+        return ToUpperAscii(std::string(explicit_name));
+    }
+    if (heroid_override != 0) {
+        if (auto* hero_stu = stu_resources::GetByID((__int64)heroid_override)) {
+            auto stu = hero_stu->to_editable();
+            if (auto* name_ref = stu.get_argument_resource(0xcd16baa)) {
+                if (const char* hname = name_ref->get_UXDisplayString()) {
+                    if (hname[0] != '\0') return ToUpperAscii(std::string(hname));
+                }
+            }
+        }
+    }
+    if (ea && entid != 0 && entid != 0xFFFFFFFFu) {
+        if (Entity* ent = ea->getEntById(entid)) {
+            char buf[0x40] = {};
+            typedef void(__fastcall* get_name_fn)(Entity*, uint8_t, char*);
+            ((get_name_fn)(globals::gameBase + 0x1027940))(ent, 1, buf);
+            if (buf[0] != '\0') {
+                return ToUpperAscii(std::string(buf));
+            }
+        }
+    }
+    return "BOT";
+}
+
+static bool ResolveEntityIsFriendlyToLocal(EntityAdminBase* ea, uint32_t entid, uint8_t explicit_team) {
+    if (!ea || !ea->local_entid) return (explicit_team == 1);
+    Entity* local_ctrl = ea->getEntById(ea->local_entid);
+    auto* local_c10 = local_ctrl ? local_ctrl->getById<Component_10_FilterBits>(0x10) : nullptr;
+    uint64_t local_team_bits = local_c10 ? (local_c10->filter_bits & 0x3C0000ULL) : 0x80000ULL;
+
+    if (explicit_team != TEAM_AUTO && explicit_team <= 4) {
+        uint64_t exp_bits = (1ULL << (explicit_team + 18)) & 0x3C0000ULL;
+        return (exp_bits != 0 && exp_bits == local_team_bits);
+    }
+    if (entid == ea->local_entid) return true;
+    if (local_ctrl) {
+        if (auto* lc20 = local_ctrl->getById<Component_20_ModelReference>(0x20)) {
+            if (entid == lc20->cam_attach_entid || entid == lc20->aim_entid || entid == lc20->movement_attach_entid)
+                return true;
+        }
+    }
+    if (Entity* ent = ea->getEntById(entid)) {
+        if (auto* c10 = ent->getById<Component_10_FilterBits>(0x10)) {
+            uint64_t ent_bits = (c10->filter_bits & 0x3C0000ULL);
+            if (ent_bits != 0 && local_team_bits != 0) {
+                return (ent_bits == local_team_bits);
+            }
+        }
+    }
+    return false;
+}
+
+void EnqueueKillfeedCommand(const ServerKillfeedCommand& cmd) {
+    std::lock_guard<std::mutex> lock(s_combat_rep_mutex);
+    ServerKillfeedCommand copy = cmd;
+    if (copy.event_seq == 0) {
+        copy.event_seq = s_next_local_seq++;
+    } else if (copy.event_seq == s_last_killfeed_seq) {
+        return; // Deduplicate retransmitted server packet
+    } else {
+        s_last_killfeed_seq = copy.event_seq;
+    }
+    if (s_pending_killfeed_cmds.size() < 32) {
+        s_pending_killfeed_cmds.push_back(copy);
+    }
+}
+
+void EnqueueEntityDeathCommand(const ServerEntityDeathCommand& cmd) {
+    std::lock_guard<std::mutex> lock(s_combat_rep_mutex);
+    ServerEntityDeathCommand copy = cmd;
+    if (copy.event_seq == 0) {
+        copy.event_seq = s_next_local_seq++;
+    } else if (copy.event_seq == s_last_death_seq) {
+        return;
+    } else {
+        s_last_death_seq = copy.event_seq;
+    }
+    if (s_pending_death_cmds.size() < 16) {
+        s_pending_death_cmds.push_back(copy);
+    }
+}
+
+void EnqueueEntityRespawnCommand(const ServerEntityRespawnCommand& cmd) {
+    std::lock_guard<std::mutex> lock(s_combat_rep_mutex);
+    ServerEntityRespawnCommand copy = cmd;
+    if (copy.event_seq == 0) {
+        copy.event_seq = s_next_local_seq++;
+    } else if (copy.event_seq == s_last_respawn_seq) {
+        return;
+    } else {
+        s_last_respawn_seq = copy.event_seq;
+    }
+    if (s_pending_respawn_cmds.size() < 16) {
+        s_pending_respawn_cmds.push_back(copy);
+    }
+}
+
+void ClearKillfeedOverlay() {
+    std::lock_guard<std::mutex> lock(s_combat_rep_mutex);
+    s_active_killfeed_items.clear();
+}
+
+void RecordInitialLocalSpawnTransform(EntityAdminBase* game_ea, const Vector4& pos, const Vector4& rot, int team_idx) {
+    float mag = std::fabs(pos.X) + std::fabs(pos.Y) + std::fabs(pos.Z);
+    if (mag < 0.05f || std::fabs(pos.Y - 1000.0f) < 5.0f) return;
+    if (!s_has_initial_local_spawn) {
+        s_has_initial_local_spawn = true;
+        s_initial_local_spawn_pos = pos;
+        s_initial_local_spawn_rot = rot;
+        s_initial_local_spawn_team = team_idx;
+        s_last_spawnroom_status = std::format("Recorded SpawnRoom floor=({:.2f}, {:.2f}, {:.2f}) team={}",
+            pos.X, pos.Y, pos.Z, team_idx);
+        ShotDiagLogFmt("[SPAWNROOM_RECORD] %s", s_last_spawnroom_status.c_str());
+    }
+    (void)game_ea;
+}
+
+bool ResolveTeamSpawnRoomTransform(EntityAdminBase* game_ea, int team_idx, Vector4& out_pos, Vector4& out_rot, std::string* out_diag) {
+    uint64_t desired_team_mask = (team_idx >= 0 && team_idx <= 3) ? (1ULL << (team_idx + 18)) : 0x80000ULL;
+    uint32_t matched_2b_entid = 0;
+    Vector4  matched_2b_pos{};
+    Vector4  matched_2b_rot{ 0.0f, 0.0f, 0.0f, 1.0f };
+    bool     has_nonzero_2b_pos = false;
+
+    if (game_ea) {
+        for (Entity* ent : *game_ea) {
+            if (!ent || !ent->hasComponent(0x2B)) continue;
+            uintptr_t c2b = (uintptr_t)ent->getById<ComponentBase>(0x2B);
+            int8_t active_byte = c2b ? SafeReadVal<int8_t>(c2b + 0x28) : 0;
+            if (active_byte < 0) continue; // -1 = inactive spawn room stage
+
+            auto* c10 = ent->getById<Component_10_FilterBits>(0x10);
+            uint64_t ent_team = c10 ? (c10->filter_bits & 0x3C0000ULL) : 0ULL;
+            if (ent_team != 0 && ent_team != desired_team_mask) continue;
+
+            matched_2b_entid = ent->entity_id;
+            if (auto* c1 = ent->getById<Component_1_SceneRendering>(1)) {
+                Vector4 p = c1->position;
+                if (std::fabs(p.X) + std::fabs(p.Y) + std::fabs(p.Z) > 0.1f) {
+                    matched_2b_pos = p;
+                    matched_2b_rot = c1->rotation;
+                    has_nonzero_2b_pos = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (s_has_initial_local_spawn) {
+        out_pos = s_initial_local_spawn_pos;
+        out_rot = s_initial_local_spawn_rot;
+        if (out_diag) {
+            *out_diag = std::format("SpawnRoom c2B=0x{:X} -> initial floor ({:.2f}, {:.2f}, {:.2f})",
+                matched_2b_entid, out_pos.X, out_pos.Y, out_pos.Z);
+        }
+        return true;
+    }
+    if (has_nonzero_2b_pos) {
+        out_pos = matched_2b_pos;
+        out_rot = matched_2b_rot;
+        if (out_diag) {
+            *out_diag = std::format("SpawnRoom c2B=0x{:X} c1->pos ({:.2f}, {:.2f}, {:.2f})",
+                matched_2b_entid, out_pos.X, out_pos.Y, out_pos.Z);
+        }
+        return true;
+    }
+
+    // Fallback to Hanamura Attackers Spawn Room or Practice origin
+    if (globals::isDemo || matched_2b_entid != 0) {
+        out_pos = Vector4(108.34f, 1.00f, 0.14f, 0.0f);
+    } else {
+        out_pos = Vector4(8.5f, 0.1f, 0.0f, 0.0f);
+    }
+    out_rot = Vector4(0.0f, 0.0f, 0.0f, 1.0f);
+    if (out_diag) {
+        *out_diag = std::format("SpawnRoom fallback ({:.2f}, {:.2f}, {:.2f}) c2B=0x{:X}",
+            out_pos.X, out_pos.Y, out_pos.Z, matched_2b_entid);
+    }
+    return true;
+}
+
+void OnGameTick(EntityAdminBase* game_ea, uintptr_t sys46) {
+    uint64_t now_ms = GetTickCount64();
+
+    std::vector<ServerKillfeedCommand>      kf_cmds;
+    std::vector<ServerEntityDeathCommand>   death_cmds;
+    std::vector<ServerEntityRespawnCommand> respawn_cmds;
+    {
+        std::lock_guard<std::mutex> lock(s_combat_rep_mutex);
+        if (!s_pending_killfeed_cmds.empty()) {
+            kf_cmds.swap(s_pending_killfeed_cmds);
+        }
+        if (!s_pending_death_cmds.empty()) {
+            death_cmds.swap(s_pending_death_cmds);
+        }
+        if (!s_pending_respawn_cmds.empty()) {
+            respawn_cmds.swap(s_pending_respawn_cmds);
+        }
+    }
+
+    uint32_t local_ctrl_id = game_ea ? game_ea->local_entid : 0;
+    uint32_t local_mdl_id  = 0;
+    if (game_ea && local_ctrl_id) {
+        if (Entity* lctrl = game_ea->getEntById(local_ctrl_id)) {
+            if (auto* lc20 = lctrl->getById<Component_20_ModelReference>(0x20)) {
+                local_mdl_id = lc20->cam_attach_entid ? lc20->cam_attach_entid : (lc20->aim_entid ? lc20->aim_entid : lc20->movement_attach_entid);
+            }
+        }
+    }
+
+    // 1. Process ServerEntityDeathCommand queue
+    for (const auto& dcmd : death_cmds) {
+        uint32_t v_ctrl = dcmd.victim_ctrl_entid;
+        uint32_t v_mdl  = dcmd.victim_mdl_entid;
+        if (game_ea) {
+            if (v_mdl == 0 && v_ctrl != 0) {
+                if (Entity* ce = game_ea->getEntById(v_ctrl)) {
+                    if (auto* c20 = ce->getById<Component_20_ModelReference>(0x20)) {
+                        v_mdl = c20->cam_attach_entid ? c20->cam_attach_entid : (c20->aim_entid ? c20->aim_entid : c20->movement_attach_entid);
+                    }
+                }
+            }
+            if (v_ctrl == 0 && v_mdl != 0) {
+                if (Entity* me = game_ea->getEntById(v_mdl)) {
+                    if (auto* c1f = me->getById<Component_1F_Backref>(0x1F)) {
+                        v_ctrl = c1f->backref_entid;
+                    }
+                }
+            }
+        }
+
+        if (dcmd.trigger_death_scream && game_ea && v_mdl != 0) {
+            if (Entity* victim_ent = game_ea->getEntById(v_mdl)) {
+                TriggerHeroDeathScream(game_ea, victim_ent, dcmd.killer_entid ? dcmd.killer_entid : local_mdl_id);
+            }
+        }
+
+        bool is_local_victim = (local_ctrl_id != 0 && (v_ctrl == local_ctrl_id || (local_mdl_id != 0 && v_mdl == local_mdl_id)));
+        if (is_local_victim) {
+            s_total_local_deaths++;
+            s_local_is_dead        = true;
+            s_local_death_start_ms = now_ms;
+            if (dcmd.respawn_delay_ms != RESPAWN_WAIT_FOR_SERVER_CMD) {
+                s_local_respawn_at_ms = now_ms + dcmd.respawn_delay_ms;
+            } else {
+                s_local_respawn_at_ms = 0;
+            }
+
+            // Fire native bottom-center Death / Eliminated-By Banner (+0xCA7B40: System46::OnPlayerStatusBanner)
+            // Note: +0xCA7CAF checks bit 0x3F (Component_3F_PlayerInfo) on the entity resolved from [pkt + 0x6C]
+            // when banner_type == 2 ("YOU WERE ELIMINATED BY %1$s"), so resolve killer's Controller entity ID!
+            if (dcmd.trigger_status_banner && sys46 != 0 && game_ea) {
+                uint32_t killer_ctrl_id = 0;
+                if (dcmd.killer_entid != 0 && dcmd.killer_entid != 0xFFFFFFFFu &&
+                    dcmd.killer_entid != local_ctrl_id && dcmd.killer_entid != local_mdl_id) {
+                    if (Entity* kent = game_ea->getEntById(dcmd.killer_entid)) {
+                        if (kent->hasComponent(0x3F)) {
+                            killer_ctrl_id = kent->entity_id;
+                        } else if (auto* kc1f = kent->getById<Component_1F_Backref>(0x1F)) {
+                            if (kc1f->backref_entid && game_ea->getEntById(kc1f->backref_entid)) {
+                                killer_ctrl_id = kc1f->backref_entid;
+                            }
+                        }
+                    }
+                }
+                auto on_status_banner = (void(__fastcall*)(uintptr_t, __int64, const uint8_t*))(globals::gameBase + 0xCA7B40);
+                uint8_t status_pkt[0x80] = {};
+                if (killer_ctrl_id != 0) {
+                    *(uint8_t*)(status_pkt + 0x68)  = 2; // 0x0DE0000000001127: "YOU WERE ELIMINATED BY %1$s"
+                    *(uint32_t*)(status_pkt + 0x6C) = killer_ctrl_id;
+                } else {
+                    *(uint8_t*)(status_pkt + 0x68)  = 3; // 0x0DE0000000001128: "YOU HAVE DIED"
+                    *(uint32_t*)(status_pkt + 0x6C) = local_ctrl_id;
+                }
+                on_status_banner(sys46, 0, status_pkt);
+                ShotDiagLogFmt("[LOCAL_DEATH_BANNER (+0xCA7B40)] victim_mdl=0x%X type=%u killer_ctrl=0x%X respawn_ms=%u",
+                    v_mdl, (unsigned)status_pkt[0x68], killer_ctrl_id, dcmd.respawn_delay_ms);
+            }
+        }
+
+        if (dcmd.emit_killfeed_entry) {
+            ServerKillfeedCommand kcmd{};
+            kcmd.killer_entid          = dcmd.killer_entid;
+            kcmd.victim_entid          = v_mdl ? v_mdl : v_ctrl;
+            kcmd.ability_script_id     = dcmd.ability_script_id;
+            kcmd.kill_flags            = dcmd.kill_flags;
+            if (dcmd.killer_entid == 0 || dcmd.killer_entid == 0xFFFFFFFFu ||
+                dcmd.killer_entid == v_mdl || dcmd.killer_entid == v_ctrl) {
+                kcmd.kill_flags |= KILL_FLAG_SELF;
+            }
+            if (dcmd.killer_name[0] != '\0') {
+                strncpy_s(kcmd.killer_name, sizeof(kcmd.killer_name), dcmd.killer_name, _TRUNCATE);
+            }
+            kcmd.trigger_native_banner = 0; // Status banner already handled above
+            kf_cmds.push_back(kcmd);
+        }
+    }
+
+    // 2. Process ServerKillfeedCommand queue
+    for (const auto& kcmd : kf_cmds) {
+        uint8_t flags = kcmd.kill_flags;
+        std::string ability_str = (kcmd.ability_label[0] != '\0')
+            ? ToUpperAscii(std::string(kcmd.ability_label))
+            : std::string(ResolveAbilityKillLabel(kcmd.ability_script_id, flags));
+
+        bool is_self = ((flags & (KILL_FLAG_SELF | KILL_FLAG_ENVIRONMENTAL)) != 0) ||
+                       (kcmd.killer_entid == 0 && kcmd.killer_heroid == 0 && kcmd.killer_name[0] == '\0') ||
+                       (kcmd.killer_entid != 0 && kcmd.killer_entid == kcmd.victim_entid);
+
+        std::string killer_nm = is_self
+            ? ""
+            : ResolveEntityOrHeroDisplayName(game_ea, kcmd.killer_entid, kcmd.killer_heroid, kcmd.killer_name);
+        std::string victim_nm = ResolveEntityOrHeroDisplayName(game_ea, kcmd.victim_entid, kcmd.victim_heroid, kcmd.victim_name);
+
+        bool killer_friendly = is_self ? false : ResolveEntityIsFriendlyToLocal(game_ea, kcmd.killer_entid, kcmd.killer_team);
+        bool victim_friendly = ResolveEntityIsFriendlyToLocal(game_ea, kcmd.victim_entid, kcmd.victim_team);
+
+        if (kcmd.trigger_native_banner && sys46 != 0 && game_ea && kcmd.victim_entid != 0) {
+            if (Entity* victim_ent = game_ea->getEntById(kcmd.victim_entid)) {
+                TriggerHeroDeathScream(game_ea, victim_ent, local_mdl_id);
+            }
+            auto on_elim_banner = (int(__fastcall*)(uintptr_t, __int64, const uint8_t*))(globals::gameBase + 0xCA7EE0);
+            uint8_t elim_pkt[0x80] = {};
+            *(uint64_t*)(elim_pkt + 0x68) = 0ULL;
+            *(uint32_t*)(elim_pkt + 0x70) = *(const uint32_t*)(globals::gameBase + 0x185A0C8); // INVALID_ENTITY_ID -> Solo Elimination
+            *(uint32_t*)(elim_pkt + 0x74) = kcmd.victim_entid;
+            *(uint16_t*)(elim_pkt + 0x78) = kcmd.fire_points ? kcmd.fire_points : 100;
+            int elim_rc = on_elim_banner(sys46, 0, elim_pkt);
+            s_last_elim_trace = std::format(
+                "killer=\"{}\" victim=0x{:X}(\"{}\") ability=\"{}\" flags=0x{:X} rc={}",
+                killer_nm, kcmd.victim_entid, victim_nm, ability_str, (unsigned)flags, elim_rc);
+            ShotDiagLogFmt("[KILLFEED_EVENT (+0xCA7EE0)] %s", s_last_elim_trace.c_str());
+        }
+
+        ActiveKillfeedItem item{};
+        item.seq                = kcmd.event_seq;
+        item.created_ms         = now_ms;
+        item.duration_ms        = kcmd.display_duration_ms ? kcmd.display_duration_ms : DEFAULT_KILLFEED_DURATION_MS;
+        item.killer_name        = killer_nm;
+        item.victim_name        = victim_nm;
+        item.ability_label      = ability_str;
+        item.killer_is_friendly = killer_friendly;
+        item.victim_is_friendly = victim_friendly;
+        item.is_self_or_env     = is_self;
+        item.kill_flags         = flags;
+
+        {
+            std::lock_guard<std::mutex> lock(s_combat_rep_mutex);
+            s_active_killfeed_items.push_back(std::move(item));
+            while (s_active_killfeed_items.size() > 6) {
+                s_active_killfeed_items.erase(s_active_killfeed_items.begin());
+            }
+            s_total_killfeed_events++;
+        }
+    }
+
+    // 3. Check scheduled LocalPlayer auto-respawn timer
+    if (s_local_is_dead && s_local_respawn_at_ms != 0 && now_ms >= s_local_respawn_at_ms) {
+        s_local_respawn_at_ms = 0;
+        ServerEntityRespawnCommand rcmd{};
+        rcmd.target_ctrl_entid            = local_ctrl_id;
+        rcmd.target_mdl_entid             = local_mdl_id;
+        rcmd.has_explicit_spawn_transform = 0;
+        respawn_cmds.push_back(rcmd);
+    }
+
+    // 4. Process ServerEntityRespawnCommand queue
+    for (const auto& rcmd : respawn_cmds) {
+        bool is_local_target = (rcmd.target_ctrl_entid == 0 || rcmd.target_ctrl_entid == local_ctrl_id ||
+                                (local_mdl_id != 0 && rcmd.target_mdl_entid == local_mdl_id));
+        if (is_local_target) {
+            Vector4 spawn_pos{};
+            Vector4 spawn_rot{ 0.0f, 0.0f, 0.0f, 1.0f };
+            if (rcmd.has_explicit_spawn_transform) {
+                spawn_pos = rcmd.spawn_position;
+                spawn_rot = rcmd.spawn_rotation;
+                s_last_spawnroom_status = std::format("Server explicit spawn ({:.2f}, {:.2f}, {:.2f})",
+                    spawn_pos.X, spawn_pos.Y, spawn_pos.Z);
+            } else {
+                int team_idx = s_initial_local_spawn_team;
+                if (game_ea && local_ctrl_id) {
+                    if (Entity* lctrl = game_ea->getEntById(local_ctrl_id)) {
+                        if (auto* lc10 = lctrl->getById<Component_10_FilterBits>(0x10)) {
+                            uint64_t tbits = lc10->filter_bits & 0x3C0000ULL;
+                            if (tbits == 0x40000ULL) team_idx = 0;
+                            else if (tbits == 0x80000ULL) team_idx = 1;
+                            else if (tbits == 0x100000ULL) team_idx = 2;
+                            else if (tbits == 0x200000ULL) team_idx = 3;
+                        }
+                    }
+                }
+                ResolveTeamSpawnRoomTransform(game_ea, team_idx, spawn_pos, spawn_rot, &s_last_spawnroom_status);
+            }
+            s_local_is_dead       = false;
+            s_local_respawn_at_ms = 0;
+            s_total_local_respawns++;
+            PrometheusSystem::QueueLocalPlayerRespawn(spawn_pos, spawn_rot, rcmd.override_heroid, rcmd.override_skin_theme_id);
+            ShotDiagLogFmt("[LOCAL_RESPAWN_CMD] %s", s_last_spawnroom_status.c_str());
+        }
+    }
+}
+
+void RenderOverlay() {
+    if (!s_enable_killfeed_overlay && !s_local_is_dead) return;
+
+    uint64_t now_ms = GetTickCount64();
+    ImGuiIO& io = ImGui::GetIO();
+    if (io.DisplaySize.x <= 0.0f || io.DisplaySize.y <= 0.0f) return;
+
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    if (!dl) return;
+
+    // 1. Top-Right Overwatch-Styled HUD Killfeed Cards
+    if (s_enable_killfeed_overlay) {
+        std::vector<ActiveKillfeedItem> items_snapshot;
+        {
+            std::lock_guard<std::mutex> lock(s_combat_rep_mutex);
+            for (auto it = s_active_killfeed_items.begin(); it != s_active_killfeed_items.end();) {
+                if (now_ms >= it->created_ms + it->duration_ms) {
+                    it = s_active_killfeed_items.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            items_snapshot = s_active_killfeed_items;
+        }
+
+        const float right_margin = 28.0f;
+        const float top_margin   = 32.0f;
+        const float row_height   = 32.0f;
+        const float row_gap      = 6.0f;
+        const float slant_dx     = 7.0f;
+
+        for (size_t idx = 0; idx < items_snapshot.size(); ++idx) {
+            const auto& item = items_snapshot[idx];
+            uint64_t age_ms  = (now_ms > item.created_ms) ? (now_ms - item.created_ms) : 0;
+            uint64_t rem_ms  = (item.created_ms + item.duration_ms > now_ms) ? (item.created_ms + item.duration_ms - now_ms) : 0;
+
+            float slide_t = (age_ms < 160) ? ((float)age_ms / 160.0f) : 1.0f;
+            slide_t = 1.0f - (1.0f - slide_t) * (1.0f - slide_t); // ease-out quad
+            float alpha = (rem_ms < 500) ? ((float)rem_ms / 500.0f) : 1.0f;
+            if (age_ms < 120) alpha *= ((float)age_ms / 120.0f);
+            if (alpha < 0.0f) alpha = 0.0f;
+            if (alpha > 1.0f) alpha = 1.0f;
+
+            auto col_a = [&](uint8_t r, uint8_t g, uint8_t b, uint8_t a) -> ImU32 {
+                return IM_COL32(r, g, b, (uint8_t)((float)a * alpha));
+            };
+
+            ImVec2 k_sz = item.is_self_or_env ? ImVec2(0.0f, 0.0f) : ImGui::CalcTextSize(item.killer_name.c_str());
+            ImVec2 v_sz = ImGui::CalcTextSize(item.victim_name.c_str());
+            ImVec2 a_sz = item.ability_label.empty() ? ImVec2(0.0f, 0.0f) : ImGui::CalcTextSize(item.ability_label.c_str());
+
+            float k_block_w = item.is_self_or_env ? 0.0f : (k_sz.x + 22.0f);
+            float a_block_w = item.ability_label.empty() ? 0.0f : (a_sz.x + 16.0f);
+            float arrow_w   = (item.kill_flags & KILL_FLAG_CRIT) ? 34.0f : 26.0f;
+            float v_block_w = v_sz.x + 26.0f;
+            float total_w   = k_block_w + a_block_w + arrow_w + v_block_w + 12.0f;
+
+            float x_right = io.DisplaySize.x - right_margin + (1.0f - slide_t) * 60.0f;
+            float x_left  = x_right - total_w;
+            float y_top   = top_margin + (float)idx * (row_height + row_gap);
+            float y_bot   = y_top + row_height;
+            float y_mid   = 0.5f * (y_top + y_bot);
+
+            // Slanted dark translucent card background
+            ImVec2 bg_pts[4] = {
+                ImVec2(x_left + slant_dx, y_top),
+                ImVec2(x_right + slant_dx, y_top),
+                ImVec2(x_right, y_bot),
+                ImVec2(x_left, y_bot)
+            };
+            dl->AddConvexPolyFilled(bg_pts, 4, col_a(16, 20, 28, 224));
+            dl->AddPolyline(bg_pts, 4, col_a(255, 255, 255, 48), ImDrawFlags_Closed, 1.0f);
+
+            ImU32 killer_accent = item.killer_is_friendly ? col_a(41, 182, 246, 255) : col_a(255, 59, 69, 255);
+            ImU32 victim_accent = item.victim_is_friendly ? col_a(41, 182, 246, 255) : col_a(255, 59, 69, 255);
+            ImU32 killer_tint   = item.killer_is_friendly ? col_a(41, 182, 246, 52)  : col_a(255, 59, 69, 52);
+            ImU32 victim_tint   = item.victim_is_friendly ? col_a(41, 182, 246, 52)  : col_a(255, 59, 69, 52);
+
+            float cur_x = x_left + 6.0f;
+
+            // Left accent bar & Killer section
+            if (!item.is_self_or_env) {
+                ImVec2 k_bg[4] = {
+                    ImVec2(x_left + slant_dx, y_top),
+                    ImVec2(cur_x + k_block_w + slant_dx * 0.5f, y_top),
+                    ImVec2(cur_x + k_block_w - slant_dx * 0.5f, y_bot),
+                    ImVec2(x_left, y_bot)
+                };
+                dl->AddConvexPolyFilled(k_bg, 4, killer_tint);
+
+                ImVec2 l_bar[4] = {
+                    ImVec2(x_left + slant_dx, y_top),
+                    ImVec2(x_left + slant_dx + 4.5f, y_top),
+                    ImVec2(x_left + 4.5f, y_bot),
+                    ImVec2(x_left, y_bot)
+                };
+                dl->AddConvexPolyFilled(l_bar, 4, killer_accent);
+
+                ImVec2 k_pos(cur_x + 11.0f, y_mid - k_sz.y * 0.5f);
+                dl->AddText(ImVec2(k_pos.x + 1.0f, k_pos.y + 1.0f), col_a(0, 0, 0, 200), item.killer_name.c_str());
+                dl->AddText(k_pos, col_a(242, 247, 255, 255), item.killer_name.c_str());
+                cur_x += k_block_w;
+            } else {
+                ImVec2 l_bar[4] = {
+                    ImVec2(x_left + slant_dx, y_top),
+                    ImVec2(x_left + slant_dx + 4.5f, y_top),
+                    ImVec2(x_left + 4.5f, y_bot),
+                    ImVec2(x_left, y_bot)
+                };
+                dl->AddConvexPolyFilled(l_bar, 4, col_a(255, 167, 38, 255));
+            }
+
+            // Optional Ability Badge
+            if (!item.ability_label.empty()) {
+                bool is_ult = (item.kill_flags & KILL_FLAG_ULTIMATE) != 0;
+                ImU32 badge_bg     = is_ult ? col_a(255, 160, 0, 68)  : col_a(255, 255, 255, 28);
+                ImU32 badge_border = is_ult ? col_a(255, 193, 7, 210) : col_a(180, 200, 225, 110);
+                ImU32 badge_text   = is_ult ? col_a(255, 224, 130, 255) : col_a(215, 225, 240, 245);
+
+                float bx0 = cur_x + 3.0f;
+                float bx1 = cur_x + a_block_w - 3.0f;
+                float by0 = y_top + 5.0f;
+                float by1 = y_bot - 5.0f;
+                dl->AddRectFilled(ImVec2(bx0, by0), ImVec2(bx1, by1), badge_bg, 3.0f);
+                dl->AddRect(ImVec2(bx0, by0), ImVec2(bx1, by1), badge_border, 3.0f, 0, 1.0f);
+                dl->AddText(ImVec2(bx0 + 5.0f, y_mid - a_sz.y * 0.5f), badge_text, item.ability_label.c_str());
+                cur_x += a_block_w;
+            }
+
+            // Center Elimination Arrow / Critical Headshot Chevron
+            bool is_crit = (item.kill_flags & KILL_FLAG_CRIT) != 0;
+            ImU32 arrow_col = is_crit ? col_a(255, 59, 69, 255) : col_a(240, 245, 255, 245);
+            float ax_mid = cur_x + arrow_w * 0.5f;
+            if (is_crit) {
+                // Red headshot crosshair + double chevron
+                dl->AddCircle(ImVec2(ax_mid - 6.0f, y_mid), 4.5f, arrow_col, 12, 1.6f);
+                dl->AddCircleFilled(ImVec2(ax_mid - 6.0f, y_mid), 1.8f, arrow_col, 8);
+                dl->AddTriangleFilled(
+                    ImVec2(ax_mid + 2.0f, y_mid - 6.5f),
+                    ImVec2(ax_mid + 11.0f, y_mid),
+                    ImVec2(ax_mid + 2.0f, y_mid + 6.5f),
+                    arrow_col);
+            } else {
+                dl->AddTriangleFilled(
+                    ImVec2(ax_mid - 4.5f, y_mid - 6.0f),
+                    ImVec2(ax_mid + 5.5f, y_mid),
+                    ImVec2(ax_mid - 4.5f, y_mid + 6.0f),
+                    arrow_col);
+            }
+            cur_x += arrow_w;
+
+            // Victim section & Right accent bar
+            ImVec2 v_bg[4] = {
+                ImVec2(cur_x + slant_dx * 0.5f, y_top),
+                ImVec2(x_right + slant_dx, y_top),
+                ImVec2(x_right, y_bot),
+                ImVec2(cur_x - slant_dx * 0.5f, y_bot)
+            };
+            dl->AddConvexPolyFilled(v_bg, 4, victim_tint);
+
+            ImVec2 v_pos(cur_x + 8.0f, y_mid - v_sz.y * 0.5f);
+            dl->AddText(ImVec2(v_pos.x + 1.0f, v_pos.y + 1.0f), col_a(0, 0, 0, 200), item.victim_name.c_str());
+            dl->AddText(v_pos, col_a(255, 242, 242, 255), item.victim_name.c_str());
+
+            ImVec2 r_bar[4] = {
+                ImVec2(x_right + slant_dx - 4.5f, y_top),
+                ImVec2(x_right + slant_dx, y_top),
+                ImVec2(x_right, y_bot),
+                ImVec2(x_right - 4.5f, y_bot)
+            };
+            dl->AddConvexPolyFilled(r_bar, 4, victim_accent);
+        }
+    }
+
+    // 2. LocalPlayer Respawn Countdown HUD Bar (when LocalPlayer is at 0 HP waiting for Spawn Room respawn)
+    if (s_local_is_dead && s_local_respawn_at_ms > now_ms) {
+        float rem_sec = (float)(s_local_respawn_at_ms - now_ms) / 1000.0f;
+        float total_sec = (s_local_respawn_at_ms > s_local_death_start_ms)
+            ? ((float)(s_local_respawn_at_ms - s_local_death_start_ms) / 1000.0f) : 3.5f;
+        if (total_sec < 0.1f) total_sec = 0.1f;
+        float progress = 1.0f - (rem_sec / total_sec);
+        if (progress < 0.0f) progress = 0.0f;
+        if (progress > 1.0f) progress = 1.0f;
+
+        std::string txt = std::format("RESPAWNING IN {:.1f}s", rem_sec);
+        ImVec2 t_sz = ImGui::CalcTextSize(txt.c_str());
+        float box_w = 240.0f;
+        float box_h = 38.0f;
+        float cx = io.DisplaySize.x * 0.5f;
+        float cy = io.DisplaySize.y * 0.16f;
+        ImVec2 p0(cx - box_w * 0.5f, cy - box_h * 0.5f);
+        ImVec2 p1(cx + box_w * 0.5f, cy + box_h * 0.5f);
+
+        dl->AddRectFilled(p0, p1, IM_COL32(14, 18, 26, 220), 4.0f);
+        dl->AddRect(p0, p1, IM_COL32(255, 59, 69, 190), 4.0f, 0, 1.5f);
+        dl->AddText(ImVec2(cx - t_sz.x * 0.5f, p0.y + 7.0f), IM_COL32(255, 245, 245, 255), txt.c_str());
+
+        // Progress bar along bottom of respawn box
+        ImVec2 bar0(p0.x + 8.0f, p1.y - 8.0f);
+        ImVec2 bar1(p1.x - 8.0f, p1.y - 4.0f);
+        dl->AddRectFilled(bar0, bar1, IM_COL32(50, 60, 75, 200), 2.0f);
+        dl->AddRectFilled(bar0, ImVec2(bar0.x + (bar1.x - bar0.x) * progress, bar1.y), IM_COL32(41, 182, 246, 255), 2.0f);
+    }
+}
+
+} // namespace CombatReplication
+
 void __fastcall UpdateHealthbarVisibility_hook(uintptr_t sys46) {
     s_last_sys46 = sys46;
     EntityAdminBase* ea = sys46 ? SafeReadVal<EntityAdminBase*>(sys46 + 0x08) : nullptr;
@@ -3093,7 +3797,7 @@ void __fastcall UpdateHealthbarVisibility_hook(uintptr_t sys46) {
                         if (s_pending_dmg_pkt_count < 32) {
                             int32_t dmg_int = (int32_t)(dmg + 0.5f);
                             uint8_t pkt_flags = (uint8_t)(hp <= 0.0f ? 2 : 0);
-                            s_pending_dmg_pkts[s_pending_dmg_pkt_count++] = PendingDamagePacket{ ent->entity_id, dmg_int, pkt_flags, false };
+                            s_pending_dmg_pkts[s_pending_dmg_pkt_count++] = PendingDamagePacket{ ent->entity_id, dmg_int, pkt_flags, false, 0x0580000000000025ULL };
                         }
                         s_pending_dummy_hit_dump_ticks = 4;
                         ShotDiagLogFmt("[PULSE_BOMB_DETONATE] proj=0x%X target=0x%X stuck=%d dist=%.2fm dmg=%.1f -> HP=%.1f bomb=(%.2f,%.2f,%.2f)",
@@ -3142,18 +3846,19 @@ void __fastcall UpdateHealthbarVisibility_hook(uintptr_t sys46) {
                         local_pkts[i].target_entid, local_pkts[i].damage_int, local_pkts[i].flags,
                         pip_hit, pip_crit, pip_kill);
                     if ((local_pkts[i].flags & 2) != 0) {
-                        if (Entity* victim_ent = ea->getEntById(local_pkts[i].target_entid)) {
-                            TriggerHeroDeathScream(ea, victim_ent, local_mdl_id);
+                        CombatReplication::ServerKillfeedCommand kcmd{};
+                        kcmd.killer_entid          = local_mdl_id ? local_mdl_id : ea->local_entid;
+                        kcmd.victim_entid          = local_pkts[i].target_entid;
+                        kcmd.ability_script_id     = local_pkts[i].ability_script_id;
+                        kcmd.kill_flags            = ((local_pkts[i].flags & 1) ? CombatReplication::KILL_FLAG_CRIT : 0) |
+                                                     CombatReplication::KILL_FLAG_SOLO_ELIM;
+                        kcmd.fire_points           = 100;
+                        kcmd.trigger_native_banner = 1;
+                        CombatReplication::EnqueueKillfeedCommand(kcmd);
+                        if (!s_auto_dumped_first_kill) {
+                            s_auto_dumped_first_kill = true;
+                            s_auto_kill_dump_ticks = 3;
                         }
-                        // Dispatch native Elimination Banner ("ELIMINATED [HERO] 100") & 2D Elimination Audio Sting via +0xCA7EE0
-                        auto on_elim_banner = (int(__fastcall*)(uintptr_t, __int64, const uint8_t*))(globals::gameBase + 0xCA7EE0);
-                        uint8_t elim_pkt[0x80] = {};
-                        *(uint64_t*)(elim_pkt + 0x68) = 0ULL; // label_res_id (unused in Branch B)
-                        *(uint32_t*)(elim_pkt + 0x70) = *(const uint32_t*)(globals::gameBase + 0x185A0C8); // INVALID_ENTITY_ID -> Branch B (Solo Elimination)
-                        *(uint32_t*)(elim_pkt + 0x74) = local_pkts[i].target_entid; // victim_entid
-                        *(uint16_t*)(elim_pkt + 0x78) = 100; // fire_points ("100")
-                        int elim_rc = on_elim_banner(sys46, 0, elim_pkt);
-                        ShotDiagLogFmt("[ELIM_BANNER (+0xCA7EE0)] victim=0x%X points=100 rc=%d", local_pkts[i].target_entid, elim_rc);
                     }
                 }
             }
@@ -3275,6 +3980,53 @@ void __fastcall UpdateHealthbarVisibility_hook(uintptr_t sys46) {
             }
             NotifyTrackedHealthbarViewModels(ent->entity_id, c28, ent_cur_hp);
         }
+    }
+
+    if (ea && ea->local_entid) {
+        if (s_auto_kill_dump_ticks > 0 && --s_auto_kill_dump_ticks == 0) {
+            WeaponHardpointDiag::DumpKillfeedAndRespawnDiag(ea, "AUTO_AFTER_FIRST_KILL");
+        }
+        Entity* lctrl_0 = ea->getEntById(ea->local_entid);
+        Entity* lmdl_0 = nullptr;
+        uint32_t lmdl_0_id = 0;
+        if (lctrl_0) {
+            if (auto* lc20 = lctrl_0->getById<Component_20_ModelReference>(0x20)) {
+                lmdl_0_id = lc20->cam_attach_entid ? lc20->cam_attach_entid : (lc20->aim_entid ? lc20->aim_entid : lc20->movement_attach_entid);
+                if (lmdl_0_id) lmdl_0 = ea->getEntById(lmdl_0_id);
+            }
+        }
+        if (lmdl_0) {
+            if (auto* lc28 = lmdl_0->getById<Component_28_STUHealthComponent>(0x28)) {
+                float cur0 = lc28->CalcTotalCurrentHealth();
+                float max0 = lc28->CalcTotalMaxHealth();
+                if (max0 > 0.0f && cur0 <= 0.0f) {
+                    if (s_auto_dumped_0hp_mdl != lmdl_0_id) {
+                        s_auto_dumped_0hp_mdl = lmdl_0_id;
+                        s_auto_0hp_dump_ticks = 4;
+
+                        CombatReplication::ServerEntityDeathCommand dcmd{};
+                        dcmd.victim_ctrl_entid     = ea->local_entid;
+                        dcmd.victim_mdl_entid      = lmdl_0_id;
+                        dcmd.killer_entid          = 0; // Self / damage button unless overridden by server
+                        dcmd.kill_flags            = CombatReplication::KILL_FLAG_SELF;
+                        dcmd.respawn_delay_ms      = CombatReplication::s_enable_local_auto_respawn
+                            ? (uint32_t)(CombatReplication::s_local_respawn_delay_sec * 1000.0f)
+                            : CombatReplication::RESPAWN_WAIT_FOR_SERVER_CMD;
+                        dcmd.trigger_death_scream  = 1;
+                        dcmd.trigger_status_banner = 1;
+                        dcmd.emit_killfeed_entry   = 1;
+                        CombatReplication::EnqueueEntityDeathCommand(dcmd);
+                    }
+                } else if (cur0 > 0.0f && s_auto_dumped_0hp_mdl == lmdl_0_id) {
+                    s_auto_dumped_0hp_mdl = 0;
+                    CombatReplication::s_local_is_dead = false;
+                }
+            }
+        }
+        if (s_auto_0hp_dump_ticks > 0 && --s_auto_0hp_dump_ticks == 0) {
+            WeaponHardpointDiag::DumpKillfeedAndRespawnDiag(ea, "AUTO_AT_LOCAL_0HP");
+        }
+        CombatReplication::OnGameTick(ea, sys46);
     }
 
     if (target_dummy && target_c28 && local_c2f) {
@@ -4501,6 +5253,63 @@ static int DiscoverHeroWeaponSlots(Component_23_Statescript* c23, StatescriptIns
     return max_slot;
 }
 
+static bool HasMultiWeaponPair(StatescriptSyncMgr* ss_inner) {
+    if (!ss_inner || IsBadReadPtr(ss_inner, sizeof(StatescriptSyncMgr))) return false;
+    if (!ss_inner->g3_arrWithIds.ptr || ss_inner->g3_arrWithIds.num <= 0 || ss_inner->g3_arrWithIds.num > 64) return false;
+    int slotted_count = 0;
+    for (int i = 0; i < ss_inner->g3_arrWithIds.num; ++i) {
+        StatescriptInstance* sub = ss_inner->g3_arrWithIds.ptr[i].instance;
+        if (!sub || IsBadReadPtr(sub, sizeof(StatescriptInstance))) continue;
+        uint64_t sid = SafeReadVal<uint64_t>((uintptr_t)sub + 0x150);
+        if (sid == 0x058000000000006BULL || sid == 0x058000000000006DULL ||
+            sid == 0x0580000000000102ULL || sid == 0x05800000000000F3ULL) {
+            return true;
+        }
+        if (sub->rid_instance_varbag && !IsBadReadPtr(sub->rid_instance_varbag, sizeof(StatescriptVar_VarBag))) {
+            if (ReadVarBagInt32(sub->rid_instance_varbag, 0x0D8000000000001CLL) >= 1) {
+                slotted_count++;
+            }
+        }
+    }
+    return (slotted_count >= 2);
+}
+
+static void SeedHeroWeaponSlotVars(StatescriptInstance* inst) {
+    if (!inst || IsBadReadPtr(inst, sizeof(StatescriptInstance))) return;
+    uint64_t pre_sid = SafeReadVal<uint64_t>((uintptr_t)inst + 0x150);
+    int w_slot = (pre_sid == 0x058000000000006BULL || pre_sid == 0x0580000000000102ULL) ? 1 :
+                 ((pre_sid == 0x058000000000006DULL || pre_sid == 0x05800000000000F3ULL) ? 2 : 0);
+    bool is_multi = (w_slot > 0) || (pre_sid == 0x0580000000000015ULL && HasMultiWeaponPair(inst->ss_inner));
+    if (!is_multi && pre_sid != 0x0580000000000015ULL) return;
+
+    if (w_slot > 0 && inst->rid_instance_varbag && !IsBadReadPtr(inst->rid_instance_varbag, sizeof(StatescriptVar_VarBag))) {
+        if (ReadVarBagInt32(inst->rid_instance_varbag, 0x0D8000000000001CLL) != w_slot) {
+            StatescriptPrimitive scv(StatescriptPrimitive_INT, (int64_t)w_slot);
+            inst->rid_instance_varbag->SetVar({ 0x0D8000000000001CLL }, scv);
+        }
+    }
+    if (inst->ss_inner && inst->ss_inner->rid_entity_varbag &&
+        !IsBadReadPtr(inst->ss_inner->rid_entity_varbag, sizeof(StatescriptVar_VarBag))) {
+        int cur_1f = ReadVarBagInt32(inst->ss_inner->rid_entity_varbag, 0x0D8000000000001FLL);
+        if (is_multi) {
+            if (cur_1f <= 0) {
+                StatescriptPrimitive p1(StatescriptPrimitive_INT, 1LL);
+                inst->ss_inner->rid_entity_varbag->SetVar({ 0x0D8000000000001ELL }, p1);
+                inst->ss_inner->rid_entity_varbag->SetVar({ StatescriptVar_ENTITY_VARBAG, 0x0D8000000000001ELL }, p1);
+                inst->ss_inner->rid_entity_varbag->SetVar({ 0x0D8000000000001FLL }, p1);
+                inst->ss_inner->rid_entity_varbag->SetVar({ StatescriptVar_ENTITY_VARBAG, 0x0D8000000000001FLL }, p1);
+            }
+        } else if (cur_1f < 0) {
+            StatescriptPrimitive p0(StatescriptPrimitive_INT, 0LL);
+            inst->ss_inner->rid_entity_varbag->SetVar({ 0x0D8000000000001ELL }, p0);
+            inst->ss_inner->rid_entity_varbag->SetVar({ StatescriptVar_ENTITY_VARBAG, 0x0D8000000000001ELL }, p0);
+            inst->ss_inner->rid_entity_varbag->SetVar({ 0x0D8000000000001FLL }, p0);
+            inst->ss_inner->rid_entity_varbag->SetVar({ StatescriptVar_ENTITY_VARBAG, 0x0D8000000000001FLL }, p0);
+            ShotDiagLogFmt("[SINGLE_WPN_RECOVER_0x1F] cur_1f=%d -> reset 0x1E/0x1F=0", cur_1f);
+        }
+    }
+}
+
 static uint32_t GetGraphNodeSTUHash(STUStatescriptBase* node) {
     if (!node || IsBadReadPtr(node, sizeof(STUStatescriptBase))) return 0;
     if (!node->graph_node.base.vfptr || IsBadReadPtr(node->graph_node.base.vfptr, sizeof(STUBase_vt))) return 0;
@@ -4884,9 +5693,15 @@ static void __fastcall TickProjectileManager_hook(void* proj_sys) {
             s_active_dash_sweep_end_ms = 0;
             s_riptire_ent_id = 0;
             s_riptire_end_ms = 0;
-            s_pending_weapon_slot = 1;
+            auto* lc23 = local_hero->getById<Component_23_Statescript>(0x23);
+            if (lc23 && HasMultiWeaponPair(&lc23->ss_inner)) {
+                s_pending_weapon_slot = 1;
+                s_pending_weapon_reason = "HERO_INIT";
+            } else {
+                s_pending_weapon_slot = 0;
+                s_pending_weapon_reason = nullptr;
+            }
             s_pending_weapon_cycle_dir = 0;
-            s_pending_weapon_reason = "HERO_INIT";
         }
         {
             static bool s_prev_key_1 = false;
@@ -5029,7 +5844,7 @@ static void __fastcall TickProjectileManager_hook(void* proj_sys) {
                     std::lock_guard<std::mutex> hit_lock(s_pellet_hit_mutex);
                     if (s_pending_dmg_pkt_count < 32) {
                         uint8_t pkt_flags = (uint8_t)(new_hp <= 0.0f ? 2 : 0);
-                        s_pending_dmg_pkts[s_pending_dmg_pkt_count++] = PendingDamagePacket{ ent->entity_id, 6, pkt_flags, true };
+                        s_pending_dmg_pkts[s_pending_dmg_pkt_count++] = PendingDamagePacket{ ent->entity_id, 6, pkt_flags, true, 0x05800000000000FEULL };
                     }
                 }
                 ShotDiagLogFmt("[WINSTON_TESLA_TICK] hit=0x%X dist=%.2fm -%.1f -> HP %.1f",
@@ -5096,7 +5911,7 @@ static void __fastcall TickProjectileManager_hook(void* proj_sys) {
                     std::lock_guard<std::mutex> hit_lock(s_pellet_hit_mutex);
                     if (s_pending_dmg_pkt_count < 32) {
                         uint8_t pkt_flags = (uint8_t)(new_hp <= 0.0f ? 2 : 0);
-                        s_pending_dmg_pkts[s_pending_dmg_pkt_count++] = PendingDamagePacket{ best_ent->entity_id, 10, pkt_flags, true };
+                        s_pending_dmg_pkts[s_pending_dmg_pkt_count++] = PendingDamagePacket{ best_ent->entity_id, 10, pkt_flags, true, 0x0580000000000241ULL };
                     }
                 }
                 ShotDiagLogFmt("[ZARYA_BEAM_TICK] hit=0x%X dist=%.2fm -%.1f -> HP %.1f",
@@ -5328,7 +6143,7 @@ static void __fastcall TickProjectileManager_hook(void* proj_sys) {
                             int32_t dmg_int = (int32_t)(s_active_dash_sweep_dmg + 0.5f);
                             if (dmg_int < 1) dmg_int = 1;
                             uint8_t pkt_flags = (uint8_t)(new_hp <= 0.0f ? 2 : 0);
-                            s_pending_dmg_pkts[s_pending_dmg_pkt_count++] = PendingDamagePacket{ ent->entity_id, dmg_int, pkt_flags, true };
+                            s_pending_dmg_pkts[s_pending_dmg_pkt_count++] = PendingDamagePacket{ ent->entity_id, dmg_int, pkt_flags, true, s_active_dash_sweep_script_id };
                         }
                     }
                     // Apply knockback impulse to hit enemy for D.Va Boosters (0x47E / 0x26A / 0xB2F), Reinhardt Charge (0x07D / 0x0BE), and Winston Jump Pack (0x109)
@@ -5587,7 +6402,7 @@ static void __fastcall TickProjectileManager_hook(void* proj_sys) {
                                     int32_t dmg_int = (int32_t)(tick_dmg + 0.5f);
                                     if (dmg_int < 1) dmg_int = 1;
                                     uint8_t pkt_flags = (uint8_t)(new_hp <= 0.0f ? 2 : 0);
-                                    s_pending_dmg_pkts[s_pending_dmg_pkt_count++] = PendingDamagePacket{ ent->entity_id, dmg_int, pkt_flags, true };
+                                    s_pending_dmg_pkts[s_pending_dmg_pkt_count++] = PendingDamagePacket{ ent->entity_id, dmg_int, pkt_flags, true, sub.script_id };
                                 }
                             }
                             if (single_target) break;
@@ -5616,9 +6431,17 @@ static void __fastcall TickProjectileManager_hook(void* proj_sys) {
                     if (!c1 || !c28 || c28->CalcTotalCurrentHealth() <= 0.0f) continue;
                     Vector4 d = Sub3(c1->position, tp);
                     if (sqrtf(Dot3(d, d)) <= 10.0f) {
+                        *(uint32_t*)((uintptr_t)c28 + 0x14) = 1;
                         float new_hp = ApplyDamageToHealthComponent(c28, 600.0f);
                         if (new_hp <= 0.0f) *(uint32_t*)((uintptr_t)c1 + 0x1B8) &= ~0x10000u;
                         SyncEntityHealthVarBag(ent);
+                        {
+                            std::lock_guard<std::mutex> hit_lock(s_pellet_hit_mutex);
+                            if (s_pending_dmg_pkt_count < 32) {
+                                uint8_t pkt_flags = (uint8_t)(new_hp <= 0.0f ? 2 : 0);
+                                s_pending_dmg_pkts[s_pending_dmg_pkt_count++] = PendingDamagePacket{ ent->entity_id, 600, pkt_flags, false, 0x0580000000000232ULL };
+                            }
+                        }
                     }
                 }
             }
@@ -6168,7 +6991,8 @@ static uint8_t __fastcall StatescriptAction_ExecuteAndContinue_hook(
             //   - node[19]: Initial weapon selection on spawn (selects slot 1)
             //   - node[12]: Next Weapon (Scroll Wheel 0x5F)
             //   - node[13]: Prev Weapon (Scroll Wheel 0x5E)
-            if (script_id == 0x0580000000000015ULL && owner_ent && owner_ent == GetLocalHeroModelEnt()) {
+            if (script_id == 0x0580000000000015ULL && owner_ent && owner_ent == GetLocalHeroModelEnt() &&
+                HasMultiWeaponPair(inst->ss_inner)) {
                 int nidx = stu_node->idx_in_nodes;
                 if (nidx == 19) {
                     s_pending_weapon_slot = 1;
@@ -6424,7 +7248,7 @@ static uint8_t __fastcall StatescriptAction_ExecuteAndContinue_hook(
                                 int32_t dmg_int = (int32_t)(amt + 0.5f);
                                 if (dmg_int < 1) dmg_int = 1;
                                 uint8_t pkt_flags = (uint8_t)(new_hp <= 0.0f ? 2 : 0);
-                                s_pending_dmg_pkts[s_pending_dmg_pkt_count++] = PendingDamagePacket{ target_ent->entity_id, dmg_int, pkt_flags, true };
+                                s_pending_dmg_pkts[s_pending_dmg_pkt_count++] = PendingDamagePacket{ target_ent->entity_id, dmg_int, pkt_flags, true, script_id };
                             }
                         }
                         ShotDiagLogFmt("[ACTION_DMG (0x04CC5359)] script=0x%llX target=0x%X -%.1f -> HP %.1f",
@@ -6494,6 +7318,7 @@ static uint32_t __fastcall StatescriptState_StartState_hook(StatescriptState* st
     if (!IsHeroOrSubEntScript(inst)) {
         if (IsAnyHeroOrSubEntScript(inst)) {
             inst->execution_flags = (inst->execution_flags | 0x400001u) & ~(0x100Cu | 0x200000u);
+            SeedHeroWeaponSlotVars(inst);
         }
         return StatescriptState_StartState_orig(state, a2);
     }
@@ -6547,33 +7372,10 @@ static uint32_t __fastcall StatescriptState_StartState_hook(StatescriptState* st
         }
     }
 
-    // Pre-seed multi-weapon slot variables (0x1C in instance VarBag, 0x1E/0x1F = 1 in entity VarBag) BEFORE
-    // node[2] (0xE811ECBB Cond:BoolSwitch) or 0xC2A01675 (HUD weapon indicator) evaluates on initial spawn!
-    {
-        uint64_t pre_sid = SafeReadVal<uint64_t>((uintptr_t)inst + 0x150);
-        if (pre_sid == 0x058000000000006BULL || pre_sid == 0x058000000000006DULL ||
-            pre_sid == 0x0580000000000102ULL || pre_sid == 0x05800000000000F3ULL ||
-            pre_sid == 0x0580000000000015ULL) {
-            int w_slot = (pre_sid == 0x058000000000006BULL || pre_sid == 0x0580000000000102ULL) ? 1 :
-                         ((pre_sid == 0x058000000000006DULL || pre_sid == 0x05800000000000F3ULL) ? 2 : 0);
-            if (w_slot > 0 && inst->rid_instance_varbag && !IsBadReadPtr(inst->rid_instance_varbag, sizeof(StatescriptVar_VarBag))) {
-                if (ReadVarBagInt32(inst->rid_instance_varbag, 0x0D8000000000001CLL) != w_slot) {
-                    StatescriptPrimitive scv(StatescriptPrimitive_INT, (int64_t)w_slot);
-                    inst->rid_instance_varbag->SetVar({ 0x0D8000000000001CLL }, scv);
-                }
-            }
-            if (inst->ss_inner && inst->ss_inner->rid_entity_varbag &&
-                !IsBadReadPtr(inst->ss_inner->rid_entity_varbag, sizeof(StatescriptVar_VarBag))) {
-                if (ReadVarBagInt32(inst->ss_inner->rid_entity_varbag, 0x0D8000000000001FLL) <= 0) {
-                    StatescriptPrimitive p1(StatescriptPrimitive_INT, 1LL);
-                    inst->ss_inner->rid_entity_varbag->SetVar({ 0x0D8000000000001ELL }, p1);
-                    inst->ss_inner->rid_entity_varbag->SetVar({ StatescriptVar_ENTITY_VARBAG, 0x0D8000000000001ELL }, p1);
-                    inst->ss_inner->rid_entity_varbag->SetVar({ 0x0D8000000000001FLL }, p1);
-                    inst->ss_inner->rid_entity_varbag->SetVar({ StatescriptVar_ENTITY_VARBAG, 0x0D8000000000001FLL }, p1);
-                }
-            }
-        }
-    }
+    // Pre-seed multi-weapon slot variables (0x1C in instance VarBag, 0x1E/0x1F = 1 in entity VarBag) ONLY for heroes
+    // with a multi-weapon pair (Mercy 0x6B/0x6D, Torbjorn 0x102/0xF3). Single-weapon heroes natively use slot 0 (0x1C=0,
+    // 0x1F=0) and forcing 0x1F=1 on 0x0580000000000015 blocks their Cond:BoolSwitch (0xE811ECBB) weapon spawners!
+    SeedHeroWeaponSlotVars(inst);
 
     uint32_t saved_exec_flags = inst->execution_flags;
     inst->execution_flags = (inst->execution_flags | 0x400008u) & ~0x1000u;
@@ -6770,7 +7572,7 @@ static uint32_t __fastcall StatescriptState_StartState_hook(StatescriptState* st
                                     int32_t dmg_int = (int32_t)(dmg + 0.5f);
                                     if (dmg_int < 1) dmg_int = 1;
                                     uint8_t pkt_flags = (uint8_t)(new_hp <= 0.0f ? 2 : 0);
-                                    s_pending_dmg_pkts[s_pending_dmg_pkt_count++] = PendingDamagePacket{ ent->entity_id, dmg_int, pkt_flags, true };
+                                    s_pending_dmg_pkts[s_pending_dmg_pkt_count++] = PendingDamagePacket{ ent->entity_id, dmg_int, pkt_flags, true, script_id };
                                 }
                             }
                             Vector4 push_dir{ d.X + fwd.X * 1.5f, 0.0f, d.Z + fwd.Z * 1.5f, 0.0f };
@@ -6996,7 +7798,7 @@ static void OnUniversalStateEntry(StatescriptSyncMgr* ss, StatescriptInstance* i
     // 1b. Multi-Weapon Manager Script (0x0580000000000015 STUWeaponComponent::m_managerScript):
     //   - On initial entry (node[14], node[20], node[43]) after node[37]/node[38] reset 0x1E=0 & 0x1F=0, select Weapon 1.
     //   - On weapon-switch request state (node[21], node[33], node[30]), commit desired slot 0x0D8000000000001E to 0x0D8000000000001F.
-    if (script_id == 0x0580000000000015ULL) {
+    if (script_id == 0x0580000000000015ULL && HasMultiWeaponPair(inst->ss_inner)) {
         if (node_idx == 14 || node_idx == 20 || node_idx == 43) {
             if (inst->ss_inner && inst->ss_inner->rid_entity_varbag &&
                 ReadVarBagInt32(inst->ss_inner->rid_entity_varbag, 0x0D8000000000001FLL) <= 0) {
@@ -8575,26 +9377,58 @@ static const char* ResolveSSNodeName(uint32_t hash) {
     case 0x2F937AE3: return "Entry:GameMsg";
     case 0x902C07FC: return "Entry:Start";
     case 0xC71FD31C: return "Entry:Event";
+    case 0xBE49A4C2: return "Entry:GameMsgA";
+    case 0x46C48944: return "Entry:SubEntStart";
+    case 0x32240295: return "Entry:Global";
+    case 0x11D7F052: return "Plug:Input";
+    case 0x3E490486: return "Plug:Output";
+    case 0x24AB1F0B: return "Plug:Subgraph";
+    case 0xB8F35B20: return "Plug:Subgraph2";
+    case 0x5732771B: return "Plug:ClientOnlySubgraph";
+    case 0x26C93342: return "Plug:ClientOnlySubgraph2";
+    case 0x4E5FEEE5: return "Plug:ServerOnlySubgraph";
+    case 0x7776C23C: return "Node:Base";
+    case 0xD285A1BB: return "State:Base";
+    case 0x2ECEFC8B: return "Act:Base";
+    case 0x7C37927C: return "Graph:Statescript";
+    case 0x329AC5F3: return "GraphWithOverrides";
+    case 0x9B38211B: return "Comp:Statescript";
+    case 0xAEBE9BAA: return "Comp:Health";
+    case 0x528F2F94: return "Comp:VoiceSet";
+    case 0x401ED666: return "Comp:DoorMover_29";
+    case 0x1B54380E: return "Comp:DoorObstacle_2A";
     case 0xE811ECBB: return "Cond:BoolSwitch";
     case 0xCD462C0E: return "Cond:CmpSwitch";
     case 0xD5411AC4: return "Cond:FilterSwitch";
+    case 0xD0B42497: return "Cond:JunctionGate";
+    case 0xB1032DAF: return "Cond:IfBranch";
     case 0x7555AC24: return "Act:SendEvent";
     case 0xF9EF59A6: return "Act:PlayScript";
     case 0x8CD9A3B0: return "Act:StopScript";
     case 0xAD6D8308: return "Act:ResetState";
+    case 0x837E8660: return "Act:StopState";
     case 0xBA2A3B19: return "Act:WaitDelay";
     case 0x558B92CA: return "Act:ClientSimTick";
     case 0xA329F060: return "Act:SetVarClient";
     case 0xB3934B2D: return "Act:ModifyVar";
     case 0xFB58999F: return "Act:ClearVar";
     case 0xA1ABA697: return "Act:PlayAnim";
+    case 0xEB923A6A: return "Act:PlayHardpointAnim";
+    case 0x5046363D: return "Act:AnimLayerTag";
     case 0xB2301AC1: return "Act:PlaySound";
+    case 0x66B5F581: return "Act:PlayEffect";
     case 0x4935CA8D: return "Act:CamFX";
     case 0x1CA9A2AC: return "Act:Rumble";
     case 0x4E83BC01: return "Act:SendGameMsg(SRV)";
+    case 0x5BEA9B4B: return "Act:SendGameMsgCond";
+    case 0x2501A4DB: return "Act:RandomFromBucket";
+    case 0x76F2536A: return "Act:SendHeroSelection";
     case 0x4698E4B6: return "Act:SetVar";
+    case 0x7C22911E: return "Act:ResetVelocity";
+    case 0xE4D667E6: return "Act:ClearBeamTarget";
     case 0x04CC5359: return "SRV_Act:DmgHeal";
     case 0x5C46D801: return "SRV_Act:DestroyEnt";
+    case 0x6332D975: return "SRV_Act:DestroyEnt2";
     case 0x1BB99C36: return "SRV_Act:CreateEntA";
     case 0x4CCED352: return "SRV_Act:CreateEntB";
     case 0x0E3689F3: return "SRV_Act:CreateEntC";
@@ -8602,20 +9436,49 @@ static const char* ResolveSSNodeName(uint32_t hash) {
     case 0xC75B4AD2: return "SRV_Act:UltCharge";
     case 0xFC39E2F1: return "SRV_Act:RespawnTele";
     case 0xC5E146B4: return "SRV_Act:TeamObj";
+    case 0x17C9F80B: return "SRV_Act:SelectWeaponSlot";
+    case 0xBD6A3DFF: return "SRV_Act:AITargetingA";
+    case 0x78184003: return "SRV_Act:AITargetingB";
+    case 0x3A846155: return "SRV_Act:RIPTirePossess";
+    case 0x74CB0002: return "SRV_Act:RIPTireDetonate";
+    case 0xEAEE2743: return "SRV_Act:SpawnDeployable";
+    case 0x0D5A6DD2: return "SRV_Act:StatusCleanse";
+    case 0xDE4F0F88: return "SRV_Act:AbilityEvent";
+    case 0x0CDC2E1A: return "SRV_Act:CombatTrigger";
+    case 0xA88EB9DE: return "SRV_Act:MineVenomDoT";
+    case 0x65F5405F: return "SRV_Act:InitBarrierHealthVars";
+    case 0xAF645748: return "Act:BarrierHealthEvent";
     case 0xF53C5DA8: return "State:LogicalBtn";
+    case 0xFF77458C: return "State:InputButton";
     case 0xF7D6498C: return "State:StateStack(Mtx)";
     case 0x860EE5FC: return "State:WeaponVolley";
+    case 0x44E7F474: return "State:WeaponFireFX";
+    case 0xFFBFA88D: return "State:EffectBase";
     case 0x6E81F6D4: return "State:Effect";
+    case 0xC0A88BB0: return "State:BeamEffect";
     case 0xCD396790: return "State:WaitTimer";
+    case 0x65F158DA: return "State:WaitAnim";
+    case 0x970EC198: return "State:VarRampTimer";
     case 0x3DB862C4: return "State:Subscript";
+    case 0xA7213568: return "State:SubgraphGroup";
+    case 0x26367267: return "State:MultiSwitch";
+    case 0x381D6654: return "State:AnimTag";
     case 0xC17B255D: return "State:MoveImpulse";
+    case 0xC1035274: return "State:MoveTowards";
     case 0x2A0FB7E6: return "State:DirDash";
     case 0x619D9E95: return "State:MeleeSweep";
     case 0xC2A01675: return "State:TargetSweep";
     case 0x6A6C9D8B: return "State:ChannelHold";
     case 0x8A71D6B6: return "State:StatusMod";
     case 0x3E7B1C90: return "State:Barrier";
+    case 0x1E2D3677: return "State:BarrierActiveSub";
+    case 0x99D0CF4A: return "State:BarrierHealthMonitor";
+    case 0xE7C6AAF6: return "State:SpawnBarrierEntity";
+    case 0x0459C53D: return "State:SpawnProjectile";
+    case 0xF8EC9531: return "State:FireTargetedProj";
     case 0x72596FBE: return "State:RecallRewind";
+    case 0x029BF346: return "State:RecallHistoryRecorder";
+    case 0x7211CF70: return "State:RecallRewindTick";
     case 0xA6D7759E: return "State:BlinkTele";
     case 0x2E3B1980: return "State:HealTether";
     case 0xFD0D8424: return "State:Deployable";
@@ -8626,38 +9489,50 @@ static const char* ResolveSSNodeName(uint32_t hash) {
     case 0x12AA4F0F: return "State:MeiWallStart(Grp1Stub)";
     case 0x614C3A0A: return "State:MeiWallPillar(Grp1Stub)";
     case 0xD78490D1: return "State:Knockback";
-    case 0x6332D975: return "SRV_Act:DestroyEnt2";
     case 0xA323EC29: return "State:PetPossess";
-    case 0xBE49A4C2: return "Entry:GameMsgA";
-    case 0x46C48944: return "Entry:SubEntStart";
     case 0x85C28A9A: return "State:ShaderParam(0xEE)";
-    case 0x99D0CF4A: return "State:BarrierHealthMonitor";
-    case 0x65F5405F: return "SRV_Act:InitBarrierHealthVars";
-    case 0xAF645748: return "Act:BarrierHealthEvent";
-    case 0x1E2D3677: return "State:BarrierActiveSub";
-    case 0xD0B42497: return "Cond:JunctionGate";
-    case 0x837E8660: return "Act:StopState";
-    case 0xEC502A81: return "CV:Expression";
     case 0x498B421A: return "State:TargetLockOn";
     case 0x725967AA: return "State:TargetScannerUI";
     case 0xE831BEF1: return "State:TetherOrbMonitor";
-    case 0xF8EC9531: return "State:FireTargetedProj";
-    case 0xCEF466A3: return "CV:AITargetEnt";
-    case 0x40AD92BE: return "CV:HasAITarget";
-    case 0x65F158DA: return "State:WaitAnim";
     case 0x7FB4BF64: return "State:DoorWait/Sweep";
-    case 0xFF77458C: return "State:InputButton";
     case 0x2168E38F: return "State:BeamTargetUI";
     case 0xC739BAAC: return "State:BeamReticleUI";
     case 0x4AB09851: return "State:HeroHUDMonitor";
-    case 0x970EC198: return "State:VarRampTimer";
-    case 0xB1032DAF: return "Cond:IfBranch";
-    case 0xEB923A6A: return "Act:PlayHardpointAnim";
-    case 0x5046363D: return "Act:AnimLayerTag";
-    case 0x381D6654: return "State:AnimTag";
-    case 0xA7213568: return "State:SubgraphGroup";
-    case 0x26367267: return "State:MultiSwitch";
-    case 0x44E7F474: return "State:WeaponFireFX";
+    case 0x8BA08EDD: return "State:UXBase";
+    case 0x8F23FA30: return "State:UXHeroSelectScreen";
+    case 0x6E3B4652: return "State:UXHeroSelect";
+    case 0xDB0FDC79: return "State:GamePadVibration";
+    case 0x1AB3B4D7: return "SRV_State:AITargeting";
+    case 0x68CB1DF9: return "SRV_State:WeaponMod";
+    case 0x9C27CBCE: return "SRV_State:DeployableActive";
+    case 0xA7CA1073: return "SRV_State:AuraBuff";
+    case 0x6C6ECEED: return "SRV_State:ChannelAbility";
+    case 0xE67578C0: return "SRV_State:CombatState";
+    case 0x8B6A3312: return "SRV_State:TurretUpgrade";
+    case 0x8DE7E50F: return "SRV_State:GrapplePull";
+    case 0x5179B279: return "SRV_State:MineTrigger";
+    case 0xBFD9AADD: return "CV:Base";
+    case 0xF8CC195D: return "CV:Dynamic";
+    case 0xCC3A08F4: return "CV:ExpressionBase";
+    case 0xEC502A81: return "CV:Expression";
+    case 0x5C7964FF: return "CV:LogicalButton";
+    case 0xFF7876F9: return "CV:GameMessage";
+    case 0x34D7F9EE: return "CV:Identifier";
+    case 0x92C535C6: return "CV:DataStore";
+    case 0xE476E0B4: return "CV:FloatBase";
+    case 0x4369E6C9: return "CV:Float";
+    case 0x636E86DD: return "CV:IntBase";
+    case 0x3AE7427E: return "CV:Int";
+    case 0xB233D29C: return "CV:BoolBase";
+    case 0x5E745F2B: return "CV:Bool";
+    case 0x04E83493: return "CV:StatescriptGraph";
+    case 0xE53C2921: return "CV:EntityDef";
+    case 0xF029B472: return "CV:BoneHardpoint";
+    case 0xDBF9195C: return "CV:Vec3Offset";
+    case 0xCEF466A3: return "CV:AITargetEnt";
+    case 0x40AD92BE: return "CV:HasAITarget";
+    case 0x6324DD9F: return "STU:GameMsgRef";
+    case 0xC936AE28: return "STU:ModifyHealth";
     default: break;
     }
     auto it = allmighty_hash_lib::hashes.find(hash);
@@ -8682,14 +9557,23 @@ static std::string DecodeConfigVarCompact(uintptr_t obj_addr, uint32_t chash) {
         uint64_t rid08 = SafeReadVal<uint64_t>(obj_addr + 0x08);
         return std::format("DS(0x{:X})", rid10 ? rid10 : rid08);
     }
-    if (chash == 0xE476E0B4) { // STUConfigVarFloat
+    if (chash == 0xE476E0B4 || chash == 0x4369E6C9) { // STUConfigVarFloat
         return std::format("Flt({:.2f})", SafeReadVal<float>(obj_addr + 0x10));
     }
-    if (chash == 0x636E86DD) { // STUConfigVarInt
+    if (chash == 0x636E86DD || chash == 0x3AE7427E) { // STUConfigVarInt
         return std::format("Int({})", SafeReadVal<int32_t>(obj_addr + 0x10));
     }
-    if (chash == 0xB233D29C) { // STUConfigVarBool
+    if (chash == 0xB233D29C || chash == 0x5E745F2B) { // STUConfigVarBool
         return std::format("Bool({})", SafeReadVal<uint8_t>(obj_addr + 0x10));
+    }
+    if (chash == 0x5C7964FF) { // STUConfigVarLogicalButton
+        return std::format("Btn(0x{:X})", SafeReadVal<uint32_t>(obj_addr + 0x10));
+    }
+    if (chash == 0xDBF9195C) { // STUConfigVarVec3
+        return std::format("Vec3({:.2f},{:.2f},{:.2f})",
+            SafeReadVal<float>(obj_addr + 0x10),
+            SafeReadVal<float>(obj_addr + 0x14),
+            SafeReadVal<float>(obj_addr + 0x18));
     }
     if (chash == 0xEC502A81) { // STUConfigVarExpression
         auto* bc_list = (STUBullshitListFull<uint8_t>*)(obj_addr + 0x20);
@@ -9579,6 +10463,495 @@ void WeaponHardpointDiag::DumpDummyCombatForensics(EntityAdminBase* game_ea, con
     s_last_dummy_dump_status = std::format("Wrote dummy_combat_diag.log ({} bytes, raycasts={}, ok={})",
         out.size(), s_shot_raycast_calls, ok ? "YES" : "NO");
     printf("[DummyCombatDiag] %s\n", s_last_dummy_dump_status.c_str());
+}
+
+void WeaponHardpointDiag::ApplyLocalHeroDamageAllowZero(EntityAdminBase* game_ea, float dmg) {
+    if (!game_ea || !game_ea->local_entid) return;
+    Entity* local_ctrl = game_ea->getLocalEnt();
+    if (!local_ctrl) return;
+    auto* c20 = local_ctrl->getById<Component_20_ModelReference>(0x20);
+    uint32_t mdl_id = c20 ? (c20->cam_attach_entid ? c20->cam_attach_entid : (c20->aim_entid ? c20->aim_entid : c20->movement_attach_entid)) : 0;
+    Entity* local_mdl = mdl_id ? game_ea->getEntById(mdl_id) : nullptr;
+    if (!local_mdl) return;
+    auto* c28 = local_mdl->getById<Component_28_STUHealthComponent>(0x28);
+    if (!c28) return;
+    *(uint32_t*)((uintptr_t)c28 + 0x14) = 1;
+    float new_hp = ApplyDamageToHealthComponent(c28, dmg);
+    if (dmg >= 900.0f || new_hp < 0.01f) {
+        // Ensure zero across all enabled parts
+        HealthPart* pools[3] = { c28->shield_health, c28->armour_health, c28->normal_health };
+        for (int p = 0; p < 3; ++p) {
+            for (int i = 0; i < 0x10; ++i) {
+                if (pools[p][i].part_enabled) pools[p][i].curr_health = 0.0f;
+            }
+        }
+        new_hp = 0.0f;
+    }
+    SyncEntityHealthVarBag(local_mdl);
+    if (auto* c1 = local_mdl->getById<Component_1_SceneRendering>(1)) {
+        if (new_hp <= 0.0f) *(uint32_t*)((uintptr_t)c1 + 0x1B8) &= ~0x10000u;
+    }
+    printf("[KillLocalHero] local_mdl=0x%X new_hp=%.1f\n", mdl_id, new_hp);
+}
+
+static std::string LookupCommentOrEmpty(int64_t id) {
+    auto it = allmighty_hash_lib::comments.find(id);
+    return (it != allmighty_hash_lib::comments.end()) ? it->second : "";
+}
+
+static const char* SafeReadUXStrPtr(uint64_t str_id) {
+    __try {
+        return GetUXDisplayString((__int64)str_id);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return "(fault)";
+    }
+}
+
+static std::string SafeReadUXStr(uint64_t str_id) {
+    const char* s = SafeReadUXStrPtr(str_id);
+    if (!s) return "(null)";
+    std::string out(s);
+    for (char& ch : out) {
+        if (ch == '\r' || ch == '\n') ch = ' ';
+    }
+    return out;
+}
+
+static Entity* SafeResolveHudEntity(EntityAdminBase* game_ea) {
+    if (!game_ea || IsBadReadPtr(game_ea, 0x100)) return nullptr;
+    __try {
+        uintptr_t vt = *(uintptr_t*)game_ea;
+        if (!vt || IsBadReadPtr((const void*)vt, 0x100)) return nullptr;
+        auto is_assignable = *(char(__fastcall**)(EntityAdminBase*, uintptr_t))(vt + 0x08);
+        if (!is_assignable || !is_assignable(game_ea, globals::gameBase + 0x17B91E8)) return nullptr;
+        auto get_mgr = *(uintptr_t(__fastcall**)(EntityAdminBase*))(vt + 0xE0);
+        uintptr_t mgr = get_mgr ? get_mgr(game_ea) : 0;
+        if (!mgr || IsBadReadPtr((const void*)mgr, 0x10)) return nullptr;
+        uintptr_t mvt = *(uintptr_t*)mgr;
+        if (!mvt || IsBadReadPtr((const void*)mvt, 0x10)) return nullptr;
+        auto get_ent = *(Entity*(__fastcall**)(uintptr_t))(mvt + 0x08);
+        return get_ent ? get_ent(mgr) : nullptr;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
+static const char* SafeGetViewModelName(ViewModel* vm) {
+    if (!vm || IsBadReadPtr(vm, sizeof(ViewModel))) return "(invalid)";
+    __try {
+        if (vm->vfptr && !IsBadReadPtr(vm->vfptr, sizeof(ViewModel_vt)) && vm->vfptr->GetName) {
+            const char* n = vm->vfptr->GetName();
+            if (n && !IsBadReadPtr(n, 1)) return n;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return "(fault)";
+    }
+    return "?";
+}
+
+static ViewModelRoot* SafeGetViewModelRoot() {
+    __try {
+        return GetViewModelRoot();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
+static bool SafeIsActivityLogState(StatescriptState* st) {
+    if (!st || IsBadReadPtr(st, sizeof(StatescriptState))) return false;
+    __try {
+        uintptr_t svt = *(uintptr_t*)st;
+        if (svt && !IsBadReadPtr((void*)svt, 0x20)) {
+            auto fn = *(char(__fastcall**)(void*, uintptr_t))(svt + 0x10);
+            if (fn) return fn(st, globals::gameBase + 0x17BC1A0) != 0;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return false;
+}
+
+static const char* SafeReadVMStringRep(uintptr_t val) {
+    if (!val || IsBadReadPtr((void*)val, sizeof(string_rep))) return nullptr;
+    __try {
+        auto* rep = (string_rep*)val;
+        const char* s = rep->get();
+        if (s && !IsBadReadPtr(s, 1)) return s;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return nullptr;
+}
+
+static bool IsInterestingVM(ViewModel* vm, const char* name) {
+    if (!vm || IsBadReadPtr(vm, sizeof(ViewModel))) return true;
+    std::string nm = name ? name : "";
+    for (char& c : nm) c = (char)tolower((unsigned char)c);
+    if (nm.find("hud") != std::string::npos || nm.find("activity") != std::string::npos ||
+        nm.find("toast") != std::string::npos || nm.find("banner") != std::string::npos ||
+        nm.find("kill") != std::string::npos || nm.find("dead") != std::string::npos ||
+        nm.find("death") != std::string::npos || nm.find("respawn") != std::string::npos ||
+        nm.find("ingame") != std::string::npos || nm.find("game") != std::string::npos ||
+        nm.find("generic") != std::string::npos || nm.find("match") != std::string::npos ||
+        nm.find("portrait") != std::string::npos || nm.find("health") != std::string::npos ||
+        nm.find("player") != std::string::npos || nm.find("world") != std::string::npos ||
+        nm.find("chat") != std::string::npos || nm.find("feed") != std::string::npos ||
+        nm.find("log") != std::string::npos || nm.find("elim") != std::string::npos ||
+        nm.find("notice") != std::string::npos || nm.find("alert") != std::string::npos ||
+        nm.find("score") != std::string::npos || nm.find("team") != std::string::npos ||
+        nm.find("hero") != std::string::npos || nm.find("overlay") != std::string::npos) {
+        return true;
+    }
+    if (vm->properties.ptr && vm->properties.num > 0 && vm->properties.num <= 128 &&
+        !IsBadReadPtr(vm->properties.ptr, sizeof(ViewModelPropertyListItem) * vm->properties.num)) {
+        for (int i = 0; i < vm->properties.num; ++i) {
+            uint64_t k = (uint64_t)vm->properties.ptr[i].key;
+            if (k == 0x0AC00000000000ADULL || k == 0x0AC0000000000126ULL ||
+                k == 0x0AC0000000000128ULL || k == 0x0AC0000000000129ULL ||
+                k == 0x0AC0000000000160ULL || k == 0x0AC00000000001B9ULL ||
+                k == 0x0AC00000000001FCULL || k == 0x0AC0000000000205ULL ||
+                k == 0x0AC000000000040AULL || k == 0x0AC00000000005D5ULL ||
+                k == 0x0AC00000000005D6ULL || k == 0x0AC000000000093DULL ||
+                k == 0x0AC0000000000952ULL ||
+                (k >= 0x0AC000000000083DULL && k <= 0x0AC0000000000844ULL) ||
+                k == 0x0AC0000000000891ULL || k == 0x0AC0000000000892ULL ||
+                vm->properties.ptr[i].property.type == ViewModelPropertyType_VIEWMODEL ||
+                vm->properties.ptr[i].property.type == ViewModelPropertyType_ARRAY) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static void DumpViewModelRecursive(std::string& out, ViewModel* vm, int depth, int& line_budget, int max_lines, const char* prefix_tag) {
+    if (!vm || line_budget >= max_lines || depth > 4 || IsBadReadPtr(vm, sizeof(ViewModel))) return;
+    const char* vm_name = SafeGetViewModelName(vm);
+
+    std::string indent(depth * 2, ' ');
+    int pcnt = (vm->properties.ptr && vm->properties.num >= 0 && vm->properties.num <= 256) ? vm->properties.num : -1;
+    out.append(std::format("{}* {}{} vm=0x{:X} id=0x{:X} `{}` props={}\n",
+        indent, prefix_tag ? prefix_tag : "", prefix_tag ? " " : "",
+        (unsigned long long)vm, (unsigned long long)vm->id, vm_name, pcnt));
+    line_budget++;
+
+    if (pcnt <= 0 || !IsInterestingVM(vm, vm_name)) return;
+    if (IsBadReadPtr(vm->properties.ptr, sizeof(ViewModelPropertyListItem) * pcnt)) return;
+
+    for (int i = 0; i < pcnt && line_budget < max_lines; ++i) {
+        auto& item = vm->properties.ptr[i];
+        uint64_t k = (uint64_t)item.key;
+        std::string kname = LookupCommentOrEmpty((__int64)k);
+        auto t = item.property.type;
+        if (t == ViewModelPropertyType_VIEWMODEL) {
+            ViewModel* ch = (ViewModel*)item.property.value;
+            std::string tag = std::format("prop:0x{:X}({})", k & 0xFFFF, kname);
+            DumpViewModelRecursive(out, ch, depth + 1, line_budget, max_lines, tag.c_str());
+        } else if (t == ViewModelPropertyType_ARRAY) {
+            ViewModelArray* arr = (ViewModelArray*)item.property.value;
+            int acnt = (arr && !IsBadReadPtr(arr, sizeof(ViewModelArray)) && arr->viewmodel_list.num >= 0 && arr->viewmodel_list.num <= 512)
+                ? arr->viewmodel_list.num : -1;
+            out.append(std::format("{}  - ARR prop=0x{:X} `{}` count={}\n", indent, k, kname, acnt));
+            line_budget++;
+            if (acnt > 0 && arr->viewmodel_list.ptr && !IsBadReadPtr(arr->viewmodel_list.ptr, sizeof(ViewModel*) * acnt)) {
+                int show = (acnt > 4) ? 4 : acnt;
+                for (int j = 0; j < show && line_budget < max_lines; ++j) {
+                    std::string tag = std::format("[{}]", j);
+                    DumpViewModelRecursive(out, arr->viewmodel_list.ptr[j], depth + 2, line_budget, max_lines, tag.c_str());
+                }
+            }
+        } else {
+            std::string extra;
+            if (t == ViewModelPropertyType_STRING_REP) {
+                if (const char* s = SafeReadVMStringRep((uintptr_t)item.property.value)) {
+                    extra = std::format(" str=\"{}\"", s);
+                }
+            } else if (t == ViewModelPropertyType_FLT) {
+                float fv = *(float*)&item.property.value;
+                extra = std::format(" flt={:.2f}", fv);
+            } else if (t == ViewModelPropertyType_LONG) {
+                std::string vn = LookupCommentOrEmpty(item.property.value);
+                extra = std::format(" long=0x{:X}({})", (unsigned long long)item.property.value, vn);
+            }
+            out.append(std::format("{}  - prop=0x{:X} `{}` t={} has={} val=0x{:X}{}\n",
+                indent, k, kname, (int)t, (int)item.property.has_value, (unsigned long long)item.property.value, extra));
+            line_budget++;
+        }
+    }
+}
+
+static uintptr_t SafeResolveSys46Case8Obj(uintptr_t mgr) {
+    if (!mgr || IsBadReadPtr((void*)mgr, 0xF0)) return 0;
+    __try {
+        int32_t sub_cnt = *(int32_t*)(mgr + 0xE0);
+        uintptr_t sub_arr = *(uintptr_t*)(mgr + 0xD8);
+        if (!sub_arr || sub_cnt <= 0 || sub_cnt > 256 || IsBadReadPtr((void*)sub_arr, sizeof(void*) * sub_cnt)) return 0;
+        for (int si = 0; si < sub_cnt; ++si) {
+            uintptr_t obj = *(uintptr_t*)(sub_arr + (uintptr_t)si * 8);
+            if (!obj || IsBadReadPtr((void*)obj, 0x20)) continue;
+            uintptr_t ovt = *(uintptr_t*)obj;
+            if (!ovt || IsBadReadPtr((void*)ovt, 0x20)) continue;
+            auto is_fn = *(char(__fastcall**)(uintptr_t, uintptr_t))(ovt + 0x08);
+            if (is_fn && is_fn(obj, globals::gameBase + 0x17B9548)) {
+                return obj;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return 0;
+}
+
+void WeaponHardpointDiag::DumpKillfeedAndRespawnDiag(EntityAdminBase* game_ea, const char* trigger_reason) {
+    std::string out;
+    out.reserve(65536);
+    out += std::format("# Killfeed & Respawn Live Diag (trigger: {})\n\n", trigger_reason ? trigger_reason : "Manual");
+
+    // 1. UX Display Strings
+    out += "## 1. Localized 0x0DE0 UX Strings (Build 0.8.0.24919)\n";
+    static const uint64_t kUxProbeIds[] = {
+        0x0DE0000000001124ULL, 0x0DE0000000001125ULL, 0x0DE0000000001126ULL, 0x0DE0000000001127ULL,
+        0x0DE0000000001128ULL, 0x0DE0000000001129ULL, 0x0DE000000000112AULL, 0x0DE000000000112BULL,
+        0x0DE000000000112CULL, 0x0DE000000000112DULL, 0x0DE000000000112EULL, 0x0DE000000000112FULL,
+        0x0DE0000000001155ULL, 0x0DE0000000001156ULL, 0x0DE0000000001157ULL, 0x0DE0000000001158ULL,
+        0x0DE0000000001159ULL, 0x0DE000000000115AULL, 0x0DE000000000115BULL, 0x0DE000000000115CULL,
+        0x0DE000000000223EULL, 0x0DE000000000223FULL, 0x0DE0000000002240ULL, 0x0DE0000000002241ULL,
+        0x0DE0000000002242ULL, 0x0DE0000000002243ULL, 0x0DE0000000002318ULL, 0x0DE0000000001D26ULL,
+        0x0DE0000000001D27ULL, 0x0DE00000000016BFULL, 0x0DE00000000016C0ULL, 0x0DE000000000040AULL,
+        0x0DE000000000041AULL, 0x0DE000000000043AULL, 0x0DE000000000043BULL, 0x0DE000000000043EULL,
+        0x0DE000000000043FULL
+    };
+    for (uint64_t uid : kUxProbeIds) {
+        std::string s = SafeReadUXStr(uid);
+        if (s != "(invalid)") {
+            out.append(std::format("- `0x{:016X}`: \"{}\"\n", uid, s));
+        }
+    }
+
+    // 2. HUD Entity, Activity_Log (0x1417BC1A0), System46, & Component_3A
+    out += "\n## 2. HUD Entity (+0xD5F104), Activity_Log (0x1417BC1A0), & System46\n";
+    out.append(std::format("- `Last ELIM_BANNER`: {}\n", s_last_elim_trace.empty() ? "(none yet)" : s_last_elim_trace));
+    if (s_last_sys46 && !IsBadReadPtr((void*)s_last_sys46, 0x100)) {
+        uintptr_t lst_arr = SafeReadVal<uintptr_t>(s_last_sys46 + 0x50);
+        int32_t lst_cnt = SafeReadVal<int32_t>(s_last_sys46 + 0x58);
+        uintptr_t mgr = SafeReadVal<uintptr_t>(s_last_sys46 + 0x08);
+        int32_t sub_cnt = (mgr && !IsBadReadPtr((void*)mgr, 0xF0)) ? SafeReadVal<int32_t>(mgr + 0xE0) : -1;
+        uintptr_t case8_obj = SafeResolveSys46Case8Obj(mgr);
+        out.append(std::format("- `sys46`: 0x{:X} listeners={} (arr=0x{:X}) mgr=0x{:X} subs={} case8_obj(0x1417B9548)=0x{:X}\n",
+            (unsigned long long)s_last_sys46, lst_cnt, (unsigned long long)lst_arr,
+            (unsigned long long)mgr, sub_cnt, (unsigned long long)case8_obj));
+    }
+    Entity* hud_ent = SafeResolveHudEntity(game_ea);
+    auto dump_ss_entity = [&](const char* label, Entity* e, bool dump_all_active_states) {
+        if (!e || IsBadReadPtr(e, sizeof(Entity))) {
+            out.append(std::format("- `{}`: NULL\n", label));
+            return;
+        }
+        uintptr_t rl = SafeReadVal<uintptr_t>((uintptr_t)e + 0x30);
+        uint64_t res_id = (rl && !IsBadReadPtr((const void*)rl, 0x20)) ? SafeReadVal<uint64_t>(rl + 0x10) : 0;
+        uint64_t comp_mask = SafeReadVal<uint64_t>((uintptr_t)e + 0x98);
+        out.append(std::format("- `{}`: entid=`0x{:X}` res=`0x{:016X}` mask=`0x{:X}`\n",
+            label, e->entity_id, (unsigned long long)res_id, (unsigned long long)comp_mask));
+        auto* c23 = e->getById<Component_23_Statescript>(0x23);
+        if (!c23 || IsBadReadPtr(c23, sizeof(Component_23_Statescript))) return;
+        int ninst = c23->ss_inner.g1_instanceArr.num;
+        if (!c23->ss_inner.g1_instanceArr.ptr || ninst <= 0 || ninst > 128) return;
+        for (int i = 0; i < ninst; ++i) {
+            StatescriptInstance* inst = c23->ss_inner.g1_instanceArr.ptr[i];
+            if (!inst || IsBadReadPtr(inst, sizeof(StatescriptInstance))) continue;
+            std::string sname = LookupCommentOrEmpty(inst->script_id);
+            std::string act_states;
+            if (inst->state_impl_list.ptr && inst->state_impl_list.num > 0 && inst->state_impl_list.num <= 256 &&
+                !IsBadReadPtr(inst->state_impl_list.ptr, sizeof(void*) * inst->state_impl_list.num)) {
+                for (int si = 0; si < inst->state_impl_list.num; ++si) {
+                    StatescriptState* st = inst->state_impl_list.ptr[si];
+                    if (!st || IsBadReadPtr(st, sizeof(StatescriptState))) continue;
+                    bool is_act = (st->state_flags & 1) != 0;
+                    bool is_actlog = SafeIsActivityLogState(st);
+                    if (is_actlog || (dump_all_active_states && is_act)) {
+                        int32_t qcnt = is_actlog ? SafeReadVal<int32_t>((uintptr_t)st + 0xB8) : -1;
+                        int32_t q438 = is_actlog ? SafeReadVal<int32_t>((uintptr_t)st + 0x438) : -1;
+                        uintptr_t svt = SafeReadVal<uintptr_t>((uintptr_t)st);
+                        uint64_t vt_rva = (svt > globals::gameBase) ? (svt - globals::gameBase) : svt;
+                        act_states += std::format("[idx={} act={} flg=0x{:X} vt=+0x{:X} actlog={}(q={},q438={})]",
+                            st->idx_in_m_states, (int)is_act, st->state_flags, (unsigned long long)vt_rva,
+                            (int)is_actlog, qcnt, q438);
+                    }
+                }
+            }
+            out.append(std::format("  - inst={} sid=`0x{:X}`({}) flags=0x{:X} {}\n",
+                (int)inst->instance_id, (unsigned long long)inst->script_id, sname, inst->execution_flags, act_states));
+        }
+    };
+    dump_ss_entity("HUD_Ent", hud_ent, true);
+
+    if (game_ea && !IsBadReadPtr(game_ea, 0x100)) {
+        int extra_actlog = 0;
+        int comp3a_cnt = 0;
+        for (Entity* ent : *game_ea) {
+            if (!ent) continue;
+            if (comp3a_cnt < 8 && (ent->hasComponent(0x3A) || ent->hasComponent(0x59))) {
+                uintptr_t rl = SafeReadVal<uintptr_t>((uintptr_t)ent + 0x30);
+                uint64_t res_id = (rl && !IsBadReadPtr((const void*)rl, 0x20)) ? SafeReadVal<uint64_t>(rl + 0x10) : 0;
+                uintptr_t c3a = (uintptr_t)ent->getById(0x3A);
+                uintptr_t c59 = (uintptr_t)ent->getById(0x59);
+                uintptr_t v3a = c3a ? SafeReadVal<uintptr_t>(c3a) : 0;
+                uintptr_t v59 = c59 ? SafeReadVal<uintptr_t>(c59) : 0;
+                out.append(std::format("- `Comp3A/59`: entid=`0x{:X}` res=`0x{:016X}` c3a=0x{:X}(vt=+0x{:X}) c59=0x{:X}(vt=+0x{:X})\n",
+                    ent->entity_id, (unsigned long long)res_id,
+                    (unsigned long long)c3a, v3a > globals::gameBase ? (unsigned long long)(v3a - globals::gameBase) : (unsigned long long)v3a,
+                    (unsigned long long)c59, v59 > globals::gameBase ? (unsigned long long)(v59 - globals::gameBase) : (unsigned long long)v59));
+                comp3a_cnt++;
+            }
+            if (ent == hud_ent || extra_actlog >= 8) continue;
+            auto* c23 = ent->getById<Component_23_Statescript>(0x23);
+            if (!c23 || IsBadReadPtr(c23, sizeof(Component_23_Statescript))) continue;
+            int ninst = c23->ss_inner.g1_instanceArr.num;
+            if (!c23->ss_inner.g1_instanceArr.ptr || ninst <= 0 || ninst > 128) continue;
+            for (int i = 0; i < ninst; ++i) {
+                StatescriptInstance* inst = c23->ss_inner.g1_instanceArr.ptr[i];
+                if (!inst || IsBadReadPtr(inst, sizeof(StatescriptInstance))) continue;
+                bool has_interesting = (inst->script_id == 0x0580000000000029ULL || inst->script_id == 0x0580000000000093ULL);
+                if (!has_interesting && inst->state_impl_list.ptr && inst->state_impl_list.num > 0 && inst->state_impl_list.num <= 256) {
+                    for (int si = 0; si < inst->state_impl_list.num && !has_interesting; ++si) {
+                        if (SafeIsActivityLogState(inst->state_impl_list.ptr[si])) has_interesting = true;
+                    }
+                }
+                if (has_interesting) {
+                    dump_ss_entity("ExtraSS_Ent", ent, false);
+                    extra_actlog++;
+                    break;
+                }
+            }
+        }
+    }
+
+    // 3. Live ViewModels
+    out += "\n## 3. Live ViewModels (GetViewModelRoot +0x18A7070)\n";
+    ViewModelRoot* vm_root = SafeGetViewModelRoot();
+    if (vm_root && !IsBadReadPtr(vm_root, sizeof(ViewModelRoot)) &&
+        vm_root->viewmodel_list.ptr && vm_root->viewmodel_list.num > 0 && vm_root->viewmodel_list.num <= 512) {
+        out.append(std::format("- Total VM list count: `{}`\n", vm_root->viewmodel_list.num));
+        out += "### 3A. Complete Flat Index of All Live ViewModels\n";
+        for (int i = 0; i < vm_root->viewmodel_list.num; ++i) {
+            ViewModel* vm = vm_root->viewmodel_list.ptr[i];
+            if (!vm || IsBadReadPtr(vm, sizeof(ViewModel))) continue;
+            const char* nm = SafeGetViewModelName(vm);
+            int pcnt = (vm->properties.ptr && vm->properties.num >= 0 && vm->properties.num <= 256) ? vm->properties.num : -1;
+            std::string keys;
+            if (pcnt > 0 && !IsBadReadPtr(vm->properties.ptr, sizeof(ViewModelPropertyListItem) * pcnt)) {
+                int showk = (pcnt > 8) ? 8 : pcnt;
+                for (int pi = 0; pi < showk; ++pi) {
+                    uint64_t pk = (uint64_t)vm->properties.ptr[pi].key;
+                    std::string kn = LookupCommentOrEmpty((__int64)pk);
+                    keys += std::format("{}{:X}{}", pi ? "," : "", pk, kn.empty() ? "" : "(" + kn + ")");
+                }
+                if (pcnt > 8) keys += ",...";
+            }
+            out.append(std::format("  - [{}] root={} id=0x{:X} `{}` props={} [{}]\n",
+                i, (vm == vm->this_or_parent) ? 1 : 0, (unsigned long long)vm->id, nm, pcnt, keys));
+        }
+        out += "### 3B. Detailed Interesting ViewModels\n";
+        int vm_lines = 0;
+        for (int i = 0; i < vm_root->viewmodel_list.num && vm_lines < 450; ++i) {
+            ViewModel* vm = vm_root->viewmodel_list.ptr[i];
+            if (!vm || IsBadReadPtr(vm, sizeof(ViewModel))) continue;
+            if (vm == vm->this_or_parent) {
+                DumpViewModelRecursive(out, vm, 0, vm_lines, 450, "ROOT");
+            }
+        }
+    } else {
+        out += "- ViewModelRoot unavailable.\n";
+    }
+
+    // 4. LocalPlayer State & Map SpawnRoom / Component_2B Entities
+    out += "\n## 4. LocalPlayer Death/Respawn State & Map SpawnRoom (0x2B / 0x13)\n";
+    if (game_ea && !IsBadReadPtr(game_ea, 0x100)) {
+        Entity* lctrl = game_ea->getLocalEnt();
+        dump_ss_entity("LocalCtrl", lctrl, true);
+        Entity* lmdl = nullptr;
+        if (lctrl) {
+            if (auto* c10 = lctrl->getById<Component_10_FilterBits>(0x10)) {
+                out.append(std::format("  - LocalCtrl c10: pre=0x{:X} final=0x{:X}\n",
+                    (unsigned long long)c10->pre_filter_bits, (unsigned long long)c10->filter_bits));
+            }
+            if (auto* c3f = lctrl->getById<Component_3F_PlayerInfo>(0x3F)) {
+                out.append(std::format("  - LocalCtrl c3f: hero=0x{:X}\n", (unsigned long long)c3f->selected_heroid));
+            }
+            if (auto* c20 = lctrl->getById<Component_20_ModelReference>(0x20)) {
+                uint32_t mid = c20->cam_attach_entid ? c20->cam_attach_entid : (c20->aim_entid ? c20->aim_entid : c20->movement_attach_entid);
+                lmdl = mid ? game_ea->getEntById(mid) : nullptr;
+                out.append(std::format("  - LocalCtrl c20: cam=0x{:X} aim=0x{:X} mov=0x{:X}\n",
+                    c20->cam_attach_entid, c20->aim_entid, c20->movement_attach_entid));
+            }
+        }
+        dump_ss_entity("LocalMdl", lmdl, true);
+        if (lmdl) {
+            auto* c1 = lmdl->getById<Component_1_SceneRendering>(1);
+            auto* c10 = lmdl->getById<Component_10_FilterBits>(0x10);
+            auto* c28 = lmdl->getById<Component_28_STUHealthComponent>(0x28);
+            auto* c23 = lmdl->getById<Component_23_Statescript>(0x23);
+            Vector4 lp = c1 ? c1->position : Vector4{};
+            uint32_t c1_1b8 = c1 ? SafeReadVal<uint32_t>((uintptr_t)c1 + 0x1B8) : 0;
+            out.append(std::format("  - LocalMdl pos=({:.2f},{:.2f},{:.2f}) c1_1b8=0x{:X} c10_pre=0x{:X} c10=0x{:X} hp={:.1f}/{:.1f} c28_14={}\n",
+                lp.X, lp.Y, lp.Z, c1_1b8,
+                c10 ? (unsigned long long)c10->pre_filter_bits : 0ULL,
+                c10 ? (unsigned long long)c10->filter_bits : 0ULL,
+                c28 ? c28->CalcTotalCurrentHealth() : -1.0f,
+                c28 ? c28->CalcTotalMaxHealth() : -1.0f,
+                c28 ? SafeReadVal<uint32_t>((uintptr_t)c28 + 0x14) : 0));
+            if (c23 && c23->ss_inner.rid_entity_varbag && !IsBadReadPtr(c23->ss_inner.rid_entity_varbag, sizeof(StatescriptVar_VarBag))) {
+                auto* vb = c23->ss_inner.rid_entity_varbag;
+                std::string vb_str;
+                int vb_logged = 0;
+                for (int bi = 0; bi < 16; ++bi) {
+                    auto& b = vb->sub_items[bi];
+                    if (!b.arr_ptr || b.item_count <= 0 || b.item_count > 512) continue;
+                    for (int bj = 0; bj < b.item_count; ++bj) {
+                        StatescriptVar_Base* vr = b.arr_ptr[bj].ptr;
+                        if (!vr || IsBadReadPtr(vr, sizeof(StatescriptVar_Base))) continue;
+                        if (vr->is_cvd() && vb_logged < 48) {
+                            int64_t val = ((StatescriptVar_Primitive*)vr)->global_var.value;
+                            vb_str += std::format("`0x{:X}`=0x{:X}, ", (unsigned long long)vr->var_id, (unsigned long long)val);
+                            vb_logged++;
+                        }
+                    }
+                }
+                out.append(std::format("  - LocalMdl VarBag scalars ({}): {}\n", vb_logged, vb_str));
+            }
+        }
+
+        int spawn_ents = 0;
+        for (Entity* ent : *game_ea) {
+            if (!ent || spawn_ents >= 16) break;
+            if (!ent->hasComponent(0x2B) && !ent->hasComponent(0x13)) continue;
+            uintptr_t rl = SafeReadVal<uintptr_t>((uintptr_t)ent + 0x30);
+            uint64_t res_id = (rl && !IsBadReadPtr((const void*)rl, 0x20)) ? SafeReadVal<uint64_t>(rl + 0x10) : 0;
+            auto* c1 = ent->getById<Component_1_SceneRendering>(1);
+            Vector4 p = c1 ? c1->position : Vector4{};
+            auto* c10 = ent->getById<Component_10_FilterBits>(0x10);
+            uintptr_t c2b = (uintptr_t)ent->getById<ComponentBase>(0x2B);
+            std::string raw_2b;
+            if (c2b && !IsBadReadPtr((void*)c2b, 0x80)) {
+                raw_2b = std::format("c2b[+18=0x{:X},+1C=0x{:X},+20=0x{:X},+24=0x{:X},+28=0x{:X},+2C=0x{:X}]",
+                    SafeReadVal<uint32_t>(c2b + 0x18), SafeReadVal<uint32_t>(c2b + 0x1C),
+                    SafeReadVal<uint32_t>(c2b + 0x20), SafeReadVal<uint32_t>(c2b + 0x24),
+                    SafeReadVal<uint32_t>(c2b + 0x28), SafeReadVal<uint32_t>(c2b + 0x2C));
+            }
+            out.append(std::format("- MapEnt `0x{:X}` res=`0x{:016X}` has2B={} has13={} pos=({:.1f},{:.1f},{:.1f}) c10=0x{:X} {}\n",
+                ent->entity_id, (unsigned long long)res_id, (int)ent->hasComponent(0x2B), (int)ent->hasComponent(0x13),
+                p.X, p.Y, p.Z, c10 ? (unsigned long long)c10->filter_bits : 0ULL, raw_2b));
+            spawn_ents++;
+        }
+    }
+
+    const char* fname = (trigger_reason && strstr(trigger_reason, "0HP"))
+        ? "killfeed_respawn_0hp_diag.log"
+        : "killfeed_respawn_diag.log";
+    FILE* f = fopen(fname, "wb");
+    bool ok = false;
+    if (f) {
+        fwrite(out.data(), 1, out.size(), f);
+        fclose(f);
+        ok = true;
+    }
+    s_last_killfeed_diag_status = std::format("Wrote {} ({} bytes, trigger={}, ok={})",
+        fname, out.size(), trigger_reason ? trigger_reason : "Manual", ok ? "YES" : "NO");
+    printf("[KillfeedRespawnDiag] %s\n", s_last_killfeed_diag_status.c_str());
 }
 
 //void ConstructNewGameEAInPlace() {

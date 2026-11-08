@@ -469,9 +469,16 @@ class player_spawner_deluxe : public window {
 			if (ImGui::Button("Dump Dummy & Shot Forensics (dummy_combat_diag.log)")) {
 				WeaponHardpointDiag::DumpDummyCombatForensics(GameEntityAdmin(), "Manual Spawner Button");
 			}
+			ImGui::SameLine();
+			if (ImGui::Button("Dump Killfeed & Respawn Diag (killfeed_respawn_diag.log)")) {
+				WeaponHardpointDiag::DumpKillfeedAndRespawnDiag(GameEntityAdmin(), "Manual Spawner Button");
+			}
 			if (WeaponHardpointDiag::s_shot_raycast_calls > 0 || WeaponHardpointDiag::s_last_dummy_dump_status != "Not dumped yet.") {
 				ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "Shot Raycasts(+0xD354B0): %d | %s",
 					WeaponHardpointDiag::s_shot_raycast_calls, WeaponHardpointDiag::s_last_dummy_dump_status.c_str());
+			}
+			if (WeaponHardpointDiag::s_last_killfeed_diag_status != "Not dumped yet.") {
+				ImGui::TextColored(ImVec4(0.4f, 0.9f, 1.0f, 1.0f), "%s", WeaponHardpointDiag::s_last_killfeed_diag_status.c_str());
 			}
 			ImGui::Checkbox("Offline Dummy Damage (local hitscan authority)", &WeaponHardpointDiag::s_dummy_damage_enabled);
 			ImGui::SameLine();
@@ -516,6 +523,10 @@ class player_spawner_deluxe : public window {
 							sync_entity_health_varbag(local_mdl);
 						}
 						ImGui::SameLine();
+						if (ImGui::SmallButton("Kill Local Hero (0 HP)")) {
+							WeaponHardpointDiag::ApplyLocalHeroDamageAllowZero(ea, lcur + 100.0f);
+						}
+						ImGui::SameLine();
 						if (ImGui::SmallButton("Full Heal Local Hero")) {
 							HealthPart* pools[3] = { lc28->normal_health, lc28->armour_health, lc28->shield_health };
 							for (int p = 0; p < 3; p++) {
@@ -527,6 +538,38 @@ class player_spawner_deluxe : public window {
 							}
 							sync_entity_health_varbag(local_mdl);
 						}
+
+						ImGui::Checkbox("HUD Killfeed Overlay", &CombatReplication::s_enable_killfeed_overlay);
+						ImGui::SameLine();
+						ImGui::Checkbox("Auto-Respawn in Spawn Room", &CombatReplication::s_enable_local_auto_respawn);
+						ImGui::SameLine();
+						ImGui::SetNextItemWidth(85.0f);
+						ImGui::SliderFloat("Delay (s)", &CombatReplication::s_local_respawn_delay_sec, 1.0f, 8.0f, "%.1fs");
+						ImGui::SameLine();
+						if (ImGui::SmallButton("Respawn in Spawn Room Now")) {
+							CombatReplication::ServerEntityRespawnCommand rcmd{};
+							rcmd.target_ctrl_entid = local_ctrl_id;
+							rcmd.target_mdl_entid  = local_mdl_id;
+							rcmd.has_explicit_spawn_transform = 0;
+							CombatReplication::EnqueueEntityRespawnCommand(rcmd);
+						}
+						ImGui::SameLine();
+						if (ImGui::SmallButton("Test Killfeed Entry")) {
+							CombatReplication::ServerKillfeedCommand kcmd{};
+							kcmd.killer_entid          = local_mdl_id ? local_mdl_id : local_ctrl_id;
+							kcmd.killer_team           = 1;
+							kcmd.victim_heroid         = 0x02E0000000000003ULL; // Tracer
+							kcmd.victim_team           = 0;
+							kcmd.ability_script_id     = 0x0580000000000025ULL; // Pulse Bomb
+							kcmd.kill_flags            = CombatReplication::KILL_FLAG_CRIT | CombatReplication::KILL_FLAG_ULTIMATE;
+							kcmd.trigger_native_banner = 0;
+							CombatReplication::EnqueueKillfeedCommand(kcmd);
+						}
+						ImGui::TextDisabled("Killfeed=%u | Deaths=%u | Respawns=%u | %s",
+							CombatReplication::s_total_killfeed_events,
+							CombatReplication::s_total_local_deaths,
+							CombatReplication::s_total_local_respawns,
+							CombatReplication::s_last_spawnroom_status.c_str());
 					}
 				}
 

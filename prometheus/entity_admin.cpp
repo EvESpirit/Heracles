@@ -129,6 +129,98 @@ static player_spawner s_hero_select_spawner;
 // so the old local entities are not deleted while the Statescript VM is executing this action.
 static __int64 s_pending_hero_swap_id = 0;
 
+static bool     s_pending_local_respawn = false;
+static Vector4  s_pending_respawn_pos{};
+static Vector4  s_pending_respawn_rot{ 0.0f, 0.0f, 0.0f, 1.0f };
+static uint64_t s_pending_respawn_heroid = 0;
+static uint64_t s_pending_respawn_skin = 0;
+
+void PrometheusSystem::QueueLocalPlayerRespawn(const Vector4& spawn_pos, const Vector4& spawn_rot, uint64_t override_heroid, uint64_t override_skin_theme_id) {
+	s_pending_respawn_pos = spawn_pos;
+	s_pending_respawn_rot = spawn_rot;
+	s_pending_respawn_heroid = override_heroid;
+	s_pending_respawn_skin = override_skin_theme_id;
+	s_pending_local_respawn = true;
+}
+
+static void process_pending_local_respawn() {
+	if (!s_pending_local_respawn)
+		return;
+	s_pending_local_respawn = false;
+
+	auto ea = GameEntityAdmin();
+	if (!ea)
+		return;
+
+	__int64 heroid = (__int64)s_pending_respawn_heroid;
+	__int64 model_entid = 0;
+	int preserved_team = 1;
+
+	if (auto old_local = ea->getLocalEnt()) {
+		if (heroid == 0) {
+			if (auto info = old_local->getById<Component_3F_PlayerInfo>(0x3F)) {
+				heroid = info->selected_heroid;
+			}
+		}
+		if (auto c10 = old_local->getById<Component_10_FilterBits>(0x10)) {
+			uint64_t tbits = c10->filter_bits & 0x3C0000ULL;
+			if (tbits == 0x40000ULL) preserved_team = 0;
+			else if (tbits == 0x80000ULL) preserved_team = 1;
+			else if (tbits == 0x100000ULL) preserved_team = 2;
+			else if (tbits == 0x200000ULL) preserved_team = 3;
+		}
+		if (auto pet = old_local->getById<Component_20_ModelReference>(0x20)) {
+			if (Entity* old_model = ea->getEntById(pet->cam_attach_entid)) {
+				if (old_model->resload_entry)
+					model_entid = old_model->resload_entry->resource_id;
+			}
+		}
+	}
+
+	if (heroid != 0) {
+		if (auto hero_stu = stu_resources::GetByID(heroid)) {
+			auto gameplay_ent = hero_stu->to_editable().get_argument_resource("m_gameplayEntity");
+			if (gameplay_ent && gameplay_ent->has_resource()) {
+				model_entid = gameplay_ent->resource_id;
+			}
+		}
+	}
+	if (model_entid == 0) {
+		model_entid = 0x0400000000000004ULL; // Default Tracer gameplay entity
+		if (heroid == 0)
+			heroid = 0x02E0000000000003ULL;  // Default Tracer STUHero
+	}
+
+	PrometheusSystem::instance()->DeleteLocalEnt();
+
+	s_hero_select_spawner = player_spawner(model_entid);
+	s_hero_select_spawner.use_deferred_spawn = true;
+	s_hero_select_spawner.controller_info.heroid = heroid;
+	s_hero_select_spawner.model_info.heroid = heroid;
+	s_hero_select_spawner.controller_info.team = preserved_team;
+	s_hero_select_spawner.model_info.team = preserved_team;
+	if (s_pending_respawn_skin != 0) {
+		s_hero_select_spawner.model_info.skin_theme_id = (__int64)s_pending_respawn_skin;
+	}
+
+	Vector4 pos = s_pending_respawn_pos;
+	Vector4 rot = s_pending_respawn_rot;
+	pos.W = 0.0f;
+	if (rot.X == 0.0f && rot.Y == 0.0f && rot.Z == 0.0f && rot.W == 0.0f) {
+		rot.W = 1.0f;
+	}
+	s_hero_select_spawner.model_info.set_position = true;
+	s_hero_select_spawner.model_info.spawn_position = pos;
+	s_hero_select_spawner.model_info.spawn_rotation = rot;
+
+	auto local_ents = s_hero_select_spawner.spawn();
+	printf("[CombatReplication] Respawned LocalPlayer hero=0x%llX model=0x%llX ctrl=0x%X mdl=0x%X at SpawnRoom (%.2f, %.2f, %.2f)\n",
+		(unsigned long long)heroid, (unsigned long long)model_entid,
+		local_ents.first ? local_ents.first->entity_id : 0,
+		local_ents.second ? local_ents.second->entity_id : 0,
+		pos.X, pos.Y, pos.Z);
+}
+
 static void process_pending_hero_swap() {
 	__int64 heroid = s_pending_hero_swap_id;
 	if (heroid == 0)
@@ -776,6 +868,7 @@ void PrometheusSystem::OnTick(float tick) {
 	}
 
 	process_pending_hero_swap();
+	process_pending_local_respawn();
 	s_hero_select_spawner.tick_deferred_spawn();
 	WeaponHardpointDiag::TickProjectileTracker(_game_ea);
 
@@ -788,6 +881,17 @@ void PrometheusSystem::OnTick(float tick) {
 		if (pet_controller) {
 			local_model = _game_ea->getEntById(pet_controller->cam_attach_entid);
 			if (local_model) {
+				if (auto c1 = local_model->getById<Component_1_SceneRendering>(1)) {
+					int team_idx = 1;
+					if (auto c10 = local_controller->getById<Component_10_FilterBits>(0x10)) {
+						uint64_t tbits = c10->filter_bits & 0x3C0000ULL;
+						if (tbits == 0x40000ULL) team_idx = 0;
+						else if (tbits == 0x80000ULL) team_idx = 1;
+						else if (tbits == 0x100000ULL) team_idx = 2;
+						else if (tbits == 0x200000ULL) team_idx = 3;
+					}
+					CombatReplication::RecordInitialLocalSpawnTransform(_game_ea, c1->position, c1->rotation, team_idx);
+				}
 				auto ss = local_model->getById<Component_23_Statescript>(0x23);
 				auto health_stru = local_model->getById<Component_28_STUHealthComponent>(0x28);
 
