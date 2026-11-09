@@ -33,6 +33,7 @@ static constexpr uint8_t  TEAM_AUTO                     = 0xFF;
 static constexpr uint32_t RESPAWN_WAIT_FOR_SERVER_CMD   = 0xFFFFFFFFu;
 static constexpr uint32_t DEFAULT_KILLFEED_DURATION_MS  = 5500u;
 static constexpr uint32_t DEFAULT_LOCAL_RESPAWN_MS      = 3500u;
+static constexpr uint32_t DEFAULT_DUMMY_RESPAWN_MS      = 10000u;
 
 #pragma pack(push, 1)
 
@@ -75,18 +76,31 @@ struct ServerEntityDeathCommand {
 };
 static_assert(std::is_trivially_copyable_v<ServerEntityDeathCommand>, "ServerEntityDeathCommand must be trivially copyable POD");
 
-// 3. Server -> Client: Spawn-Room / Explicit Transform Respawn Command
+// 3. Server -> Client: Spawn-Room / Explicit Transform Respawn Command (LocalPlayer OR Non-Local Dummy/Remote Player)
 struct ServerEntityRespawnCommand {
     uint32_t event_seq                      = 0;  // 0 = auto-assign locally; >0 = server sequence ID (deduplicated)
     uint32_t target_ctrl_entid              = 0;  // 0 = LocalPlayer controller (GameEntityAdmin()->local_entid)
     uint32_t target_mdl_entid               = 0;  // 0 = resolve from controller Component_20
-    uint64_t override_heroid                = 0;  // 0 = keep current Component_3F::selected_heroid
-    uint64_t override_skin_theme_id         = 0;  // 0 = keep current skin
-    uint8_t  has_explicit_spawn_transform   = 0;  // 1 = use spawn_position/spawn_rotation; 0 = resolve Component_2B SpawnRoom
+    uint64_t override_heroid                = 0;  // 0 = keep current / saved Component_3F::selected_heroid
+    uint64_t override_model_resid           = 0;  // 0 = resolve from override_heroid or saved dummy record
+    uint64_t override_skin_theme_id         = 0;  // 0 = keep current / saved skin
+    uint8_t  override_team                  = TEAM_AUTO; // 0..3 or TEAM_AUTO (keep current / saved team)
+    uint8_t  apply_delayed_lockon_bit       = 1;  // 1 = queue delayed 0x1 lock-on filter bit (~1s after spawn) for non-local entities
+    uint8_t  cleanup_existing_corpse        = 1;  // 1 = safely tear down existing 0 HP ragdoll corpse & child slots first
+    uint8_t  has_explicit_spawn_transform   = 0;  // 1 = use spawn_position/spawn_rotation; 0 = saved dummy transform or Component_2B SpawnRoom
     Vector4  spawn_position                 = {};
     Vector4  spawn_rotation                 = { 0.0f, 0.0f, 0.0f, 1.0f };
 };
 static_assert(std::is_trivially_copyable_v<ServerEntityRespawnCommand>, "ServerEntityRespawnCommand must be trivially copyable POD");
+
+// 4. Server -> Client: Explicit Corpse Cleanup / Entity Despawn Command
+struct ServerCorpseCleanupCommand {
+    uint32_t event_seq                      = 0;  // 0 = auto-assign locally; >0 = server sequence ID (deduplicated)
+    uint32_t target_ctrl_entid              = 0;  // Controller entity ID (0 = auto-resolve from target_mdl_entid via Component_1F)
+    uint32_t target_mdl_entid               = 0;  // Model entity ID (0 = auto-resolve from target_ctrl_entid via Component_20)
+    uint8_t  remove_spawn_record            = 0;  // 1 = permanently remove dummy auto-respawn record; 0 = keep for respawn
+};
+static_assert(std::is_trivially_copyable_v<ServerCorpseCleanupCommand>, "ServerCorpseCleanupCommand must be trivially copyable POD");
 
 #pragma pack(pop)
 
@@ -94,18 +108,30 @@ static_assert(std::is_trivially_copyable_v<ServerEntityRespawnCommand>, "ServerE
 inline bool        s_enable_killfeed_overlay   = true;
 inline bool        s_enable_local_auto_respawn = true;
 inline float       s_local_respawn_delay_sec   = 3.5f;
+inline bool        s_enable_dummy_auto_respawn = true;   // On by default (Phase 7 Stage 4A)
+inline float       s_dummy_respawn_delay_sec   = 10.0f;  // 10.0s default delay (adjustable e.g. 3-5s or 1-15s)
 inline bool        s_local_is_dead             = false;
 inline uint64_t    s_local_death_start_ms      = 0;
 inline uint64_t    s_local_respawn_at_ms       = 0;
 inline uint32_t    s_total_killfeed_events     = 0;
 inline uint32_t    s_total_local_deaths        = 0;
 inline uint32_t    s_total_local_respawns      = 0;
+inline uint32_t    s_total_dummy_deaths        = 0;
+inline uint32_t    s_total_dummy_respawns      = 0;
+inline uint32_t    s_total_corpses_cleaned     = 0;
+inline uint32_t    s_total_skin_swaps          = 0;
+inline bool        s_show_skin_switcher_f1     = false;
 inline std::string s_last_spawnroom_status     = "SpawnRoom: waiting for first spawn";
+inline std::string s_last_dummy_respawn_status = "DummyRespawn: ready (auto=ON, delay=10.0s)";
+inline std::string s_last_skin_swap_status     = "SkinSwitcher: Ready (Press F1 or Top Bar 'Skins [F1]')";
 
 // Thread-safe Command Enqueue API (callable from network thread, raycast worker threads, or main thread)
 void EnqueueKillfeedCommand(const ServerKillfeedCommand& cmd);
 void EnqueueEntityDeathCommand(const ServerEntityDeathCommand& cmd);
 void EnqueueEntityRespawnCommand(const ServerEntityRespawnCommand& cmd);
+void EnqueueCorpseCleanupCommand(const ServerCorpseCleanupCommand& cmd);
+bool EnqueueWorldEntitySkinSwap(uint32_t target_ctrl_entid, uint32_t target_mdl_entid, uint64_t new_skin_theme_id, uint64_t optional_override_heroid = 0, uint8_t optional_override_team = TEAM_AUTO);
+void NotifyEntityAboutToBeDeleted(uint32_t ctrl_entid, uint32_t mdl_entid);
 void ClearKillfeedOverlay();
 
 // Spawn-Room (Component_2B) Transform Resolution & Recording
@@ -117,5 +143,6 @@ void OnGameTick(EntityAdminBase* game_ea, uintptr_t sys46);
 
 // DX11 Present Overlay Renderer (called every frame in PresentHook, even when debug UI is hidden)
 void RenderOverlay();
+void RenderSkinSwitcherF1Window();
 
 } // namespace CombatReplication

@@ -178,6 +178,7 @@
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
       <WarningLevel>Level3</WarningLevel>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
@@ -295,6 +296,7 @@
     <ClInclude Include="windows\player_spawner_deluxe.h" />
     <ClInclude Include="windows\pvpgame_explorer.h" />
     <ClInclude Include="windows\radio_selector_window.h" />
+    <ClInclude Include="windows\skin_switcher_window.h" />
     <ClInclude Include="windows\statescript_fake_logicalbtn.h" />
     <ClInclude Include="windows\statescript_fuzzer.h" />
     <ClInclude Include="windows\statescript_graph_window.h" />

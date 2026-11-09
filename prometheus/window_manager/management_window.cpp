@@ -125,6 +125,9 @@ void management_window::render() {
 			if (!globals::isDemo && ImGui::Button("Demo")) {
 				globals::isDemo = true;
 			}
+			if (ImGui::MenuItem("Skins [F1]", nullptr, CombatReplication::s_show_skin_switcher_f1)) {
+				CombatReplication::s_show_skin_switcher_f1 = !CombatReplication::s_show_skin_switcher_f1;
+			}
 			auto game_ea = GameEntityAdmin();
 			if (game_ea) {
 				auto world = get_system27_WorldEngineSystem(game_ea);

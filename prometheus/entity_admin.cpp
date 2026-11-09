@@ -134,12 +134,14 @@ static Vector4  s_pending_respawn_pos{};
 static Vector4  s_pending_respawn_rot{ 0.0f, 0.0f, 0.0f, 1.0f };
 static uint64_t s_pending_respawn_heroid = 0;
 static uint64_t s_pending_respawn_skin = 0;
+static uint8_t  s_pending_respawn_team = 0xFF;
 
-void PrometheusSystem::QueueLocalPlayerRespawn(const Vector4& spawn_pos, const Vector4& spawn_rot, uint64_t override_heroid, uint64_t override_skin_theme_id) {
+void PrometheusSystem::QueueLocalPlayerRespawn(const Vector4& spawn_pos, const Vector4& spawn_rot, uint64_t override_heroid, uint64_t override_skin_theme_id, uint8_t override_team) {
 	s_pending_respawn_pos = spawn_pos;
 	s_pending_respawn_rot = spawn_rot;
 	s_pending_respawn_heroid = override_heroid;
 	s_pending_respawn_skin = override_skin_theme_id;
+	s_pending_respawn_team = override_team;
 	s_pending_local_respawn = true;
 }
 
@@ -154,7 +156,7 @@ static void process_pending_local_respawn() {
 
 	__int64 heroid = (__int64)s_pending_respawn_heroid;
 	__int64 model_entid = 0;
-	int preserved_team = 1;
+	int preserved_team = 0;
 
 	if (auto old_local = ea->getLocalEnt()) {
 		if (heroid == 0) {
@@ -173,9 +175,23 @@ static void process_pending_local_respawn() {
 			if (Entity* old_model = ea->getEntById(pet->cam_attach_entid)) {
 				if (old_model->resload_entry)
 					model_entid = old_model->resload_entry->resource_id;
+				if (auto mc10 = old_model->getById<Component_10_FilterBits>(0x10)) {
+					uint64_t tbits = mc10->filter_bits & 0x3C0000ULL;
+					if (tbits == 0x40000ULL) preserved_team = 0;
+					else if (tbits == 0x80000ULL) preserved_team = 1;
+					else if (tbits == 0x100000ULL) preserved_team = 2;
+					else if (tbits == 0x200000ULL) preserved_team = 3;
+				}
+				CombatReplication::NotifyEntityAboutToBeDeleted(old_local->entity_id, old_model->entity_id);
+			} else {
+				CombatReplication::NotifyEntityAboutToBeDeleted(old_local->entity_id, 0);
 			}
 		}
 	}
+	if (s_pending_respawn_team <= 3) {
+		preserved_team = (int)s_pending_respawn_team;
+	}
+	s_pending_respawn_team = 0xFF;
 
 	if (heroid != 0) {
 		if (auto hero_stu = stu_resources::GetByID(heroid)) {
@@ -201,6 +217,12 @@ static void process_pending_local_respawn() {
 	s_hero_select_spawner.model_info.team = preserved_team;
 	if (s_pending_respawn_skin != 0) {
 		s_hero_select_spawner.model_info.skin_theme_id = (__int64)s_pending_respawn_skin;
+		player_spawner::set_preferred_hero_skin_theme((uint64_t)heroid, s_pending_respawn_skin);
+	} else {
+		uint64_t pref_skin = player_spawner::get_preferred_hero_skin_theme((uint64_t)heroid);
+		if (pref_skin != 0) {
+			s_hero_select_spawner.model_info.skin_theme_id = (__int64)pref_skin;
+		}
 	}
 
 	Vector4 pos = s_pending_respawn_pos;
@@ -214,11 +236,16 @@ static void process_pending_local_respawn() {
 	s_hero_select_spawner.model_info.spawn_rotation = rot;
 
 	auto local_ents = s_hero_select_spawner.spawn();
-	printf("[CombatReplication] Respawned LocalPlayer hero=0x%llX model=0x%llX ctrl=0x%X mdl=0x%X at SpawnRoom (%.2f, %.2f, %.2f)\n",
-		(unsigned long long)heroid, (unsigned long long)model_entid,
+	printf("[CombatReplication] Respawned LocalPlayer hero=0x%llX skin=0x%llX model=0x%llX ctrl=0x%X mdl=0x%X team=%d at (%.2f, %.2f, %.2f)\n",
+		(unsigned long long)heroid, (unsigned long long)s_hero_select_spawner.model_info.skin_theme_id, (unsigned long long)model_entid,
 		local_ents.first ? local_ents.first->entity_id : 0,
 		local_ents.second ? local_ents.second->entity_id : 0,
-		pos.X, pos.Y, pos.Z);
+		preserved_team, pos.X, pos.Y, pos.Z);
+
+	state_replicator::ChangeHeroMessage msg{};
+	msg.heroid = heroid;
+	msg.skinid = s_hero_select_spawner.model_info.skin_theme_id;
+	state_replicator::emplace_hero_update(msg);
 }
 
 static void process_pending_hero_swap() {
@@ -240,10 +267,11 @@ static void process_pending_hero_swap() {
 	}
 	auto model_entid = gameplay_ent->resource_id;
 
-	// Capture the previous hero model's world transform before deleting it.
+	// Capture the previous hero model's world transform & team before deleting it.
 	bool have_transform = false;
 	Vector4 old_pos{};
 	Vector4 old_rot{};
+	int preserved_team = 0;
 	if (auto old_local = ea->getLocalEnt()) {
 		if (auto info = old_local->getById<Component_3F_PlayerInfo>(0x3F)) {
 			if (info->selected_heroid == heroid)
@@ -252,6 +280,13 @@ static void process_pending_hero_swap() {
 		auto pet = old_local->getById<Component_20_ModelReference>(0x20);
 		Entity* old_model = pet ? ea->getEntById(pet->cam_attach_entid) : nullptr;
 		if (old_model) {
+			if (auto mc10 = old_model->getById<Component_10_FilterBits>(0x10)) {
+				uint64_t tbits = mc10->filter_bits & 0x3C0000ULL;
+				if (tbits == 0x40000ULL) preserved_team = 0;
+				else if (tbits == 0x80000ULL) preserved_team = 1;
+				else if (tbits == 0x100000ULL) preserved_team = 2;
+				else if (tbits == 0x200000ULL) preserved_team = 3;
+			}
 			auto c1 = old_model->getById<Component_1_SceneRendering>(1);
 			auto c15 = old_model->getById<Component_15_STUCharacterMoverComponent>(0x15);
 			if (c15) {
@@ -264,6 +299,9 @@ static void process_pending_hero_swap() {
 			}
 			if (c1)
 				old_rot = c1->rotation;
+			CombatReplication::NotifyEntityAboutToBeDeleted(old_local->entity_id, old_model->entity_id);
+		} else {
+			CombatReplication::NotifyEntityAboutToBeDeleted(old_local->entity_id, 0);
 		}
 	}
 
@@ -273,6 +311,12 @@ static void process_pending_hero_swap() {
 	s_hero_select_spawner.use_deferred_spawn = true;
 	s_hero_select_spawner.controller_info.heroid = heroid;
 	s_hero_select_spawner.model_info.heroid = heroid;
+	s_hero_select_spawner.controller_info.team = preserved_team;
+	s_hero_select_spawner.model_info.team = preserved_team;
+	uint64_t pref_skin = player_spawner::get_preferred_hero_skin_theme((uint64_t)heroid);
+	if (pref_skin != 0) {
+		s_hero_select_spawner.model_info.skin_theme_id = (__int64)pref_skin;
+	}
 	if (have_transform) {
 		old_pos.W = 0.0f;
 		s_hero_select_spawner.model_info.set_position = true;
@@ -280,15 +324,15 @@ static void process_pending_hero_swap() {
 		s_hero_select_spawner.model_info.spawn_rotation = old_rot;
 	}
 	auto local_ents = s_hero_select_spawner.spawn();
-	printf("[HeroSwap] Swapped to hero %llx (model %llx) ctrl=%x model=%x pos=(%.2f,%.2f,%.2f) has_pos=%d\n",
-		(unsigned long long)heroid, (unsigned long long)model_entid,
+	printf("[HeroSwap] Swapped to hero %llx (model %llx, skin %llx) ctrl=%x model=%x pos=(%.2f,%.2f,%.2f) has_pos=%d\n",
+		(unsigned long long)heroid, (unsigned long long)model_entid, (unsigned long long)s_hero_select_spawner.model_info.skin_theme_id,
 		local_ents.first ? local_ents.first->entity_id : 0, local_ents.second ? local_ents.second->entity_id : 0,
 		old_pos.X, old_pos.Y, old_pos.Z, (int)have_transform);
 
 	//TODO Move
 	state_replicator::ChangeHeroMessage msg;
 	msg.heroid = heroid;
-	msg.skinid = 0;
+	msg.skinid = s_hero_select_spawner.model_info.skin_theme_id;
 	state_replicator::emplace_hero_update(msg);
 }
 
@@ -869,6 +913,7 @@ void PrometheusSystem::OnTick(float tick) {
 
 	process_pending_hero_swap();
 	process_pending_local_respawn();
+	player_spawner::process_pending_dummy_operations(_game_ea);
 	s_hero_select_spawner.tick_deferred_spawn();
 	WeaponHardpointDiag::TickProjectileTracker(_game_ea);
 

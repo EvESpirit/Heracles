@@ -1063,7 +1063,7 @@ public:
         return s_instance;
     }
 
-    static void QueueLocalPlayerRespawn(const Vector4& spawn_pos, const Vector4& spawn_rot, uint64_t override_heroid = 0, uint64_t override_skin_theme_id = 0);
+    static void QueueLocalPlayerRespawn(const Vector4& spawn_pos, const Vector4& spawn_rot, uint64_t override_heroid = 0, uint64_t override_skin_theme_id = 0, uint8_t override_team = 0xFF);
 
     void DeleteLocalEnt() {
         auto local_ent = _game_ea->getLocalEnt();

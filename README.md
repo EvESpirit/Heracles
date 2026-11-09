@@ -35,7 +35,7 @@ Hey and welcome, thanks for stopping by!
 # 1. Usage
 
 If you haven't already, download the Overwatch Beta build we target from [Hidden Palace](https://hiddenpalace.org/Overwatch_(Oct_27,_2015_prototype)) and extract the files somewhere.
-* ⚠️ Make sure that you don't download any malicious executable and verify that `GameClientApp.exe` is signed by Blizzard. The signature will get broken after applying that patch - but musn't be before.
+* âš ï¸ Make sure that you don't download any malicious executable and verify that `GameClientApp.exe` is signed by Blizzard. The signature will get broken after applying that patch - but musn't be before.
 * You can optionally remove the `BlizzardError` directory.
 
 ## Download a Release
@@ -163,7 +163,8 @@ For further reference for heroes specifically, please check out the TEST_MATRIX.
 * **Pressing `H` to swap heroes works anywhere:** You can press `H` anywhere on any map to open the Hero Select screen and swap heroes in-place at your current position. This is a placeholder for native spawnroom detection.
 * **Doors, Capture Points, and Payloads stay in place:** Blocking Component `0x12`'s empty-buffer `(0,0,0)` overwrites keeps all map props, payloads, and doors at their proper map coordinates.
 * **Spawn doors slide open and closed:** You can open and close map spawn doors natively (with animations, sound, and collision) from the Player Spawner DeLuxe or the first Diagnostics window.
-* **Target Dummies & Full Combat Loop:** You can spawn Enemy or Friendly bots in Player Spawner DeLuxe. Shooting them now hits their actual skeletal bone hitboxes (with headshots, armor reduction, blood/spark VFX, flinch animations, and hurt grunts), shows their overhead enemy healthbar, awards `0% -> 100%` Ultimate charge, and triggers ragdoll knockouts, 3D death screams, red kill skulls, and the `"ELIMINATED [HERO]"` banner on kill.
+* **Target Dummies & Full Combat Loop:** You can spawn Enemy or Friendly bots in Player Spawner DeLuxe. Shooting them now hits their actual skeletal bone hitboxes (with headshots, armor reduction, blood/spark VFX, flinch animations, and hurt grunts), shows their overhead enemy healthbar, awards `0% -> 100%` Ultimate charge, and triggers ragdoll knockouts, 3D death screams, red kill skulls, the **"ELIMINATED [HERO]"** banner, and a top-right **HUD Killfeed** on kill.
+* **Hero & World Skin Switcher (`F1`):** Press **F1** (or open **Cosmetics -> Hero & World Skin Switcher (F1)** in the top menu bar) to visually switch between all 84 skin themes (1 Classic + 3 Recolor themes per hero, with color swatches and weapon skin overrides) on yourself or any Friendly, Neutral, or Enemy hero in the world.
 * **Hero Abilities & Ultimates:** Many of the abilities across the roster already function correctly and reliably. The remaining issues cluster around a couple of very specific problems that generalize fixes across the cluster (targeted abilities, dual-weapon heroes, certain shield interactions and visuals etc.). This is being actively worked on. Please refer to the TEST_MATRIX.md - this is being updated as testing progresses in step with development.
 
 ## Still broken / WIP
@@ -179,7 +180,7 @@ For further reference for heroes specifically, please check out the TEST_MATRIX.
 
 * **Quick-start in 4 clicks:** Click **`DP Load`** in the top bar -> pick a map under **`Map`** -> open **Game -> Player Spawner DeLuxe** -> pick a hero and click **`Spawn`** (and click **`Open Spawn Doors`** so you aren't locked in spawn yelling door stuck).
 * **Hide the debug UI:** Press `~`  to toggle all ImGui windows on/off so you can play with a clean screen.
-* **Swap heroes with `H`:** Once you've spawned a hero, just press **`H`** at any time to open the native Hero Select screen and switch heroes on the fly. *Optionally, you can just select a hero normally from the in-game menu after you've loaded a map externally. It should work. If you encounter issues, simply spawn with the Player Spawner DeLuxe as described above.*
+* **Swap heroes with `H` & switch skins with `F1`:** Once you've spawned a hero, press **`H`** at any time to open the native Hero Select screen and switch heroes on the fly, or press **`F1`** to open the visual **Hero & World Skin Switcher** to change skins on yourself or any friendly/neutral/enemy hero in the world. *Optionally, you can just select a hero normally from the in-game menu after you've loaded a map externally. It should work. If you encounter issues, simply spawn with the Player Spawner DeLuxe as described above.*
 * **Spawn Target Dummies:** In **Player Spawner DeLuxe**, click **`Spawn Jeff Kaplan`** to drop a target enemy dummy in front of you to test weapons, headshots, knockbacks, and Ultimates, or **`Spawn Friendly Dummy (Team 0)`** to test ally-based abilities. They don't do anything except just stand there waiting to get shot or blown up, but are very useful for development and general testing.
 * **Teleport & Timescale:** Use the **Up / Down arrow keys** to teleport yourself up or down. Use the **Left / Right arrow keys** to slow down or speed up the physics timescale. This is necessary on... most maps. On Hanamura, specifically just Genji falls through the floor when you try to spawn him. I still don't know why lol.
 * **World Map:** Press **`M`** in-game to toggle the overhead map overlay.

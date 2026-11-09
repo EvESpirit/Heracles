@@ -210,6 +210,7 @@ class player_spawner_deluxe : public window {
 		if (valid_rot.X == 0.0f && valid_rot.Y == 0.0f && valid_rot.Z == 0.0f && valid_rot.W == 0.0f) {
 			valid_rot.W = 1.0f;
 		}
+		player_spawner::update_dummy_saved_transform(model_ent->entity_id, pos, valid_rot);
 		if (auto* slot = OriginClutterTracker::GetSlot(model_ent->entity_id, model_ent)) {
 			slot->culled_by_heracles = false;
 			slot->has_nonzero_pos = true;
@@ -259,7 +260,7 @@ class player_spawner_deluxe : public window {
 	}
 
 	inline void render() override {
-		if (open_window(nullptr, 0, ImVec2(1050, 550))) {
+		if (open_window(nullptr, 0, ImVec2(1050, 580))) {
 			ImGui::Text("Player Spawner DeLuxe at your service.");
 			if (ImGui::BeginChild("replay entity", ImVec2(0, 0), ImGuiChildFlags_AutoResizeX | ImGuiChildFlags_AutoResizeY)) {
 				ImGui::Text("Controller Entity");
@@ -489,6 +490,33 @@ class player_spawner_deluxe : public window {
 			ImGui::SliderFloat("Crit x", &WeaponHardpointDiag::s_dummy_crit_mult, 1.0f, 3.0f, "%.1f");
 			ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "%s", WeaponHardpointDiag::s_last_dummy_hit.c_str());
 
+			// Timed Dummy Auto-Respawn & Corpse Cleanup Controls (Phase 7 Stage 4A — Server-Command Ready)
+			ImGui::Checkbox("Auto-Respawn Dummies (Corpse Cleanup)", &CombatReplication::s_enable_dummy_auto_respawn);
+			ImGui::SameLine();
+			ImGui::SetNextItemWidth(95.0f);
+			ImGui::SliderFloat("Dummy Delay (s)", &CombatReplication::s_dummy_respawn_delay_sec, 1.0f, 15.0f, "%.1fs");
+			ImGui::SameLine();
+			if (ImGui::SmallButton("3s")) {
+				CombatReplication::s_dummy_respawn_delay_sec = 3.0f;
+			}
+			ImGui::SameLine();
+			if (ImGui::SmallButton("5s")) {
+				CombatReplication::s_dummy_respawn_delay_sec = 5.0f;
+			}
+			ImGui::SameLine();
+			if (ImGui::SmallButton("10s")) {
+				CombatReplication::s_dummy_respawn_delay_sec = 10.0f;
+			}
+			ImGui::SameLine();
+			if (ImGui::SmallButton("Respawn All Dead Dummies Now")) {
+				player_spawner::respawn_all_dead_dummies_now(GameEntityAdmin());
+			}
+			ImGui::TextDisabled("DummyDeaths=%u | DummyRespawns=%u | CorpsesCleaned=%u | %s",
+				CombatReplication::s_total_dummy_deaths,
+				CombatReplication::s_total_dummy_respawns,
+				CombatReplication::s_total_corpses_cleaned,
+				CombatReplication::s_last_dummy_respawn_status.c_str());
+
 			// Compact Live Enemy Dummies / Non-Local Hero Models Status List
 			if (EntityAdminBase* ea = GameEntityAdmin()) {
 				Entity* local_ctrl = ea->getLocalEnt();
@@ -586,6 +614,7 @@ class player_spawner_deluxe : public window {
 					if (ImGui::BeginChild("EnemyDummiesList", ImVec2(0, 125), true)) {
 						uint32 del_ctrl_id = 0;
 						uint32 del_mdl_id = 0;
+						uint64_t now_ms = GetTickCount64();
 						for (Entity* ent : *ea) {
 							if (!ent || ent->entity_id == local_ctrl_id || ent->entity_id == local_mdl_id) continue;
 							if (!ent->hasComponent(0x15) || !ent->hasComponent(0x28)) continue;
@@ -637,6 +666,19 @@ class player_spawner_deluxe : public window {
 								sync_entity_health_varbag(ent);
 							}
 							ImGui::SameLine();
+							if (ImGui::SmallButton("Kill") && c28) {
+								HealthPart* pools[3] = { c28->shield_health, c28->armour_health, c28->normal_health };
+								for (int p = 0; p < 3; p++) {
+									for (int i = 0; i < 0x10; i++) {
+										pools[p][i].curr_health = 0.0f;
+									}
+								}
+								if (c1) {
+									*(uint32_t*)((uintptr_t)c1 + 0x1B8) &= ~0x10000u;
+								}
+								sync_entity_health_varbag(ent);
+							}
+							ImGui::SameLine();
 							if (ImGui::SmallButton("Reset HP") && c28) {
 								uint64_t h_id = 0;
 								if (ctrl_ent) {
@@ -646,6 +688,16 @@ class player_spawner_deluxe : public window {
 								}
 								c28->InitHeroHealthPools(h_id, 0);
 								sync_entity_health_varbag(ent);
+							}
+							ImGui::SameLine();
+							if (ImGui::SmallButton("Respawn")) {
+								CombatReplication::ServerEntityRespawnCommand rcmd{};
+								rcmd.target_ctrl_entid            = ctrl_id;
+								rcmd.target_mdl_entid             = ent->entity_id;
+								rcmd.apply_delayed_lockon_bit     = 1;
+								rcmd.cleanup_existing_corpse      = 1;
+								rcmd.has_explicit_spawn_transform = 0; // Use saved transform in DummySpawnRecord
+								CombatReplication::EnqueueEntityRespawnCommand(rcmd);
 							}
 							ImGui::SameLine();
 							if (ImGui::SmallButton("Team 0")) {
@@ -660,6 +712,7 @@ class player_spawner_deluxe : public window {
 										cc10->FilterBitsMakeFinal();
 									}
 								}
+								player_spawner::update_dummy_saved_team(ent->entity_id, 0);
 							}
 							ImGui::SameLine();
 							if (ImGui::SmallButton("Team 1")) {
@@ -674,6 +727,7 @@ class player_spawner_deluxe : public window {
 										cc10->FilterBitsMakeFinal();
 									}
 								}
+								player_spawner::update_dummy_saved_team(ent->entity_id, 1);
 							}
 							ImGui::SameLine();
 							// DEBUG: live-toggle filter bit 0x1 (native lock-on candidate bit; auto-applied ~1s after spawn).
@@ -694,16 +748,35 @@ class player_spawner_deluxe : public window {
 								del_mdl_id = ent->entity_id;
 							}
 							ImGui::SameLine();
-							ImGui::Text("M:0x%x C:0x%x | HP:%.0f/%.0f | %s (0x%llx) | Pos(%.1f,%.1f,%.1f) Vis:%s Blk:%d",
-								ent->entity_id, ctrl_id, cur_hp, max_hp, team_str, (unsigned long long)fb,
-								pos.X, pos.Y, pos.Z, is_vis ? "Y" : "N", zero_blk);
+							if (cur_hp <= 0.0f && max_hp > 0.0f) {
+								player_spawner::DummySpawnRecord drec{};
+								float rem_sec = 0.0f;
+								if (player_spawner::get_dummy_record(ent->entity_id, drec) && drec.respawn_due_ms > now_ms) {
+									rem_sec = (float)(drec.respawn_due_ms - now_ms) / 1000.0f;
+								}
+								if (CombatReplication::s_enable_dummy_auto_respawn) {
+									ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.25f, 1.0f),
+										"[CORPSE: Respawn in %.1fs] M:0x%x C:0x%x | %s | SavedPos(%.1f,%.1f,%.1f)",
+										rem_sec, ent->entity_id, ctrl_id, team_str,
+										drec.spawn_position.X, drec.spawn_position.Y, drec.spawn_position.Z);
+								} else {
+									ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f),
+										"[CORPSE: Auto-Respawn OFF] M:0x%x C:0x%x | %s",
+										ent->entity_id, ctrl_id, team_str);
+								}
+							} else {
+								ImGui::Text("M:0x%x C:0x%x | HP:%.0f/%.0f | %s (0x%llx) | Pos(%.1f,%.1f,%.1f) Vis:%s Blk:%d",
+									ent->entity_id, ctrl_id, cur_hp, max_hp, team_str, (unsigned long long)fb,
+									pos.X, pos.Y, pos.Z, is_vis ? "Y" : "N", zero_blk);
+							}
 							ImGui::PopID();
 						}
 						if (del_mdl_id != 0) {
-							if (Entity* m = ea->getEntById(del_mdl_id)) ea->delEnt(m);
-							if (del_ctrl_id != 0 && del_ctrl_id != local_ctrl_id) {
-								if (Entity* c = ea->getEntById(del_ctrl_id)) ea->delEnt(c);
-							}
+							CombatReplication::ServerCorpseCleanupCommand ccmd{};
+							ccmd.target_ctrl_entid   = del_ctrl_id;
+							ccmd.target_mdl_entid    = del_mdl_id;
+							ccmd.remove_spawn_record = 1;
+							CombatReplication::EnqueueCorpseCleanupCommand(ccmd);
 						}
 					}
 					ImGui::EndChild();

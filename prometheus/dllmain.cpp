@@ -337,6 +337,9 @@ HRESULT __stdcall PresentHook(IDXGISwapChain* pSwapChain, UINT SyncInterval, UIN
         if (ImGui::IsKeyPressed(ImGuiKey_GraveAccent, false)) {
             ui_invisible = !ui_invisible;
         }
+        if (ImGui::IsKeyPressed(ImGuiKey_F1, false)) {
+            CombatReplication::s_show_skin_switcher_f1 = !CombatReplication::s_show_skin_switcher_f1;
+        }
 
         auto& io = ImGui::GetIO();
         bool menu_down = GetAsyncKeyState(VK_MENU) < 0;
@@ -351,6 +354,7 @@ HRESULT __stdcall PresentHook(IDXGISwapChain* pSwapChain, UINT SyncInterval, UIN
         ImGui::NewFrame();
 
         CombatReplication::RenderOverlay();
+        CombatReplication::RenderSkinSwitcherF1Window();
 
         if (!ui_invisible)
             window_manager::render();
@@ -678,6 +682,8 @@ __int64 afterdatapackload_hook(__int64 a1, __int64 a2, __int64 a3, int a4, int a
         char ret_1[] = { 0xB0, 0x01, 0xC3 };
         memcpy((void*)(globals::gameBase + 0xc7c960), ret_1, sizeof(ret_1));
         printf("Force chat enabled\n"); //Must be done after data packs loaded
+        extern void trigger_auto_skin_census();
+        trigger_auto_skin_census();
     }
     return result;
 }
@@ -1068,7 +1074,9 @@ void __fastcall UpdateWeaponAttachments_hook(uintptr_t weapon_mgr, uint8_t is_1p
         uintptr_t comp23 = SafeReadVal<uintptr_t>(weapon_mgr);
         if (comp23) {
             Entity* owner = SafeReadVal<Entity*>(comp23 + 0x08);
-            if (owner) owner_entid = SafeReadVal<uint32>((uintptr_t)&owner->entity_id);
+            if (owner) {
+                owner_entid = SafeReadVal<uint32>((uintptr_t)&owner->entity_id);
+            }
         }
         entries_cnt = SafeReadVal<int32_t>(weapon_mgr + 0x10);
     }
@@ -1176,11 +1184,10 @@ uint8_t __fastcall AttachComponent1Internal_hook(Component_1_SceneRendering* chi
     uintptr_t caller = (uintptr_t)_ReturnAddress();
     uintptr_t caller_rva = (caller >= globals::gameBase && caller < globals::gameBase + globals::gameSize)
         ? (caller - globals::gameBase) : caller;
-    WeaponHardpointDiag::s_attach_calls++;
-    uint8_t ret = AttachComponent1Internal_orig(child_c1, parent_c1, hp_info, rot, pos);
-
     Entity* c_ent = child_c1 ? SafeReadVal<Entity*>((uintptr_t)&child_c1->base.entity_backref) : nullptr;
     Entity* p_ent = parent_c1 ? SafeReadVal<Entity*>((uintptr_t)&parent_c1->base.entity_backref) : nullptr;
+    WeaponHardpointDiag::s_attach_calls++;
+    uint8_t ret = AttachComponent1Internal_orig(child_c1, parent_c1, hp_info, rot, pos);
     uint32 child_id = c_ent ? SafeReadVal<uint32>((uintptr_t)&c_ent->entity_id) : 0;
     uint32 parent_id = p_ent ? SafeReadVal<uint32>((uintptr_t)&p_ent->entity_id) : 0;
     if (parent_id != 0 && GameEntityAdmin() && GameEntityAdmin()->local_entid != 0) {
@@ -3034,11 +3041,13 @@ static std::mutex                              s_combat_rep_mutex;
 static std::vector<ServerKillfeedCommand>      s_pending_killfeed_cmds;
 static std::vector<ServerEntityDeathCommand>   s_pending_death_cmds;
 static std::vector<ServerEntityRespawnCommand> s_pending_respawn_cmds;
+static std::vector<ServerCorpseCleanupCommand> s_pending_corpse_cleanup_cmds;
 static std::vector<ActiveKillfeedItem>         s_active_killfeed_items;
 static uint32_t                                s_next_local_seq            = 1;
 static uint32_t                                s_last_killfeed_seq         = 0;
 static uint32_t                                s_last_death_seq            = 0;
 static uint32_t                                s_last_respawn_seq          = 0;
+static uint32_t                                s_last_corpse_cleanup_seq   = 0;
 static bool                                    s_has_initial_local_spawn   = false;
 static Vector4                                 s_initial_local_spawn_pos   = {};
 static Vector4                                 s_initial_local_spawn_rot   = { 0.0f, 0.0f, 0.0f, 1.0f };
@@ -3196,6 +3205,155 @@ void EnqueueEntityRespawnCommand(const ServerEntityRespawnCommand& cmd) {
     }
 }
 
+void EnqueueCorpseCleanupCommand(const ServerCorpseCleanupCommand& cmd) {
+    std::lock_guard<std::mutex> lock(s_combat_rep_mutex);
+    ServerCorpseCleanupCommand copy = cmd;
+    if (copy.event_seq == 0) {
+        copy.event_seq = s_next_local_seq++;
+    } else if (copy.event_seq == s_last_corpse_cleanup_seq) {
+        return;
+    } else {
+        s_last_corpse_cleanup_seq = copy.event_seq;
+    }
+    if (s_pending_corpse_cleanup_cmds.size() < 16) {
+        s_pending_corpse_cleanup_cmds.push_back(copy);
+    }
+}
+
+bool EnqueueWorldEntitySkinSwap(uint32_t target_ctrl_entid, uint32_t target_mdl_entid, uint64_t new_skin_theme_id, uint64_t optional_override_heroid, uint8_t optional_override_team) {
+    EntityAdminBase* ea = GameEntityAdmin();
+    if (!ea) return false;
+
+    Entity* m_ent = target_mdl_entid ? ea->getEntById(target_mdl_entid) : nullptr;
+    Entity* c_ent = target_ctrl_entid ? ea->getEntById(target_ctrl_entid) : nullptr;
+    if (!m_ent && c_ent) {
+        if (auto* c20 = c_ent->getById<Component_20_ModelReference>(0x20)) {
+            target_mdl_entid = c20->cam_attach_entid ? c20->cam_attach_entid : (c20->aim_entid ? c20->aim_entid : c20->movement_attach_entid);
+            m_ent = target_mdl_entid ? ea->getEntById(target_mdl_entid) : nullptr;
+        }
+    }
+    if (!c_ent && m_ent) {
+        if (auto* c1f = m_ent->getById<Component_1F_Backref>(0x1F)) {
+            if (c1f->backref_entid != 0 && c1f->backref_entid != m_ent->entity_id) {
+                target_ctrl_entid = c1f->backref_entid;
+                c_ent = ea->getEntById(target_ctrl_entid);
+            }
+        }
+        if (!c_ent) {
+            player_spawner::DummySpawnRecord drec{};
+            if (player_spawner::get_dummy_record(target_mdl_entid, drec) && drec.controller_entid != 0) {
+                target_ctrl_entid = drec.controller_entid;
+                c_ent = ea->getEntById(target_ctrl_entid);
+            }
+        }
+    }
+    if (!m_ent && !c_ent) return false;
+
+    Vector4 live_pos{};
+    Vector4 live_rot{ 0.0f, 0.0f, 0.0f, 1.0f };
+    bool have_pos = false;
+    if (m_ent) {
+        if (auto* c15 = m_ent->getById<Component_15_STUCharacterMoverComponent>(0x15)) {
+            const Vector4& p = c15->movement_state_2.absolute_position;
+            if (fabsf(p.X) + fabsf(p.Y) + fabsf(p.Z) > 0.01f) {
+                live_pos = p;
+                have_pos = true;
+            }
+        }
+        if (auto* c1 = m_ent->getById<Component_1_SceneRendering>(1)) {
+            if (!have_pos) {
+                live_pos = c1->position;
+                have_pos = true;
+            }
+            live_rot = c1->rotation;
+        }
+    }
+    if (!have_pos) {
+        player_spawner::DummySpawnRecord rec{};
+        if (player_spawner::get_dummy_record(target_mdl_entid ? target_mdl_entid : target_ctrl_entid, rec)) {
+            live_pos = rec.spawn_position;
+            live_rot = rec.spawn_rotation;
+            have_pos = true;
+        }
+    }
+    if (live_rot.X == 0.0f && live_rot.Y == 0.0f && live_rot.Z == 0.0f && live_rot.W == 0.0f) {
+        live_rot.W = 1.0f;
+    }
+
+    uint64_t heroid = optional_override_heroid;
+    if (heroid == 0 && c_ent) {
+        if (auto* c3f = c_ent->getById<Component_3F_PlayerInfo>(0x3F)) {
+            heroid = (uint64_t)c3f->selected_heroid;
+        }
+    }
+    bool is_local = (ea->local_entid != 0 && target_ctrl_entid == ea->local_entid);
+    if (is_local && heroid != 0 && new_skin_theme_id != 0) {
+        player_spawner::set_preferred_hero_skin_theme(heroid, new_skin_theme_id);
+    }
+
+    ServerEntityRespawnCommand rcmd{};
+    rcmd.event_seq                    = 0;
+    rcmd.target_ctrl_entid            = target_ctrl_entid;
+    rcmd.target_mdl_entid             = target_mdl_entid;
+    rcmd.override_heroid              = optional_override_heroid;
+    rcmd.override_model_resid         = 0;
+    rcmd.override_skin_theme_id       = new_skin_theme_id;
+    rcmd.override_team                = optional_override_team;
+    rcmd.has_explicit_spawn_transform = have_pos ? 1 : 0;
+    rcmd.cleanup_existing_corpse      = 1;
+    rcmd.apply_delayed_lockon_bit     = 1;
+    rcmd.spawn_position               = live_pos;
+    rcmd.spawn_rotation               = live_rot;
+
+    EnqueueEntityRespawnCommand(rcmd);
+    s_total_skin_swaps++;
+    s_last_skin_swap_status = std::format(
+        "Queued {} SkinSwap: M:0x{:X} C:0x{:X} -> skin=0x{:X} hero=0x{:X} at ({:.1f}, {:.1f}, {:.1f})",
+        is_local ? "LOCAL" : "WORLD", target_mdl_entid, target_ctrl_entid,
+        (unsigned long long)new_skin_theme_id, (unsigned long long)heroid,
+        live_pos.X, live_pos.Y, live_pos.Z);
+    return true;
+}
+
+void NotifyEntityAboutToBeDeleted(uint32_t ctrl_entid, uint32_t mdl_entid) {
+    for (int i = 0; i < kMaxTrackedHbSubobjs; i++) {
+        uintptr_t subobj = s_tracked_hb_subobjs[i];
+        if (!subobj) continue;
+        uint32_t bound_eid = SafeReadVal<uint32_t>(subobj + 0x10);
+        if ((mdl_entid != 0 && (s_tracked_hb_entids[i] == mdl_entid || bound_eid == mdl_entid)) ||
+            (ctrl_entid != 0 && (s_tracked_hb_entids[i] == ctrl_entid || bound_eid == ctrl_entid))) {
+            s_tracked_hb_subobjs[i] = 0;
+            s_tracked_hb_entids[i]  = 0;
+            s_tracked_hb_last_hp[i] = -1.0f;
+        }
+    }
+    if (mdl_entid != 0 && s_last_hit_dummy_entid == mdl_entid) {
+        s_last_hit_dummy_entid = 0;
+    }
+    if (EntityAdminBase* ea = GameEntityAdmin()) {
+        if (ea->local_entid) {
+            if (Entity* local_ctrl = ea->getEntById(ea->local_entid)) {
+                if (auto* local_c2f = local_ctrl->getById<Component_2F_LocalPlayer>(0x2F)) {
+                    uintptr_t ring = (uintptr_t)local_c2f + 0x15E0;
+                    int32_t cap = local_c2f->field_17E0 > 0 ? local_c2f->field_17E0 : 0x20;
+                    if (cap > 0x20) cap = 0x20;
+                    for (int32_t idx = 0; idx < cap; idx++) {
+                        uintptr_t entry = ring + (uintptr_t)idx * 0x10;
+                        uint32_t eid = *(uint32_t*)(entry + 0x00);
+                        if ((mdl_entid != 0 && eid == mdl_entid) || (ctrl_entid != 0 && eid == ctrl_entid)) {
+                            // Zero target_entid (+0x00) while preserving timestamp (+0x04) per +0xCA741D ring-buffer invariant
+                            *(uint32_t*)(entry + 0x00) = 0;
+                            if (s_last_sys46 != 0 && !IsBadReadPtr((void*)s_last_sys46, 0xA0)) {
+                                *(uint8_t*)(s_last_sys46 + 0x99) = 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 void ClearKillfeedOverlay() {
     std::lock_guard<std::mutex> lock(s_combat_rep_mutex);
     s_active_killfeed_items.clear();
@@ -3281,11 +3439,15 @@ bool ResolveTeamSpawnRoomTransform(EntityAdminBase* game_ea, int team_idx, Vecto
 }
 
 void OnGameTick(EntityAdminBase* game_ea, uintptr_t sys46) {
+    // Tick non-local dummy death detection & timed auto-respawn scheduling first
+    player_spawner::tick_dummy_respawns(game_ea);
+
     uint64_t now_ms = GetTickCount64();
 
     std::vector<ServerKillfeedCommand>      kf_cmds;
     std::vector<ServerEntityDeathCommand>   death_cmds;
     std::vector<ServerEntityRespawnCommand> respawn_cmds;
+    std::vector<ServerCorpseCleanupCommand> cleanup_cmds;
     {
         std::lock_guard<std::mutex> lock(s_combat_rep_mutex);
         if (!s_pending_killfeed_cmds.empty()) {
@@ -3297,6 +3459,14 @@ void OnGameTick(EntityAdminBase* game_ea, uintptr_t sys46) {
         if (!s_pending_respawn_cmds.empty()) {
             respawn_cmds.swap(s_pending_respawn_cmds);
         }
+        if (!s_pending_corpse_cleanup_cmds.empty()) {
+            cleanup_cmds.swap(s_pending_corpse_cleanup_cmds);
+        }
+    }
+
+    // 0. Process explicit ServerCorpseCleanupCommand queue (deferred to PrometheusSystem::OnTick boundary)
+    for (const auto& ccmd : cleanup_cmds) {
+        player_spawner::queue_corpse_cleanup_command(ccmd);
     }
 
     uint32_t local_ctrl_id = game_ea ? game_ea->local_entid : 0;
@@ -3377,6 +3547,8 @@ void OnGameTick(EntityAdminBase* game_ea, uintptr_t sys46) {
                 ShotDiagLogFmt("[LOCAL_DEATH_BANNER (+0xCA7B40)] victim_mdl=0x%X type=%u killer_ctrl=0x%X respawn_ms=%u",
                     v_mdl, (unsigned)status_pkt[0x68], killer_ctrl_id, dcmd.respawn_delay_ms);
             }
+        } else {
+            player_spawner::notify_dummy_death(v_ctrl, v_mdl, dcmd.respawn_delay_ms);
         }
 
         if (dcmd.emit_killfeed_entry) {
@@ -3467,8 +3639,9 @@ void OnGameTick(EntityAdminBase* game_ea, uintptr_t sys46) {
 
     // 4. Process ServerEntityRespawnCommand queue
     for (const auto& rcmd : respawn_cmds) {
-        bool is_local_target = (rcmd.target_ctrl_entid == 0 || rcmd.target_ctrl_entid == local_ctrl_id ||
-                                (local_mdl_id != 0 && rcmd.target_mdl_entid == local_mdl_id));
+        bool is_local_target = (rcmd.target_ctrl_entid == 0 && rcmd.target_mdl_entid == 0) ||
+                               (local_ctrl_id != 0 && rcmd.target_ctrl_entid == local_ctrl_id) ||
+                               (local_mdl_id != 0 && rcmd.target_mdl_entid == local_mdl_id);
         if (is_local_target) {
             Vector4 spawn_pos{};
             Vector4 spawn_rot{ 0.0f, 0.0f, 0.0f, 1.0f };
@@ -3495,8 +3668,12 @@ void OnGameTick(EntityAdminBase* game_ea, uintptr_t sys46) {
             s_local_is_dead       = false;
             s_local_respawn_at_ms = 0;
             s_total_local_respawns++;
-            PrometheusSystem::QueueLocalPlayerRespawn(spawn_pos, spawn_rot, rcmd.override_heroid, rcmd.override_skin_theme_id);
+            PrometheusSystem::QueueLocalPlayerRespawn(spawn_pos, spawn_rot, rcmd.override_heroid, rcmd.override_skin_theme_id, rcmd.override_team);
             ShotDiagLogFmt("[LOCAL_RESPAWN_CMD] %s", s_last_spawnroom_status.c_str());
+        } else {
+            if (player_spawner::execute_dummy_respawn_command(game_ea, rcmd)) {
+                ShotDiagLogFmt("[DUMMY_RESPAWN_CMD] %s", s_last_dummy_respawn_status.c_str());
+            }
         }
     }
 }
@@ -3846,6 +4023,7 @@ void __fastcall UpdateHealthbarVisibility_hook(uintptr_t sys46) {
                         local_pkts[i].target_entid, local_pkts[i].damage_int, local_pkts[i].flags,
                         pip_hit, pip_crit, pip_kill);
                     if ((local_pkts[i].flags & 2) != 0) {
+                        player_spawner::mark_dummy_killfeed_emitted(local_pkts[i].target_entid);
                         CombatReplication::ServerKillfeedCommand kcmd{};
                         kcmd.killer_entid          = local_mdl_id ? local_mdl_id : ea->local_entid;
                         kcmd.victim_entid          = local_pkts[i].target_entid;
@@ -5065,6 +5243,24 @@ static float ResolveShotBaseDamage(Entity* shooter, Entity* proj_ent) {
 // Fixes Gate 3: At +0xD42595..+0xD425AD, +0xD423C0 unpacks the 13-bit unsigned inst_id ((handle >> 19) & 0x1FFF = 0x1FFD
 // for inst_id = -3 = 0xFFFD) into [entry + 0x14] without sign-extending bit 12 (0x1000).
 // Also integrates active 0xD78490D1 Impulse/Knockback velocity, 100ms Heal-Over-Time (HoT), and dash sweeps smoothly on the local Hero Model.
+// Defense-in-depth guard for +0xA453C0 (+0xA453DB: ProcessScenePendingDeletions)
+// At +0xA453D1..+0xA453DB, +0xA453C0 reads rax = [rdx + 0x148] and immediately dereferences byte ptr [rax + 0x0D]
+// without checking if rax == 0. If a deleted or modified Component_1 has [c1 + 0x148] == 0, clear bit 0x1000 on
+// word ptr [c1 + 0x172] (&= 0xEFFF) and return cleanly instead of crashing at +0xA453DB.
+static void(__fastcall* ProcessSceneNodeDeletion_orig)(uintptr_t, uintptr_t) = nullptr;
+static void __fastcall ProcessSceneNodeDeletion_hook(uintptr_t scene_mgr, uintptr_t c1) {
+    if (!scene_mgr || !c1 || IsBadReadPtr((const void*)c1, 0x180)) return;
+    uintptr_t node_148 = SafeReadVal<uintptr_t>(c1 + 0x148);
+    if (!node_148 || IsBadReadPtr((const void*)node_148, 0x10)) {
+        *(uint16_t*)(c1 + 0x172) &= 0xEFFFu;
+        if (!IsBadReadPtr((void*)(scene_mgr + 0x1B0), 8)) {
+            *(uint8_t*)(scene_mgr + 0x1B4) = 1;
+        }
+        return;
+    }
+    ProcessSceneNodeDeletion_orig(scene_mgr, c1);
+}
+
 static void HideSingleEntity(Entity* ent) {
     if (!ent) return;
     const Vector4 hidden_pos(0.0f, -5000.0f, 0.0f, 0.0f);
@@ -9702,8 +9898,8 @@ static void AppendVarBagSummary(std::string& out, const char* prefix, Entity* en
         }
 
         // B. Dump comp23 + 0x1458 Child Visual/Weapon Slot Records (stride 0x250)
-        uintptr_t arr_1458 = SafeReadVal<uintptr_t>((uintptr_t)ss + 0x1458);
-        int32_t cnt_1458 = SafeReadVal<int32_t>((uintptr_t)ss + 0x1460);
+        uintptr_t arr_1458 = SafeReadVal<uintptr_t>((uintptr_t)ss + 0x1460);
+        int32_t cnt_1458 = SafeReadVal<int32_t>((uintptr_t)ss + 0x1468);
         if (arr_1458 && cnt_1458 > 0 && cnt_1458 <= 32 && !IsBadReadPtr((const void*)arr_1458, (size_t)cnt_1458 * 0x250)) {
             std::string slots_str;
             for (int32_t si = 0; si < cnt_1458; si++) {
@@ -10352,7 +10548,13 @@ static void AppendHeroEntityForensics(std::string& out, const char* label, Entit
     AppendVarBagSummary(out, "Model", mdl_ent, is_local_player);
 }
 
+static volatile bool s_in_forensics_dump = false;
+
 void WeaponHardpointDiag::DumpDummyCombatForensics(EntityAdminBase* game_ea, const char* trigger_reason) {
+    struct ScopedForensicsGuard {
+        ScopedForensicsGuard() { s_in_forensics_dump = true; }
+        ~ScopedForensicsGuard() { s_in_forensics_dump = false; }
+    } forensics_guard;
     std::string out;
     out.reserve(65536);
     out += "# Local Player vs Enemy Dummy Combat & Shot Raycast Forensics\n\n";
@@ -11164,6 +11366,8 @@ void __cdecl StartHook(void*) {
     MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0x107ec60)));
     MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xd81440), BeamEffectState_UpdateAttachment_hook, (PVOID*)&BeamEffectState_UpdateAttachment_orig));
     MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xd81440)));
+    MH_VERIFY(MH_CreateHook((PVOID)(globals::gameBase + 0xa453c0), ProcessSceneNodeDeletion_hook, (PVOID*)&ProcessSceneNodeDeletion_orig));
+    MH_VERIFY(MH_EnableHook((PVOID)(globals::gameBase + 0xa453c0)));
     statescript_logger::s_universal_state_entry_cb = OnUniversalStateEntry;
     statescript_logger::s_universal_state_exit_cb = OnUniversalStateExit;
     printf("hooked Component_1 transforms, weapon hardpoint fixes, shot/projectile impact, healthbar & Horizon 1 Stage H1.2+H1.3 hooks\n");
@@ -11419,6 +11623,8 @@ __int64 AddVehHook(__int64 old, __int64 func) {
 }
 
 int __stdcall VectoredExceptionHandler(EXCEPTION_POINTERS* exception) {
+    if (s_in_forensics_dump)
+        return EXCEPTION_CONTINUE_SEARCH;
     if (exception->ExceptionRecord->ExceptionCode == EXCEPTION_BREAKPOINT ||
         exception->ExceptionRecord->ExceptionCode == EXCEPTION_SINGLE_STEP ||
         exception->ExceptionRecord->ExceptionCode == EXCEPTION_GUARD_PAGE)

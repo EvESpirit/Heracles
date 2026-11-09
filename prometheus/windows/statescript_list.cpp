@@ -9,6 +9,8 @@
 #include "../StatescriptVar.h"
 #include "../STU_Editable.h"
 #include "../stu_resources.h"
+#include "../ResourceManager.h"
+#include "../filetype_library.h"
 #include <fstream>
 #include <format>
 #include <set>
@@ -2693,6 +2695,407 @@ void statescript_diag_window::dump_horizon1_audit_to_file() {
 	_experiment_status_msg = _dump_status_msg;
 }
 
+static bool s_auto_skin_census_done = true;
+
+static void dump_skin_census_audit(std::string& out_status) {
+	ensure_known_stu_hashes();
+
+	const char* extra_names[] = {
+		"STUHero", "STUSkin", "STUSkinBase", "STUSkinTheme", "STUProgressionUnlocks",
+		"STUUnlock", "STUUnlock_Skin", "STUUnlock_SkinTheme", "STUUnlock_Emote",
+		"STUUnlock_Pose", "STUUnlock_VoiceLine", "STUUnlock_Spray", "STUUnlock_Avatar",
+		"STUUnlock_HighlightIntro", "STUUnlock_Weapon", "STUCatalog", "STUResourceOverride",
+		"STUSkinResourceOverride", "STUAnimOverride", "teAssetPackage",
+		"m_skins", "m_skinThemes", "m_name", "m_hero", "m_skin", "m_skinTheme",
+		"m_gameplayEntity", "m_previewWeaponEntities", "m_previewEmoteEntity",
+		"m_unlocks", "m_defaultUnlocks", "m_otherUnlocks", "m_lootBoxesUnlocks",
+		"m_rarity", "m_assets", "m_assetPackage", "m_internalName", "m_skinCode",
+		"m_resourceOverrides", "m_overrideMap", "m_overrides", "m_weapons",
+		"m_weaponOverrides", "m_firstPersonComponentEntity", "m_thirdPersonComponentEntity",
+		"m_heroSelectEntity", "m_PlayOfTheGameEntity", "m_category", "m_thumbnail",
+		"m_color", "m_teamColor", "m_weapon", "m_entityDef", "m_previewEntity"
+	};
+	for (const char* s : extra_names) {
+		uint32_t h = (uint32_t)stringHash(s);
+		if (allmighty_hash_lib::hashes.find(h) == allmighty_hash_lib::hashes.end()) {
+			allmighty_hash_lib::hashes[h] = s;
+		}
+	}
+
+	std::ofstream out("c:\\Users\\Rose\\Desktop\\ow\\skin_census_audit.log", std::ios::out | std::ios::trunc);
+	if (!out.is_open()) {
+		out_status = "Failed to open c:\\Users\\Rose\\Desktop\\ow\\skin_census_audit.log!";
+		return;
+	}
+
+	out << "# Overwatch 0.8.0.24919 — Complete Skin, SkinTheme & Cosmetics Census Audit\n\n";
+
+	// =========================================================================
+	// SECTION 1: STU Class Schemas for Hero / Skin / SkinTheme / Unlock Classes
+	// =========================================================================
+	out << "## Section 1: Runtime `.bss` `STUInfo` Schemas for Skin, Theme, Hero & Unlock Classes\n\n";
+
+	std::set<STUInfo*> target_schemas;
+	auto add_chain = [&](STUInfo* info) {
+		int guard = 0;
+		while (info && is_valid_read_memory(info, sizeof(STUInfo)) && guard++ < 16) {
+			target_schemas.insert(info);
+			info = info->base_stu;
+		}
+	};
+
+	if (auto* h = stu_resources::GetByID(0x02E0000000000003ULL)) add_chain(safe_get_stu_info(h));
+	if (auto* s = stu_resources::GetByID(0x0AE00000000003EAULL)) add_chain(safe_get_stu_info(s));
+	if (auto* t = stu_resources::GetByID(0x0A50000000001711ULL)) add_chain(safe_get_stu_info(t));
+
+	for (STURegistry* reg = GetSTURegistry(); reg && is_valid_read_memory(reg, sizeof(STURegistry)); reg = reg->next) {
+		STUInfo* info = reg->info;
+		if (!info || !is_valid_read_memory(info, sizeof(STUInfo))) continue;
+		auto nh_it = allmighty_hash_lib::hashes.find(info->name_hash);
+		if (nh_it != allmighty_hash_lib::hashes.end()) {
+			const std::string& nm = nh_it->second;
+			if (nm.find("Skin") != std::string::npos || nm.find("Theme") != std::string::npos ||
+				nm.find("Unlock") != std::string::npos || nm.find("Catalog") != std::string::npos ||
+				nm.find("Hero") != std::string::npos || nm.find("Override") != std::string::npos) {
+				add_chain(info);
+			}
+		}
+	}
+
+	// Second pass: any class inheriting from any class in target_schemas
+	for (STURegistry* reg = GetSTURegistry(); reg && is_valid_read_memory(reg, sizeof(STURegistry)); reg = reg->next) {
+		STUInfo* info = reg->info;
+		if (!info || !is_valid_read_memory(info, sizeof(STUInfo))) continue;
+		STUInfo* cur = info;
+		int guard = 0;
+		while (cur && is_valid_read_memory(cur, sizeof(STUInfo)) && guard++ < 16) {
+			if (target_schemas.count(cur) && cur->name_hash != 0x37D36253) { // exclude root STUObject derivatives unless skin/hero related
+				auto nh_it = allmighty_hash_lib::hashes.find(cur->name_hash);
+				std::string cnm = (nh_it != allmighty_hash_lib::hashes.end()) ? nh_it->second : "";
+				if (cnm != "STUStatescriptBase" && cnm != "STUConfigVar" && cnm != "STUEntityComponent") {
+					target_schemas.insert(info);
+				}
+				break;
+			}
+			cur = cur->base_stu;
+		}
+	}
+
+	for (STUInfo* info : target_schemas) {
+		if (!info || !is_valid_read_memory(info, sizeof(STUInfo))) continue;
+		std::string cname = allmighty_hash_lib::hashes.count(info->name_hash) ? allmighty_hash_lib::hashes[info->name_hash] : "Unknown";
+		std::string chain_str;
+		STUInfo* cur = info;
+		int g = 0;
+		while (cur && is_valid_read_memory(cur, sizeof(STUInfo)) && g++ < 16) {
+			if (!chain_str.empty()) chain_str += " -> ";
+			std::string bn = allmighty_hash_lib::hashes.count(cur->name_hash) ? allmighty_hash_lib::hashes[cur->name_hash] : "Unknown";
+			chain_str += std::format("0x{:08X}({})", cur->name_hash, bn);
+			cur = cur->base_stu;
+		}
+		out << std::format("### STU Class `0x{:08X}` (`{}`) — `size=0x{:X}`, `own_args={}`\n",
+			info->name_hash, cname, info->instance_size, info->argument_count);
+		out << "- **Inheritance**: `" << chain_str << "`\n";
+		int aidx = 0;
+		for (auto arg_pair : *info) {
+			STUInfo* def_cls = arg_pair.first;
+			STUArgumentInfo* arg = arg_pair.second;
+			if (!arg || !is_valid_read_memory(arg, sizeof(STUArgumentInfo))) continue;
+			std::string aname = allmighty_hash_lib::hashes.count(arg->name_hash) ? allmighty_hash_lib::hashes[arg->name_hash] : "Unknown";
+			STUConstraintType ctype = (arg->constraint && is_valid_read_memory(arg->constraint, sizeof(void*)))
+				? arg->constraint->get_type_flag() : (STUConstraintType)-1;
+			uint32_t target_stu = (arg->constraint && is_valid_read_memory(arg->constraint, sizeof(void*)))
+				? (uint32_t)arg->constraint->get_stu_type() : 0;
+			std::string tname = allmighty_hash_lib::hashes.count(target_stu) ? allmighty_hash_lib::hashes[target_stu] : "Unknown";
+			out << std::format("  - [{}] `+0x{:03X}`: Field `0x{:08X}` (`{}`) | Constraint: `{}` | TargetType: `0x{:08X}` (`{}`) | DefinedIn: `0x{:08X}`\n",
+				aidx++, arg->offset, arg->name_hash, aname,
+				STU_ConstraintType_ToString(ctype), target_stu, tname,
+				def_cls ? def_cls->name_hash : 0);
+		}
+		out << "\n";
+	}
+
+	// =========================================================================
+	// SECTION 2: Per-Hero (0x02E0...) Complete Skin & SkinTheme Census
+	// =========================================================================
+	out << "## Section 2: Per-Hero (`STUHero` `0x02E0...`) Complete `m_skins` (`0x0AE0...`) & `m_skinThemes` (`0x0A50...`) Census\n\n";
+
+	auto heroes_map = stu_resources::GetIfAssignableTo(stringHash("STUHero"));
+
+	struct HeroSkinSummary {
+		uint64_t hero_id = 0;
+		std::string hero_name;
+		uint64_t gp_ent_id = 0;
+		uint64_t prog_unlocks_id = 0;
+		std::vector<uint64_t> skin_ids;
+		std::vector<uint64_t> skin_theme_ids;
+	};
+	std::vector<HeroSkinSummary> summaries;
+	std::set<uint64_t> hero_referenced_skins;
+	std::set<uint64_t> hero_referenced_themes;
+	std::set<uint64_t> hero_referenced_unlocks;
+
+	for (auto& hpair : heroes_map) {
+		uint64_t hero_id = (uint64_t)hpair.first;
+		STUBase<>* hero_base = hpair.second;
+		if (!hero_base || !hero_base->valid()) continue;
+		STU_Object hero_obj = hero_base->to_editable();
+		STUInfo* hero_info = safe_get_stu_info(hero_base);
+
+		HeroSkinSummary sum{};
+		sum.hero_id = hero_id;
+		sum.hero_name = "Unknown";
+		if (auto* name_ref = hero_obj.get_argument_resource(0xcd16baa)) {
+			if (is_valid_read_memory(name_ref, sizeof(STUResourceReference)) &&
+				name_ref->resource_id != 0 &&
+				(name_ref->resource_id & 0xDE0000000000000ULL) != 0) {
+				const char* s = GetUXDisplayString(name_ref->resource_id);
+				if (s && s[0] != '\0') sum.hero_name = s;
+			}
+		}
+		if (auto* gp_ref = hero_obj.get_argument_resource("m_gameplayEntity")) {
+			if (is_valid_read_memory(gp_ref, sizeof(STUResourceReference))) {
+				sum.gp_ent_id = (uint64_t)gp_ref->resource_id;
+			}
+		}
+		if (is_valid_read_memory((void*)((uintptr_t)hero_base + 0x110), 8)) {
+			sum.prog_unlocks_id = *(uint64_t*)((uintptr_t)hero_base + 0x110);
+			if (sum.prog_unlocks_id) hero_referenced_unlocks.insert(sum.prog_unlocks_id);
+		}
+
+		out << std::format("### Hero `{}` — `STUHero` `0x{:016X}` (at `0x{:X}`)\n",
+			sum.hero_name, hero_id, (uintptr_t)hero_base);
+		{
+			std::unordered_set<uintptr_t> vis;
+			vis.insert((uintptr_t)hero_base);
+			dump_stu_object_fields(out, hero_base, hero_info, 1, 3, vis);
+		}
+
+		auto skins_list = hero_obj.get_argument_resreflist("m_skins");
+		if (skins_list.valid()) {
+			int s_idx = 0;
+			for (STUResourceReference* skin_ref : skins_list) {
+				if (!skin_ref || !is_valid_read_memory(skin_ref, sizeof(STUResourceReference))) continue;
+				uint64_t skin_id = (uint64_t)skin_ref->resource_id;
+				sum.skin_ids.push_back(skin_id);
+				hero_referenced_skins.insert(skin_id);
+
+				try_load_resource((__int64)skin_id);
+				STUBase<>* skin_base = stu_resources::GetByID((__int64)skin_id);
+				STUInfo* skin_info = skin_base ? safe_get_stu_info(skin_base) : nullptr;
+				out << std::format("  * **`m_skins[{}]`**: `0x{:016X}` (ptr=`0x{:X}`, STU=`0x{:08X}` `{}`)\n",
+					s_idx++, skin_id, (uintptr_t)skin_base,
+					skin_info ? skin_info->name_hash : 0,
+					skin_base ? get_rtti_classname(skin_base) : "NULL");
+
+				if (skin_base && skin_info) {
+					std::unordered_set<uintptr_t> svis;
+					svis.insert((uintptr_t)skin_base);
+					dump_stu_object_fields(out, skin_base, skin_info, 2, 5, svis);
+
+					STU_Object skin_obj = skin_base->to_editable();
+					auto themes_list = skin_obj.get_argument_resreflist("m_skinThemes");
+					if (themes_list.valid()) {
+						int t_idx = 0;
+						for (STUResourceReference* theme_ref : themes_list) {
+							if (!theme_ref || !is_valid_read_memory(theme_ref, sizeof(STUResourceReference))) continue;
+							uint64_t theme_id = (uint64_t)theme_ref->resource_id;
+							sum.skin_theme_ids.push_back(theme_id);
+							hero_referenced_themes.insert(theme_id);
+
+							try_load_resource((__int64)theme_id);
+							STUBase<>* theme_base = stu_resources::GetByID((__int64)theme_id);
+							STUInfo* theme_info = theme_base ? safe_get_stu_info(theme_base) : nullptr;
+							out << std::format("    - **`m_skinThemes[{}]`**: `0x{:016X}` (ptr=`0x{:X}`, STU=`0x{:08X}` `{}`)\n",
+								t_idx++, theme_id, (uintptr_t)theme_base,
+								theme_info ? theme_info->name_hash : 0,
+								theme_base ? get_rtti_classname(theme_base) : "NULL");
+							if (theme_base && theme_info) {
+								std::unordered_set<uintptr_t> tvis;
+								tvis.insert((uintptr_t)theme_base);
+								dump_stu_object_fields(out, theme_base, theme_info, 3, 5, tvis);
+							}
+						}
+					}
+				}
+			}
+		}
+
+		if (sum.prog_unlocks_id != 0) {
+			try_load_resource((__int64)sum.prog_unlocks_id);
+			STUBase<>* u_base = stu_resources::GetByID((__int64)sum.prog_unlocks_id);
+			STUInfo* u_info = u_base ? safe_get_stu_info(u_base) : nullptr;
+			out << std::format("  * **`stu_progression_unlocks (+0x110)`**: `0x{:016X}` (ptr=`0x{:X}`, STU=`0x{:08X}`)\n",
+				sum.prog_unlocks_id, (uintptr_t)u_base, u_info ? u_info->name_hash : 0);
+			if (u_base && u_info) {
+				std::unordered_set<uintptr_t> uvis;
+				uvis.insert((uintptr_t)u_base);
+				dump_stu_object_fields(out, u_base, u_info, 2, 5, uvis);
+			}
+		}
+
+		summaries.push_back(sum);
+		out << "\n---\n\n";
+	}
+
+	out << "### 2.1 Summary Table Across All 21 Heroes\n\n";
+	out << "| # | Hero Name | `STUHero` (`0x02E0`) | `m_skins` Count | `STUSkin` IDs (`0x0AE0`) | `m_skinThemes` Count | `STUSkinTheme` IDs (`0x0A50`) | `stu_progression_unlocks` (`0x0EA0`) |\n";
+	out << "|---|---|---|---|---|---|---|---|\n";
+	size_t total_hero_skins = 0;
+	size_t total_hero_themes = 0;
+	for (size_t i = 0; i < summaries.size(); i++) {
+		auto& s = summaries[i];
+		total_hero_skins += s.skin_ids.size();
+		total_hero_themes += s.skin_theme_ids.size();
+		std::string s_str, t_str;
+		for (uint64_t id : s.skin_ids) { if (!s_str.empty()) s_str += ", "; s_str += std::format("`0x{:016X}`", id); }
+		for (uint64_t id : s.skin_theme_ids) { if (!t_str.empty()) t_str += ", "; t_str += std::format("`0x{:016X}`", id); }
+		out << std::format("| {} | **{}** | `0x{:016X}` | **{}** | {} | **{}** | {} | `0x{:016X}` |\n",
+			i + 1, s.hero_name, s.hero_id,
+			s.skin_ids.size(), s_str.empty() ? "-" : s_str,
+			s.skin_theme_ids.size(), t_str.empty() ? "-" : t_str,
+			s.prog_unlocks_id);
+	}
+	out << std::format("\n- **Total Heroes (`0x02E0`)**: `{}`\n", summaries.size());
+	out << std::format("- **Total Hero-Linked `STUSkin` (`0x0AE0`)**: `{}` (Unique: `{}`)\n", total_hero_skins, hero_referenced_skins.size());
+	out << std::format("- **Total Hero-Linked `STUSkinTheme` (`0x0A50`)**: `{}` (Unique: `{}`)\n\n", total_hero_themes, hero_referenced_themes.size());
+
+	// =========================================================================
+	// SECTION 3: Global Constructed STUs, Engine Resource Table & AssetPacks
+	// =========================================================================
+	out << "## Section 3: Global Constructed STUs (`stu_resources::GetAll()`), Engine Resource Hash Table (`+0x18A19A8`) & `AssetPackManager` (`+0x17A98C0`)\n\n";
+
+	auto all_stus = stu_resources::GetAll();
+	std::map<uint16_t, std::vector<std::pair<uint64_t, STUBase<>*>>> stus_by_prefix;
+	for (auto& kv : all_stus) {
+		uint64_t rid = (uint64_t)kv.first;
+		uint16_t prefix = (uint16_t)((rid >> 48) & 0xFFFF);
+		stus_by_prefix[prefix].push_back({ rid, kv.second });
+	}
+
+	out << "### 3.1 `stu_resources::GetAll()` (`_constructed_stus`) Breakdown by Resource Prefix\n";
+	out << std::format("- **Total Constructed STU Instances**: `{}`\n\n", all_stus.size());
+	out << "| High-16 Prefix | Filetype | Count | Sample Resource IDs & STU Class |\n";
+	out << "|---|---|---|---|\n";
+	for (auto& kv : stus_by_prefix) {
+		uint16_t pfx = kv.first;
+		uint64_t sample_id = kv.second.front().first;
+		uint16_t ft = (uint16_t)(bitswap(16 * (sample_id & 0xFFFF000000000000ULL)) + 1);
+		std::string sample_str;
+		for (size_t i = 0; i < kv.second.size() && i < 4; i++) {
+			if (i > 0) sample_str += ", ";
+			STUInfo* inf = safe_get_stu_info(kv.second[i].second);
+			uint32_t nh = inf ? inf->name_hash : 0;
+			std::string cn = allmighty_hash_lib::hashes.count(nh) ? allmighty_hash_lib::hashes[nh] : get_rtti_classname(kv.second[i].second);
+			sample_str += std::format("`0x{:016X}`(`0x{:08X}` {})", kv.second[i].first, nh, cn);
+		}
+		out << std::format("| `0x{:04X}` | `{:03X}` | **{}** | {} |\n", pfx, ft, kv.second.size(), sample_str);
+	}
+	out << "\n";
+
+	uint16_t interesting_prefixes[] = { 0x02E0, 0x0AE0, 0x0A50, 0x0EA0, 0x0460, 0x06E0, 0x0B90 };
+	for (uint16_t pfx : interesting_prefixes) {
+		auto it = stus_by_prefix.find(pfx);
+		size_t cnt = (it != stus_by_prefix.end()) ? it->second.size() : 0;
+		out << std::format("#### All Constructed STUs with Prefix `0x{:04X}` (Count: `{}`)\n", pfx, cnt);
+		if (it != stus_by_prefix.end()) {
+			for (auto& pair : it->second) {
+				uint64_t rid = pair.first;
+				STUBase<>* ptr = pair.second;
+				STUInfo* inf = safe_get_stu_info(ptr);
+				uint32_t nh = inf ? inf->name_hash : 0;
+				std::string cn = allmighty_hash_lib::hashes.count(nh) ? allmighty_hash_lib::hashes[nh] : "Unknown";
+				bool linked = hero_referenced_skins.count(rid) || hero_referenced_themes.count(rid) || hero_referenced_unlocks.count(rid);
+				out << std::format("- `0x{:016X}` at `0x{:X}` — STU `0x{:08X}` (`{}`), RTTI `{}` {}\n",
+					rid, (uintptr_t)ptr, nh, cn, get_rtti_classname(ptr),
+					(pfx == 0x0AE0 || pfx == 0x0A50 || pfx == 0x0EA0) ? (linked ? "[Hero-Linked]" : "**[UNLINKED/ORPHAN!]**") : "");
+				if ((pfx == 0x0AE0 || pfx == 0x0A50 || pfx == 0x0EA0 || pfx == 0x0460 || pfx == 0x0B90) && !linked && ptr && inf) {
+					std::unordered_set<uintptr_t> vis;
+					vis.insert((uintptr_t)ptr);
+					dump_stu_object_fields(out, ptr, inf, 1, 5, vis);
+				}
+			}
+		}
+		out << "\n";
+	}
+
+	// 3.2 Engine Global Loaded Resource Hash Table (+0x18A19A8)
+	out << "### 3.2 Engine Global Loaded-Resource Hash Table (`+0x18A19A8`, Bucket Count `+0x18A19B8`)\n";
+	auto** bucket_arr_ptr = (MisalignedResourceLoadEntry***)(globals::gameBase + 0x18A19A8);
+	uint32_t* bucket_cnt_ptr = (uint32_t*)(globals::gameBase + 0x18A19B8);
+	if (is_valid_read_memory(bucket_arr_ptr, 8) && is_valid_read_memory(bucket_cnt_ptr, 4) && *bucket_arr_ptr && *bucket_cnt_ptr > 0 && *bucket_cnt_ptr <= 0x100000) {
+		MisalignedResourceLoadEntry** buckets = *bucket_arr_ptr;
+		uint32_t bcount = *bucket_cnt_ptr;
+		std::map<uint16_t, std::vector<std::pair<uint64_t, uintptr_t>>> loaded_by_prefix;
+		size_t total_loaded = 0;
+		for (uint32_t b = 0; b < bcount; b++) {
+			if (!is_valid_read_memory(&buckets[b], 8)) continue;
+			MisalignedResourceLoadEntry* cur = buckets[b];
+			int chain_guard = 0;
+			while (cur && is_valid_read_memory(cur, sizeof(MisalignedResourceLoadEntry)) && chain_guard++ < 4096) {
+				uint64_t rid = (uint64_t)cur->resource_id;
+				uint16_t pfx = (uint16_t)((rid >> 48) & 0xFFFF);
+				loaded_by_prefix[pfx].push_back({ rid, (uintptr_t)cur->align() });
+				total_loaded++;
+				cur = cur->hashlist_next;
+			}
+		}
+		out << std::format("- **Hash Table Buckets**: `{}`, **Total Loaded Resources**: `{}`\n\n", bcount, total_loaded);
+		out << "| High-16 Prefix | Filetype | Loaded Count |\n|---|---|---|\n";
+		for (auto& kv : loaded_by_prefix) {
+			uint16_t ft = (uint16_t)(bitswap(16 * (kv.second.front().first & 0xFFFF000000000000ULL)) + 1);
+			out << std::format("| `0x{:04X}` | `{:03X}` | **{}** |\n", kv.first, ft, kv.second.size());
+		}
+		out << "\n";
+
+		for (uint16_t pfx : interesting_prefixes) {
+			auto it = loaded_by_prefix.find(pfx);
+			size_t cnt = (it != loaded_by_prefix.end()) ? it->second.size() : 0;
+			out << std::format("#### Hash-Table Loaded Resources with Prefix `0x{:04X}` (Count: `{}`)\n", pfx, cnt);
+			if (it != loaded_by_prefix.end()) {
+				std::sort(it->second.begin(), it->second.end());
+				for (auto& pair : it->second) {
+					out << std::format("- `0x{:016X}` (aligned_entry=`0x{:X}`)\n", pair.first, pair.second);
+				}
+			}
+			out << "\n";
+		}
+	}
+
+	// 3.3 AssetPackManager (+0x17A98C0)
+	out << "### 3.3 `AssetPackManager` (`+0x17A98C0`) Loaded `AssetPackListItem` Lists (`+0x38` & `+0x50`)\n";
+	__int64 ap_mgr = *(__int64*)(globals::gameBase + 0x17A98C0);
+	if (ap_mgr && is_valid_read_memory((void*)ap_mgr, 0x60)) {
+		for (int list_idx = 0; list_idx < 2; list_idx++) {
+			AssetPackListItem* list_ptr = *(AssetPackListItem**)(ap_mgr + (list_idx == 0 ? 0x38 : 0x50));
+			int list_cnt = *(int*)(ap_mgr + (list_idx == 0 ? 0x40 : 0x58));
+			out << std::format("#### AssetPack List {} (`+0x{:X}`, Count: `{}`)\n", list_idx + 1, (list_idx == 0 ? 0x38 : 0x50), list_cnt);
+			if (list_ptr && list_cnt > 0 && list_cnt < 4096 && is_valid_read_memory(list_ptr, sizeof(AssetPackListItem) * list_cnt)) {
+				for (int i = 0; i < list_cnt; i++) {
+					out << std::format("- [{}] `assetPackId=0x{:016X}`, `tact_key_used=0x{:016X}`, `f0=0x{:X}`, `f2C={}`, `f38=0x{:X}`, `f40=0x{:X}`\n",
+						i, (uint64_t)list_ptr[i].assetPackId, (uint64_t)list_ptr[i].tact_key_used,
+						(uint64_t)list_ptr[i].field_0, list_ptr[i].field_2C,
+						(uint64_t)list_ptr[i].field_38, (uint64_t)list_ptr[i].field_40);
+				}
+			}
+			out << "\n";
+		}
+	}
+
+	out.close();
+	out_status = std::format("Dumped complete Skin Census to skin_census_audit.log! (Heroes={}, Skins={}, Themes={})",
+		summaries.size(), hero_referenced_skins.size(), hero_referenced_themes.size());
+}
+
+void trigger_auto_skin_census() {
+	if (!s_auto_skin_census_done && stu_resources::GetByID(0x02E0000000000003ULL) != nullptr) {
+		s_auto_skin_census_done = true;
+		std::string dummy_status;
+		dump_skin_census_audit(dummy_status);
+		printf("[SkinCensus] %s\n", dummy_status.c_str());
+	}
+}
+
 void statescript_diag_window::test_enable_0x2f_aim_and_rebind() {
 	auto* ea = GameEntityAdmin();
 	if (!ea) {
@@ -2785,6 +3188,9 @@ void statescript_diag_window::test_enable_0x2f_aim_and_rebind() {
 
 void statescript_diag_window::render_diagnostic_panel() {
 	if (ImGui::CollapsingHeader("[Step 1 Diagnostic] Weapon & Input Tracer", ImGuiTreeNodeFlags_DefaultOpen)) {
+		if (ImGui::Button("[Skin Census] Dump Complete Skin & Cosmetics Audit (skin_census_audit.log)")) {
+			dump_skin_census_audit(_dump_status_msg);
+		}
 		if (ImGui::Button("[Horizon 1] Dump All Stripped STU Nodes & 21 Hero Graphs (horizon1_stu_audit.log)")) {
 			dump_horizon1_audit_to_file();
 		}
@@ -2962,6 +3368,10 @@ void statescript_diag_window::render_diagnostic_panel() {
 }
 
 void statescript_diag_window::render() {
+	if (!s_auto_skin_census_done && stu_resources::GetByID(0x02E0000000000003ULL) != nullptr) {
+		s_auto_skin_census_done = true;
+		dump_skin_census_audit(_dump_status_msg);
+	}
 	if (s_force_weapon_exec_flags && _ss && is_valid_read_memory(_ss, sizeof(Component_23_Statescript))) {
 		for (auto* script : _ss->ss_inner.g1_instanceArr) {
 			if (!script || !is_valid_read_memory(script, sizeof(StatescriptInstance))) continue;
