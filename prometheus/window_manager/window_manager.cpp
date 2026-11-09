@@ -291,7 +291,7 @@ void window_manager::render() {
 }
 
 std::shared_ptr<window> window_manager::get_docked(window_type typ, window* from) {
-	if (from && !ImGui::IsKeyDown(ImGuiKey_ModCtrl)) {
+	if (from && !ImGui::IsKeyDown(ImGuiMod_Ctrl)) {
 		for (auto& window : s_windows) {
 			auto dock_window = window->get_root_dock().lock();
 			if (dock_window) {

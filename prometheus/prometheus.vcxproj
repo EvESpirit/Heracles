@@ -75,6 +75,10 @@
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup Label="Vcpkg">
+    <VcpkgEnableManifest>true</VcpkgEnableManifest>
+    <VcpkgManifestInstall>true</VcpkgManifestInstall>
+  </PropertyGroup>
   <ImportGroup>
     <Import Project="..\external\vcpkg\scripts\buildsystems\msbuild\vcpkg.targets" />
   </ImportGroup>
@@ -103,10 +107,6 @@
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <IncludePath>../external;$(IncludePath)</IncludePath>
-  </PropertyGroup>
-  <PropertyGroup Label="Vcpkg">
-    <VcpkgEnableManifest>true</VcpkgEnableManifest>
-    <VcpkgManifestInstall>true</VcpkgManifestInstall>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>

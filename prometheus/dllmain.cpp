@@ -297,7 +297,7 @@ HRESULT __stdcall PresentHook(IDXGISwapChain* pSwapChain, UINT SyncInterval, UIN
             static ImFontConfig cfg;
             cfg.OversampleH = cfg.OversampleV = 1;
             cfg.MergeMode = true;
-            cfg.FontBuilderFlags |= ImGuiFreeTypeBuilderFlags_LoadColor;
+            cfg.FontLoaderFlags |= ImGuiFreeTypeLoaderFlags_LoadColor;
             auto& io = ImGui::GetIO();
 
             imgui_helpers::BoldFont = io.Fonts->AddFontFromFileTTF("MonaspaceXenon-ExtraBold.otf", 13);

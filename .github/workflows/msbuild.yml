@@ -52,7 +52,7 @@ jobs:
 
     - name: Build
       working-directory: ${{ github.workspace }}
-      run: msbuild /p:Configuration=Release /p:PlatformTarget=x64 /p:OutDir=${{ github.workspace }}\output\ ${{ env.SOLUTION_FILE_PATH }}
+      run: msbuild /m /p:MultiProcessorCompilation=true /p:Configuration=Release /p:PlatformTarget=x64 /p:OutDir=${{ github.workspace }}\output\ ${{ env.SOLUTION_FILE_PATH }}
 
     - name: Zip
       working-directory: ${{ github.workspace }}
