@@ -32,7 +32,23 @@ jobs:
 
     - name: Stage vcpkg
       working-directory: ${{ github.workspace }}
-      run: . .\external\vcpkg\scripts\bootstrap.ps1
+      run: |
+        for ($i = 1; $i -le 5; $i++) {
+          try {
+            . .\external\vcpkg\scripts\bootstrap.ps1
+            if (Test-Path .\external\vcpkg\vcpkg.exe) { break }
+          } catch {
+            Write-Host "vcpkg bootstrap attempt $i failed ($_), retrying..."
+          }
+          Start-Sleep -Seconds 5
+        }
+        if (-not (Test-Path .\external\vcpkg\vcpkg.exe) -and $env:VCPKG_INSTALLATION_ROOT -and (Test-Path "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe")) {
+          Write-Host "Using runner pre-installed vcpkg.exe from $env:VCPKG_INSTALLATION_ROOT"
+          Copy-Item "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" .\external\vcpkg\vcpkg.exe -Force
+        }
+        if (-not (Test-Path .\external\vcpkg\vcpkg.exe)) {
+          throw "Failed to stage vcpkg.exe"
+        }
 
     - name: Build
       working-directory: ${{ github.workspace }}
