@@ -52,11 +52,7 @@ jobs:
 
     - name: Build
       working-directory: ${{ github.workspace }}
-      run: |
-        $vsPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
-        $latestTools = Get-ChildItem "$vsPath\VC\Tools\MSVC" -Directory | Sort-Object Name -Descending | Select-Object -First 1 -ExpandProperty Name
-        Write-Host "Using VCToolsVersion=$latestTools from $vsPath"
-        msbuild /m /p:MultiProcessorCompilation=true /p:VCToolsVersion=$latestTools /p:Configuration=Release /p:PlatformTarget=x64 /p:OutDir=${{ github.workspace }}\output\ ${{ env.SOLUTION_FILE_PATH }}
+      run: msbuild /m /p:MultiProcessorCompilation=true /p:Configuration=Release /p:PlatformTarget=x64 /p:OutDir=${{ github.workspace }}\output\ ${{ env.SOLUTION_FILE_PATH }}
 
     - name: Zip
       working-directory: ${{ github.workspace }}
