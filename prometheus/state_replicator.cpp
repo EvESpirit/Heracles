@@ -2,6 +2,26 @@
 #include <ixwebsocket/IXNetSystem.h>
 #include "serialization.h"
 
+extern "C" size_t __stdcall __std_find_first_not_of_trivial_pos_1_fallback(
+	const void* _Haystack, size_t _Haystack_length, const void* _Needle, size_t _Needle_length) noexcept {
+	const auto* hay = static_cast<const unsigned char*>(_Haystack);
+	const auto* needle = static_cast<const unsigned char*>(_Needle);
+	for (size_t i = 0; i < _Haystack_length; ++i) {
+		bool found = false;
+		for (size_t j = 0; j < _Needle_length; ++j) {
+			if (hay[i] == needle[j]) {
+				found = true;
+				break;
+			}
+		}
+		if (!found) {
+			return i;
+		}
+	}
+	return static_cast<size_t>(-1);
+}
+#pragma comment(linker, "/alternatename:__std_find_first_not_of_trivial_pos_1=__std_find_first_not_of_trivial_pos_1_fallback")
+
 void state_replicator::network_init() {
 	std::call_once(_network_init, []() {
 		printf("init net system\n");
