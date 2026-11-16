@@ -36,7 +36,7 @@
 | Hanzo | Primary Fire (Left Click) | Pass |
 | Hanzo | Sonic Arrow | Fail (despawns on contact with floor or wall same as Widow's Mine and Torb's Armor Pack) |
 | Hanzo | Scatter Arrow | Pass |
-| Hanzo | Ultimate | Partial Pass (works as intended, but the dragons only deal one bulk amount of damage (I also presume in their entire path at once, instead of in a sweeping manner) instead of damage over time while enemies stand inside the dragon vfx) |
+| Hanzo | Ultimate | Partial Pass (works as intended, but the dragons only deal one bulk amount of damage (I also presume in their entire path at once, rather than in a sweeping manner) instead of damage over time while enemies stand inside the dragon vfx) |
 | Junkrat | Primary Fire (Left Click) | Pass |
 | Junkrat | Steel Trap | Fail (despawns on contact with floor or wall same as Widow's Mine and Torb's Armor Pack) |
 | Junkrat | Concussion Mine | Fail (despawns on contact with floor or wall same as Widow's Mine and Torb's Armor Pack) |
