@@ -45,7 +45,7 @@
 | Mei | Secondary Fire (Right Click) | Pass |
 | Mei | Cryo-Freeze | Pass |
 | Mei | Ice Wall | Pass |
-| Mei | Ultimate | Fail (Snowflake despawns on contact with level geometry and never triggers the freezing field) |
+| Mei | Ultimate | Fail (Snowflake leaves on contact with level geometry and never triggers the freezing field) |
 | Torbjörn | Primary Fire (Left Click) | Pass |
 | Torbjörn | Secondary Fire (Right Click) | Pass |
 | Torbjörn | Armor Pack | Fail (despawns on deployment after it touches the ground or a wall simmilar to Widowmaker's mine) |
